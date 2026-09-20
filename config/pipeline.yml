@@ -1,0 +1,135 @@
+# Production Pack Pipeline Configuration
+
+project:
+  name: "production-pack"
+  style: "pixar-fantasy"
+  output_dir: "./output"
+
+# Service endpoints
+services:
+  comfyui:
+    host: "127.0.0.1"
+    port: 8188
+    api_url: "http://127.0.0.1:8188/api"
+    ws_url: "ws://127.0.0.1:8188/ws"
+    health_check_interval: 5  # seconds
+    restart_timeout: 60       # seconds
+
+  # LLM models (managed by dsh-engine-switch plugin + Pipeline Orchestrator)
+  qwen35_122b:
+    host: "127.0.0.1"
+    port: 11434
+    model: "qwen3.5:122b-a10b-q4"
+    api_url: "http://127.0.0.1:11434/v1"
+    vram: "~75 GB at Q4"
+    role: "reasoning agents (story, director, reviewer, character/location design)"
+    load_on_demand: true  # unload during generation to free VRAM
+
+  qwen38_27b:
+    host: "127.0.0.1"
+    port: 11435
+    model: "qwen3.8:27b-q4"
+    api_url: "http://127.0.0.1:11435/v1"
+    vram: "~16 GB at Q4"
+    role: "execution agents + QA vision (multimodal — replaces Qwen2.5-VL)"
+    load_on_demand: false  # stays loaded during generation + QA phases
+
+  chatterbox:
+    host: "127.0.0.1"
+    port: 9882
+    model: "chatterbox-turbo"
+    api_url: "http://127.0.0.1:9882"
+    vram: "4-6 GB"
+    use_for: "primary character dialogue"
+
+  cosyvoice:
+    host: "127.0.0.1"
+    port: 9880
+    model: "CosyVoice3-0.5B"
+    api_url: "http://127.0.0.1:9880"
+    vram: "4-6 GB"
+    use_for: "multilingual/cross-lingual dialogue, instruction-based emotion"
+
+  kokoro:
+    host: "127.0.0.1"
+    port: 9881
+    model: "kokoro-v1"
+    api_url: "http://127.0.0.1:9881"
+    vram: "2-3 GB"
+    use_for: "narration only"
+
+  orpheus:
+    host: "127.0.0.1"
+    port: 9883
+    model: "orpheus-3b"
+    api_url: "http://127.0.0.1:9883"
+    vram: "8-12 GB"
+    use_for: "expressive emotional dialogue (load on demand, unload after use)"
+
+# Image generation settings (Qwen Image 2.1)
+image_generation:
+  model: "Qwen-Image-2.1"
+  default_resolution: "2048x2048"
+  character_sheet_resolution: "2048x2048"
+  first_frame_resolution: "1920x1080"
+  max_reference_images: 10
+  steps: 30
+  cfg_scale: 7.0
+
+# Video generation settings (MiniMax H3)
+video_generation:
+  model: "MiniMax-H3"
+  min_duration: 3            # seconds per clip (minimum)
+  max_duration: 15           # seconds per clip (maximum)
+  default_duration: 6        # seconds per clip
+  output_resolution: "1920x1080"
+  steps: 50
+  default_mode: "reference"   # ref2va — default for most clips (best identity consistency)
+  mode_selection: "auto"      # Director decides per clip based on need:
+    # ref2va  — DEFAULT. Up to 9 images + 3 video + 3 audio refs. Best for identity locking.
+    # fl2va   — Only when continuity from previous clip is needed (captures last frame as first frame).
+    # i2va    — When a single strong first-frame is sufficient.
+    # t2va    — AVOID. Inconsistent output. Only for abstract/establishing shots with no characters.
+  avoid_modes:
+    - "text_to_video"        # t2va — inconsistent output, avoid
+  audio_enabled: true        # native H3 audio (but prefer separate overlay)
+
+# QA settings
+qa:
+  max_retries: 3
+  vision_model: "qwen3.8-27b"  # multimodal — no separate vision model needed
+  checks:
+    - hand_anomalies
+    - face_distortion
+    - character_duplication
+    - motion_artifacts
+    - texture_instability
+    - identity_drift
+    - lip_sync_correctness
+    - audio_quality
+    - temporal_consistency
+    - composition_check
+  pass_threshold: 0.85       # minimum score to pass
+
+# Audio settings
+audio:
+  # Engine selection is per-character, decided by Audio Producer (see decision tree)
+  engines:
+    default_dialogue: "chatterbox"        # best naturalness + cloning
+    multilingual_dialogue: "cosyvoice3"   # cross-lingual, instruction emotion
+    emotional_dialogue: "orpheus3b"       # intense emotion tags (load on demand)
+    narration: "kokoro"                   # lightweight, consistent narrator voice
+  sample_rate: 44100
+  format: "wav"
+  voice_reference_duration: 5  # seconds of ref audio for cloning
+  dialogue_before_video: true  # CRITICAL: dialogue audio generated BEFORE video for lip sync
+  narration_after_clips: true  # narration overlaid in post, no lip sync
+
+# Pipeline orchestration
+orchestration:
+  vram_management: true
+  auto_restart_comfyui: true
+  qwen_stop_before_generation: true
+  qwen_restart_after_generation: true
+  monitoring_interval: 2     # seconds
+  clip_generation_timeout: 300  # seconds
