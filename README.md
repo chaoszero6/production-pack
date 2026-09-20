@@ -162,4 +162,6 @@ Tested on: **RTX 5090 32GB**, Debian 13, CUDA 13.1
 
 ## License
 
-MIT
+Copyright (c) 2026 Vinoth Kannah MP. All Rights Reserved.
+
+This software is proprietary. Public for viewing/portfolio only — no permission to use, copy, modify, or distribute. See [LICENSE](LICENSE) for details.
