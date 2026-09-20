@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" modified="2026-09-20T00:00:00.000Z" agent="Draw.io" version="21.0.0" type="device">
+  <diagram id="fig3-gpu-memory" name="Figure 3 - GPU Memory Phasing">
+    <mxGraphModel dx="1422" dy="762" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="700" math="0" shadow="0" background="#FFFFFF">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Title -->
+        <mxCell id="title" value="&lt;b&gt;Figure 3 &amp;mdash; GPU Memory Phasing&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=18;" vertex="1" parent="1">
+          <mxGeometry x="440" y="20" width="400" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- 32 GB Total Header -->
+        <mxCell id="header" value="&lt;b&gt;32 GB Total VRAM&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#333333;strokeColor=#000000;fontColor=#FFFFFF;fontSize=16;arcSize=8;" vertex="1" parent="1">
+          <mxGeometry x="140" y="80" width="1000" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- Memory scale on left -->
+        <mxCell id="scale_32" value="32 GB" style="text;html=1;align=right;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="60" y="140" width="60" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="scale_20" value="20 GB" style="text;html=1;align=right;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="60" y="240" width="60" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="scale_10" value="10 GB" style="text;html=1;align=right;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="60" y="345" width="60" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="scale_0" value="0 GB" style="text;html=1;align=right;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="60" y="445" width="60" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- Dashed grid lines -->
+        <mxCell id="grid32" style="endArrow=none;dashed=1;html=1;strokeColor=#CCCCCC;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="140" y="150" as="sourcePoint" />
+            <mxPoint x="1140" y="150" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="grid20" style="endArrow=none;dashed=1;html=1;strokeColor=#CCCCCC;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="140" y="250" as="sourcePoint" />
+            <mxPoint x="1140" y="250" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="grid10" style="endArrow=none;dashed=1;html=1;strokeColor=#CCCCCC;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="140" y="355" as="sourcePoint" />
+            <mxPoint x="1140" y="355" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="grid0" style="endArrow=none;dashed=1;html=1;strokeColor=#999999;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="140" y="460" as="sourcePoint" />
+            <mxPoint x="1140" y="460" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ============ PHASE A ============ -->
+        <mxCell id="phaseA_label" value="&lt;b&gt;Phase A&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="220" y="480" width="90" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- LM1 122B MoE ~27GB bar -->
+        <mxCell id="phA_lm1" value="&lt;b&gt;LM1 122B MoE&lt;/b&gt;&lt;br&gt;~27 GB" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="160" y="180" width="200" height="275" as="geometry" />
+        </mxCell>
+
+        <!-- ============ SWAP ============ -->
+        <mxCell id="swap_label" value="&lt;b&gt;SWAP&lt;/b&gt;&lt;br&gt;&lt;i&gt;Restart&lt;br&gt;ComfyUI&lt;/i&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="395" y="275" width="80" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Swap arrow -->
+        <mxCell id="swap_arrow" style="shape=mxgraph.arrows2.stripedArrow;dy=0.24;dx=40;notch=25;fillColor=#f8cecc;strokeColor=#b85450;html=1;" vertex="1" parent="1">
+          <mxGeometry x="385" y="345" width="100" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- ============ PHASE B ============ -->
+        <mxCell id="phaseB_label" value="&lt;b&gt;Phase B&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="580" y="480" width="90" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- LM2 27B ~20GB bar -->
+        <mxCell id="phB_lm2" value="&lt;b&gt;LM2 27B&lt;/b&gt;&lt;br&gt;~20 GB" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="520" y="255" width="200" height="200" as="geometry" />
+        </mxCell>
+
+        <!-- ComfyUI + H3 ~10GB bar (stacked on top) -->
+        <mxCell id="phB_comfy" value="&lt;b&gt;ComfyUI + H3&lt;/b&gt;&lt;br&gt;~10 GB" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="520" y="155" width="200" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- ============ PHASE C ============ -->
+        <mxCell id="phaseC_label" value="&lt;b&gt;Phase C&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="900" y="480" width="90" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- No swap label -->
+        <mxCell id="no_swap" value="&lt;b&gt;No Swap&lt;/b&gt;&lt;br&gt;&lt;i&gt;LM2 already&lt;br&gt;loaded&lt;/i&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="755" y="280" width="90" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow Phase B to C (no swap) -->
+        <mxCell id="bc_arrow" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#82b366;dashed=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="725" y="355" as="sourcePoint" />
+            <mxPoint x="860" y="355" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- LM2 REUSED ~20GB bar -->
+        <mxCell id="phC_lm2" value="&lt;b&gt;LM2 REUSED&lt;/b&gt;&lt;br&gt;~20 GB" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="860" y="255" width="200" height="200" as="geometry" />
+        </mxCell>
+
+        <!-- Free memory label for Phase C -->
+        <mxCell id="free_c" value="&lt;i&gt;~12 GB Free&lt;/i&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#CCCCCC;fontSize=11;verticalAlign=middle;fontColor=#999999;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="860" y="155" width="200" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- Free memory label for Phase A -->
+        <mxCell id="free_a" value="&lt;i&gt;~5 GB Free&lt;/i&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#CCCCCC;fontSize=11;verticalAlign=middle;fontColor=#999999;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="160" y="155" width="200" height="25" as="geometry" />
+        </mxCell>
+
+        <!-- Free memory label for Phase B -->
+        <mxCell id="free_b" value="&lt;i&gt;~2 GB Free&lt;/i&gt;" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F5F5F5;strokeColor=#CCCCCC;fontSize=10;verticalAlign=middle;fontColor=#999999;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="520" y="140" width="200" height="15" as="geometry" />
+        </mxCell>
+
+        <!-- Timeline arrow -->
+        <mxCell id="timeline" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#333333;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="140" y="530" as="sourcePoint" />
+            <mxPoint x="1140" y="530" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="time_label" value="&lt;b&gt;Time &amp;rarr;&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="590" y="535" width="80" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- Legend -->
+        <mxCell id="leg_title" value="&lt;b&gt;Legend&lt;/b&gt;" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="140" y="570" width="60" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="leg1" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="140" y="600" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="leg1t" value="LM1 (122B MoE)" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="165" y="595" width="110" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="leg2" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="300" y="600" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="leg2t" value="LM2 (27B Multimodal)" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="325" y="595" width="140" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="leg3" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;" vertex="1" parent="1">
+          <mxGeometry x="490" y="600" width="20" height="15" as="geometry" />
+        </mxCell>
+        <mxCell id="leg3t" value="ComfyUI + H3" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="515" y="595" width="100" height="25" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
