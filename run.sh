@@ -672,8 +672,38 @@ except:
         if [ "$HAS_DIALOGUE" = "yes" ]; then
             log "[$SHOT_ID] Generating dialogue audio (before video for lip sync)..."
             swap_to_27b
+            # Extract emotion info from shot list for the prompt
+            DIALOGUE_INFO=$(python3 -c "
+import json
+with open('$RUN_DIR/shot_list.json') as f:
+    shots = json.load(f)['shots']
+shot = next((s for s in shots if s['shot_id'] == '$SHOT_ID'), None)
+if shot:
+    for d in shot.get('audio',{}).get('dialogue',[]):
+        print(f\"Character: {d.get('character_id','?')}\")
+        print(f\"Line: {d.get('line','')}\")
+        print(f\"Emotion: {d.get('emotion','neutral')}\")
+        print(f\"Start: {d.get('start_time',0)}s  End: {d.get('end_time','?')}s\")
+        print()
+" 2>/dev/null)
             write_prompt "$CLIP_DIR/prompt_dialogue.txt" \
-                "Generate dialogue audio for $SHOT_ID. Read $CLIP_DIR/reviewed_prompt.json for lines. Voice refs: $RUN_DIR/audio/voices/. Use Chatterbox (9882) for default, CosyVoice (50000) for multilingual. Save combined audio to $CLIP_DIR/dialogue.wav"
+                "Generate dialogue audio for $SHOT_ID with CORRECT EMOTION.
+
+Voice refs: $RUN_DIR/audio/voices/
+Shot data from shot_list.json:
+$DIALOGUE_INFO
+
+CRITICAL: Apply the emotion to the TTS generation:
+- Chatterbox (port 9882): use exaggeration parameter (0.3=subtle, 0.7=strong) matching the emotion intensity. Also add paralinguistic tags in the text: [laugh], [sigh], [gasp] where the emotion calls for it.
+- CosyVoice (port 50000): use instruction-based emotion control — append the emotion as an instruction.
+- Orpheus 3B (port 9883): use emotion tags <happy>, <sad>, <angry>, <whisper> for intense emotions.
+
+Choose the TTS engine based on the emotion:
+- Subtle emotions (warm, curious, gentle) → Chatterbox with low exaggeration
+- Strong emotions (angry, crying, shouting) → Orpheus 3B with emotion tags
+- Multilingual → CosyVoice with emotion instruction
+
+Save to $CLIP_DIR/dialogue.wav. Include emotion used in dialogue_metadata.json."
             run_dsh_agent "audio-producer" "$CLIP_DIR/prompt_dialogue.txt" "$CLIP_DIR/dialogue_meta.json"
         fi
 
