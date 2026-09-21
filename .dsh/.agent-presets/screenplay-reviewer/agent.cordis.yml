@@ -91,6 +91,12 @@
       - [ ] Reference images have explicit role assignments
       - [ ] No conflicting depth cues between reference and prompt
       - [ ] Camera movement described physically
+      - [ ] **DIALOGUE DURATION CHECK**: count words in each dialogue line,
+            divide by 2.5 → must fit within clip duration minus 1s buffer.
+            If too long, REJECT and ask Director to split or extend clip.
+      - [ ] **NARRATION-DIALOGUE OVERLAP CHECK**: if this clip has dialogue,
+            verify no narration span includes this clip. Narration and dialogue
+            must NEVER play at the same time.
 
       ## Output Format
       For each reviewed prompt, output the prompt in the correct MiniMax H3 format:

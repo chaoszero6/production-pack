@@ -65,20 +65,55 @@
       unless the shot genuinely requires continuity from the previous clip.
       For new scenes with characters in a location, prefer i2va with scene compositing.
 
+      ### Audio Duration Rules (CRITICAL)
+
+      **Dialogue MUST fit within its clip.**
+      Dialogue is lip-synced and baked into the video — it cannot overflow.
+      Rule of thumb: ~2.5 words per second at conversational speed.
+      - 5s clip → max ~12 words of dialogue
+      - 7s clip → max ~17 words of dialogue
+      - 10s clip → max ~25 words of dialogue
+      - 15s clip → max ~37 words of dialogue
+      If a dialogue line is too long, SPLIT it across multiple clips or make the clip longer.
+      NEVER assign dialogue that exceeds the clip duration.
+
+      **Narration can SPAN multiple clips.**
+      Narration is overlaid in post-production (not baked into video), so it can
+      play across consecutive clips. Use the `narration_span` field:
+      ```
+      "narration": {
+        "text": "In the village of Tickhaven...",
+        "span_clips": ["S01_001", "S01_002"],
+        "estimated_duration": 18.0
+      }
+      ```
+      Only assign `narration` to the FIRST clip of the span. Later clips in the
+      span should have `"narration": null`.
+
+      **Narration MUST NOT overlap with dialogue.**
+      If a clip has dialogue (lip-synced), do NOT also assign narration to that
+      same time window. Narration and dialogue compete for the listener's attention.
+      Rules:
+      - A clip with dialogue → `"narration": null` (narration pauses)
+      - Narration spans should STOP before a dialogue clip and RESUME after it
+      - If narration must lead into dialogue, end the narration span BEFORE the
+        dialogue clip starts
+
       ### Audio Requirements
       For each shot, specify:
-      - Which characters speak and their dialogue
-      - Narrator lines (if any)
+      - Which characters speak and their dialogue (with word-count check)
+      - Narrator lines (if any) with span_clips if it crosses clip boundaries
       - Key sound effects needed
       - Background music mood/tempo
-      - Whether MiniMax H3 should generate native audio or we overlay separately
+      - use_native_h3_audio: almost always false
 
       ## Production Rules
       - Keep shots under 15 seconds (MiniMax H3 hard limit)
       - Prefer 6-8 second clips for better quality
       - Use close-ups and medium shots for character faces (H3 distorts faces in wide shots)
       - Avoid full-body shots of multiple characters in a single frame (duplication risk)
-      - Plan for the pipeline: stop Qwen → generate → restart Qwen → QA cycle
+      - ALWAYS verify: dialogue word count fits clip duration (~2.5 words/sec)
+      - ALWAYS verify: narration does not overlap with dialogue in any clip
 
       ## Output Format
       Output a structured JSON shot list that the pipeline can process sequentially.

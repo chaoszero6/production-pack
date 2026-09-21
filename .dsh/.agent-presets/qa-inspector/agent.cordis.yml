@@ -72,7 +72,15 @@
         (narration = no lip sync, even if character is on screen)
       - **Mixed clips**: lips move ONLY during dialogue portions, NOT during narration
 
-      ### 8. Audio Quality (LOW — dialogue already baked, narration added in post)
+      ### 8. Audio-Duration Fit (CRITICAL)
+      - **Dialogue duration check**: extract the baked audio track, measure its
+        duration. If dialogue audio runs longer than the clip video, flag as FAIL.
+      - **Narration overlap check**: read the shot_list.json narration spans.
+        If this clip is in a narration span AND has dialogue, flag as FAIL
+        (narration and dialogue must never overlap).
+      - Dialogue words / 2.5 should be <= clip duration - 1s buffer
+
+      ### 9. Audio Quality (LOW — dialogue already baked, narration added in post)
       - Distorted or noisy baked-in dialogue audio
       - Multi-speaker timbre crosstalk
       - Dialogue-to-lip sync timing mismatch

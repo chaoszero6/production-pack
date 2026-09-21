@@ -66,12 +66,19 @@ consumes this schema.
           {
             "character_id": "char_001",
             "line": "It's even more beautiful than I imagined...",
+            "word_count": 7,
+            "estimated_duration": 2.8,
             "emotion": "awestruck whisper",
             "start_time": 2.0,
-            "end_time": 4.5
+            "end_time": 4.8
           }
         ],
-        "narration": null,
+        "narration": {
+          "text": "Long narration text that may span multiple clips...",
+          "span_clips": ["S01_001", "S01_002"],
+          "word_count": 45,
+          "estimated_duration": 18.0
+        },
         "use_native_h3_audio": false,
         "music_mood": "gentle wonder, soft strings",
         "sfx": ["footsteps on soft ground", "magical ambient hum"]
@@ -117,6 +124,21 @@ This prevents MiniMax H3 hand artifacts.
 ### characters_in_frame.facing
 Specify the angle the character faces relative to camera. Avoid "directly facing camera"
 for shots where hands are active — use 3/4 angles instead.
+
+### audio.dialogue — Duration Validation
+ALWAYS include `word_count` and `estimated_duration` (words / 2.5).
+Dialogue `estimated_duration` MUST be <= clip `duration_seconds` minus 1s buffer.
+If it doesn't fit, either shorten the line or increase clip duration.
+
+### audio.narration — Spanning Multiple Clips
+Narration is overlaid in post — it CAN span multiple clips via `span_clips`.
+Only set `narration` on the FIRST clip of the span; later clips get `"narration": null`.
+`estimated_duration` = `word_count` / 2.5 (narration pace ~150 wpm = 2.5 words/sec).
+
+### audio.narration — No Overlap with Dialogue
+If ANY clip in the narration's `span_clips` has dialogue, the narration span MUST
+stop BEFORE that clip. Narration and dialogue must NEVER play simultaneously.
+Pattern: narration over visual-only clips → pause → dialogue clip → pause → narration resumes.
 
 ### audio.use_native_h3_audio
 Almost always `false`. Native H3 audio quality is unreliable.

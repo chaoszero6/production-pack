@@ -519,6 +519,14 @@ if ! skip_if_done "$RUN_DIR/shot_list.json" "Director"; then
 - Output valid JSON to be processed shot-by-shot."
     run_dsh_agent "director" "$RUN_DIR/prompt_director.txt" "$RUN_DIR/shot_list.json" \
         || die "director failed — no shot_list.json (check $RUN_DIR/pipeline.log)"
+
+    # Validate audio timing — fix dialogue overflow and narration overlap
+    step "1b-validate. Audio Timing Validation"
+    TIMING_ISSUES=$(python3 "$PACK_DIR/validate_audio_timing.py" "$RUN_DIR/shot_list.json" --fix 2>&1)
+    log "$TIMING_ISSUES"
+    if echo "$TIMING_ISSUES" | grep -q "timing issue"; then
+        notify "$TIMING_ISSUES" "Audio Timing Fix"
+    fi
 fi
 
 # Post shot plan summary to Discord
