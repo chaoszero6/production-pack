@@ -97,7 +97,7 @@ video_generation:
 # QA settings
 qa:
   max_retries: 3
-  vision_model: "deepseek-v4-pro"  # cloud multimodal — V4 Pro for QA vision
+  vision_model: "deepseek-v4-flash-vision-exp"  # ONLY vision model on OpenCode Go
   checks:
     - hand_anomalies
     - face_distortion

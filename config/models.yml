@@ -11,17 +11,23 @@
 
 # Per-preset model routing (managed by run.sh set_agent_model)
 routing:
-  # Reasoning + vision agents → DeepSeek V4 Pro (text+image, 1M context, high effort)
+  # Reasoning agents → DeepSeek V4 Pro (text-only, 1M context, high effort)
   reasoning_agents:
     - story-creator
     - director
     - screenplay-reviewer
     - character-designer
     - location-designer
-    - qa-inspector
   reasoning_provider: "opencode-go-deepseek-pro"
   reasoning_model: "deepseek-v4-pro"
   reasoning_effort: "high"
+
+  # Vision agent → DeepSeek V4 Flash Vision Exp (ONLY vision model on OpenCode Go)
+  vision_agents:
+    - qa-inspector
+  vision_provider: "opencode-go-deepseek-vision"
+  vision_model: "deepseek-v4-flash-vision-exp"
+  vision_effort: "high"
 
   # Execution agents → DeepSeek V4.1 Flash (text+image, 1M context, low effort)
   execution_agents:
@@ -46,7 +52,7 @@ providers:
     session_header: "x-opencode-session: production-pack"
     stream_idle_timeout_ms: 1800000  # 30 min — long reasoning blocks
     model: "deepseek-v4-pro"
-    input: [text, image]  # Supports vision for QA
+    input: [text]  # Text-only — does NOT support images
     context_window: 1000000
     thinking_format: "deepseek"
 

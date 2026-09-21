@@ -140,12 +140,18 @@ start_hermes() {
 # per-preset override (the `engine:` plugin the presets reference,
 # @yuki-takuya-kun/dsh-engine-switch, is not installed and 404s on npm, so
 # those lines are inert). So we rewrite that one section before each call:
-#   deepseek-v4-pro     -> reasoning agents + QA (vision capable)
-#   deepseek-v4.1-flash -> execution agents (image gen, video gen, audio, etc.)
-MODEL_PRO_PRESETS="story-creator director screenplay-reviewer character-designer location-designer qa-inspector"
+#   deepseek-v4-pro              -> reasoning agents (text-only)
+#   deepseek-v4-flash-vision-exp -> QA inspector (ONLY vision model on OpenCode Go)
+#   deepseek-v4.1-flash          -> execution agents (image gen, video gen, audio, etc.)
+MODEL_PRO_PRESETS="story-creator director screenplay-reviewer character-designer location-designer"
+MODEL_VISION_PRESETS="qa-inspector"
 
 set_agent_model() {
     local preset="$1" provider="opencode-go-deepseek" model="deepseek-v4.1-flash" effort="low"
+    case " $MODEL_VISION_PRESETS " in
+        *" $preset "*)
+            provider="opencode-go-deepseek-vision"; model="deepseek-v4-flash-vision-exp"; effort="high" ;;
+    esac
     case " $MODEL_PRO_PRESETS " in
         *" $preset "*)
             provider="opencode-go-deepseek-pro"; model="deepseek-v4-pro"; effort="high" ;;
