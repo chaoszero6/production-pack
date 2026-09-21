@@ -97,7 +97,7 @@ video_generation:
 # QA settings
 qa:
   max_retries: 3
-  vision_model: "deepseek-v4.1-flash"  # cloud multimodal — accepts images for QA
+  vision_model: "deepseek-v4-pro"  # cloud multimodal — V4 Pro for QA vision
   checks:
     - hand_anomalies
     - face_distortion
