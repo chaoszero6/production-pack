@@ -15,24 +15,24 @@ services:
     health_check_interval: 5  # seconds
     restart_timeout: 60       # seconds
 
-  # LLM models (managed by dsh-engine-switch plugin + Pipeline Orchestrator)
-  qwen35_122b:
-    host: "127.0.0.1"
-    port: 11434
-    model: "qwen3.5:122b-a10b-q4"
-    api_url: "http://127.0.0.1:11434/v1"
-    vram: "~75 GB at Q4"
+  # LLM agents run on cloud (OpenCode Go) — no local LLM during production
+  # RTX 5090 is 100% dedicated to ComfyUI. See config/models.yml for routing.
+  # Local LLMs (llama-qwen35-122b, qwen3.8-27b-q6k-cuda) are STOPPED during runs.
+  cloud_reasoning:
+    provider: "opencode-go-deepseek-pro"
+    model: "deepseek-v4-pro"
+    base_url: "https://opencode.ai/zen/go/v1"
+    input: [text]           # NO image support
+    context_window: 1000000
     role: "reasoning agents (story, director, reviewer, character/location design)"
-    load_on_demand: true  # unload during generation to free VRAM
 
-  qwen38_27b:
-    host: "127.0.0.1"
-    port: 11435
-    model: "qwen3.8:27b-q4"
-    api_url: "http://127.0.0.1:11435/v1"
-    vram: "~16 GB at Q4"
-    role: "execution agents + QA vision (multimodal — replaces Qwen2.5-VL)"
-    load_on_demand: false  # stays loaded during generation + QA phases
+  cloud_execution:
+    provider: "opencode-go-deepseek"
+    model: "deepseek-v4.1-flash"
+    base_url: "https://opencode.ai/zen/go/v1"
+    input: [text, image]    # Accepts images — QA vision
+    context_window: 1000000
+    role: "execution agents + QA vision"
 
   chatterbox:
     host: "127.0.0.1"
@@ -97,7 +97,7 @@ video_generation:
 # QA settings
 qa:
   max_retries: 3
-  vision_model: "qwen3.8-27b"  # multimodal — no separate vision model needed
+  vision_model: "deepseek-v4.1-flash"  # cloud multimodal — accepts images for QA
   checks:
     - hand_anomalies
     - face_distortion
@@ -127,9 +127,10 @@ audio:
 
 # Pipeline orchestration
 orchestration:
-  vram_management: true
+  cloud_llm: true                  # All agents on cloud — no local LLM needed
+  stop_local_llms: true            # Stop local LLMs to free full VRAM for ComfyUI
   auto_restart_comfyui: true
-  qwen_stop_before_generation: true
-  qwen_restart_after_generation: true
-  monitoring_interval: 2     # seconds
-  clip_generation_timeout: 300  # seconds
+  monitoring_interval: 2           # seconds
+  clip_generation_timeout: 600     # seconds (10 min per clip incl. upscale)
+  dsh_permission_mode: "danger-full-access"  # Headless has no approval channel
+  stream_idle_timeout_ms: 1800000  # 30 min — cloud models can pause during reasoning

@@ -12,6 +12,29 @@
 
 set -euo pipefail
 
+# ── dsh FILE SANDBOX ────────────────────────────────────────────────────────
+# dsh derives its filesystem sandbox from this env var; see
+# packages/bundle/base/cordis.patch.yml in the harness:
+#     mode:            process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
+#     workspaceRoot:   process.cwd()   -> $DSH_DIR, because run_dsh_agent cds there
+#     approval policy: 'never' iff danger-full-access, else 'ask'
+# Under the default every agent may write ONLY inside $DSH_DIR, so each write to
+# $RUN_DIR is denied -- and because the headless profile has no approval channel,
+# the sanctioned escalation to danger-full-access is rejected outright
+# ("sandbox escalation ... requires approval, but no approval channel is
+# available"), leaving the agent no way to recover. The director then wrote its
+# shot list to $DSH_DIR/shot_list.json and returned a PROSE summary ("Done. The
+# complete shot list is written to ...") which run_dsh_agent captured as the
+# artifact -- that is the real cause of
+#     "could not parse shot list: Expecting value: line 1 column 1 (char 0)"
+# (Python failing to parse the word "Done."). The character- and location-
+# designer hit the same wall and wrote their PNGs to /tmp instead.
+# Grant full access up front: the pack must write into $RUN_DIR and headless can
+# never prompt for it. Agents here are already trusted to run bash, so this
+# widens nothing that was not already reachable; it only stops the silent
+# prose-instead-of-JSON skew.
+export DSH_PERMISSION_MODE="${DSH_PERMISSION_MODE:-danger-full-access}"
+
 PACK_DIR="/root/production_pack"
 DSH_DIR="/root/desktop/deepseek-harness"
 COMFYUI_DIR="/opt/comfyui"
@@ -19,6 +42,21 @@ OUTPUT_DIR="$PACK_DIR/output"
 LLM_PORT=8085
 LLM_URL="http://127.0.0.1:$LLM_PORT"
 COMFYUI_URL="http://127.0.0.1:8188"
+
+# Cloud LLM routing (2026-09-21): EVERY production-pack agent runs on the
+# OpenCode Go cloud — deepseek-v4-pro for the five reasoning agents, and
+# deepseek-v4.1-flash for the other nine. No local LLM is involved, so the RTX
+# 5090 is left entirely to ComfyUI. dsh loads .env from the invocation cwd
+# ($DSH_DIR) or $DSH_HOME, neither of which carries OPENCODE_GO_API_KEY, so
+# mirror the Hermes env into $DSH_HOME and export it for the dsh process.
+DSH_SETTINGS="/root/.dsh/settings.yaml"
+if [ -f /root/.hermes/.env ]; then
+    cp /root/.hermes/.env "$DSH_DIR/.env"
+    OPENCODE_GO_API_KEY=$(sed -n 's/^OPENCODE_GO_API_KEY=//p' /root/.hermes/.env | head -1) || true
+    export OPENCODE_GO_API_KEY
+    # `log` is not defined yet at this point in the file — use a raw echo
+    [ -n "${OPENCODE_GO_API_KEY:-}" ] || echo "[$(date '+%H:%M:%S')] WARNING: OPENCODE_GO_API_KEY not found in /root/.hermes/.env — cloud agents will fail auth"
+fi
 
 SVC_122B="llama-qwen35-122b.service"
 SVC_27B="qwen3.8-27b-q6k-cuda.service"
@@ -50,30 +88,29 @@ wait_for_health() {
     die "$name failed to start within ${timeout}s"
 }
 
-swap_to_122b() {
-    log "Swapping LLM -> Qwen 3.5 122B..."
-    systemctl stop "$SVC_27B" 2>/dev/null || true
-    systemctl restart "$SVC_COMFYUI"  # free ComfyUI VRAM cache
-    sleep 3
-    systemctl start "$SVC_122B"
-    wait_for_health "$LLM_URL/health" "$WAIT_122B" "Qwen 3.5 122B"
-}
-
-swap_to_27b() {
-    log "Swapping LLM -> Qwen 3.8 27B..."
+# ── Local LLM management (VRAM only) ────────────────────────
+# 2026-09-21: EVERY production-pack agent runs on the OpenCode Go cloud, so no
+# local LLM is needed for agent work. The 27B on :8085 (which also backs the
+# interactive Hermes session) therefore stays stopped for the whole run so
+# ComfyUI owns the full RTX 5090 for image/video generation. The swap_* names
+# are kept as shims so the existing call sites keep working.
+ensure_llms_stopped() {
     systemctl stop "$SVC_122B" 2>/dev/null || true
-    systemctl restart "$SVC_COMFYUI"  # free ComfyUI VRAM cache
-    sleep 3
-    systemctl start "$SVC_27B"
-    wait_for_health "$LLM_URL/health" "$WAIT_27B" "Qwen 3.8 27B"
-}
-
-stop_all_llms() {
-    systemctl stop "$SVC_122B" 2>/dev/null || true
-    systemctl stop "$SVC_27B" 2>/dev/null || true
-    systemctl restart "$SVC_COMFYUI"  # free VRAM
+    if systemctl is-active --quiet "$SVC_27B"; then
+        log "Stopping $SVC_27B (frees ~27GB VRAM for ComfyUI; Hermes falls back to cloud)"
+        systemctl stop "$SVC_27B" 2>/dev/null || true
+    fi
+    # the docker container sometimes outlives the systemd unit
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^qwen38'; then
+        docker stop qwen38-27b-q6k > /dev/null 2>&1 || true
+    fi
     sleep 2
 }
+
+swap_to_122b()        { ensure_llms_stopped; }   # shim: cloud routing, nothing to swap
+swap_to_122b_legacy() { ensure_llms_stopped; }   # shim: cloud routing, nothing to swap
+swap_to_27b()         { ensure_llms_stopped; }   # shim: cloud routing, nothing to swap
+stop_all_llms()       { ensure_llms_stopped; }
 
 ensure_comfyui() {
     if ! curl -sf "$COMFYUI_URL/api/system_stats" > /dev/null 2>&1; then
@@ -97,6 +134,55 @@ start_hermes() {
     systemctl start "$SVC_HERMES" 2>/dev/null || true
 }
 
+# ── Per-agent cloud model routing ───────────────────────────
+# dsh's headless bundle resolves the model for every agent from the
+# `agent-default-model` section of settings.yaml at launch — there is no
+# per-preset override (the `engine:` plugin the presets reference,
+# @yuki-takuya-kun/dsh-engine-switch, is not installed and 404s on npm, so
+# those lines are inert). So we rewrite that one section before each call:
+#   deepseek-v4-pro     -> the five reasoning agents
+#   deepseek-v4.1-flash -> everything else (default)
+MODEL_PRO_PRESETS="story-creator director screenplay-reviewer character-designer location-designer"
+
+set_agent_model() {
+    local preset="$1" provider="opencode-go-deepseek" model="deepseek-v4.1-flash" effort="low"
+    case " $MODEL_PRO_PRESETS " in
+        *" $preset "*)
+            provider="opencode-go-deepseek-pro"; model="deepseek-v4-pro"; effort="high" ;;
+    esac
+
+    python3 - "$DSH_SETTINGS" "$provider" "$model" "$effort" << 'PYEOF'
+import sys, re, os, tempfile
+path, provider, model, effort = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+text = open(path).read()
+m = re.search(r'(?m)^agent-default-model:[ \t]*$', text)
+if not m:
+    sys.exit('agent-default-model section not found in ' + path)
+head, tail = text[:m.start()], text[m.end():]
+# drop the section body: everything until the next line that starts at column 0
+# (blank lines and indented/comment lines belong to this section)
+lines = tail.splitlines(keepends=True)
+rest = ''
+for i, ln in enumerate(lines):
+    if ln.strip() and ln[:1] not in (' ', '\t', '#'):
+        rest = ''.join(lines[i:])
+        break
+block = (
+    'agent-default-model:\n'
+    '  # Managed by production_pack/run.sh (per-agent cloud routing) — do not hand-edit.\n'
+    f'  provider: {provider}\n'
+    f'  model: {model}\n'
+    f'  reasoningEffort: {effort}\n'
+)
+# atomic write so a killed run can never leave a truncated settings.yaml
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.settings-', suffix='.tmp')
+with os.fdopen(fd, 'w') as fh:
+    fh.write(head + block + rest)
+os.replace(tmp, path)
+PYEOF
+    log "Model route: $preset -> $provider / $model (effort=$effort)"
+}
+
 run_dsh_agent() {
     local preset="$1" prompt_file="$2" output_file="$3"
     log "Running agent: $preset"
@@ -105,14 +191,147 @@ run_dsh_agent() {
 
     cd "$DSH_DIR"
     # dsh headless: takes task as positional arg, prints final answer to stdout
+    # For story-creator: extract valid JSON (strip any preamble/summary)
+    local raw_output="$RUN_DIR/${preset}_raw.txt"
+
+    # all agents are cloud-hosted: point agent-default-model at the right model
+    # (pro for the reasoning agents, flash for everything else) before launch
+    set_agent_model "$preset"
+
     pnpm dsh --profile headless \
         --patch "$PACK_DIR/.dsh/.agent-presets/$preset/agent.cordis.yml" \
         "$prompt_text" \
-        > "$output_file" \
+        > "$raw_output" \
         2>> "$RUN_DIR/pipeline.log" || {
         log "WARNING: Agent $preset exited non-zero. Check $RUN_DIR/pipeline.log"
+        # Save raw output even on failure for resume
     }
+
+    # Post-process: for story-creator, extract JSON block
+    if [[ "$preset" == "story-creator" ]]; then
+        log "Extracting JSON from story-creator output..."
+        python3 - "$raw_output" "$output_file" << 'PYEOF'
+import sys, json, re
+raw = open(sys.argv[1]).read()
+
+# Candidate list, most-trusted source first:
+#   1. the whole stdout (agent printed nothing but JSON)
+#   2. fenced ```json blocks (agent wrapped it in prose)
+#   3. every balanced top-level {...} in the text, found by brace-depth scan
+# A naive regex cannot do (3): the story schema nests objects 3+ levels deep,
+# so a one-level pattern silently returns an inner sub-object instead.
+candidates = []
+
+try:
+    candidates.append(json.loads(raw.strip()))
+except Exception:
+    pass
+
+for block in re.findall(r'```(?:json)?\s*(.*?)```', raw, re.DOTALL):
+    try:
+        candidates.append(json.loads(block.strip()))
+    except Exception:
+        pass
+
+def balanced_objects(text):
+    objects, depth, start, in_str, esc = [], 0, None, False, False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    objects.append(text[start:i + 1])
+    return objects
+
+for blob in balanced_objects(raw):
+    try:
+        candidates.append(json.loads(blob))
+    except Exception:
+        pass
+
+req = ['title', 'logline', 'theme', 'characters', 'locations', 'acts', 'scenes']
+
+# Prefer a candidate that satisfies the schema; otherwise the richest object,
+# so the error message below can name exactly what the agent omitted.
+best, best_complete = None, None
+for obj in candidates:
+    if not isinstance(obj, dict):
+        continue
+    if all(k in obj for k in req):
+        if best_complete is None or len(obj) > len(best_complete):
+            best_complete = obj
+    elif best is None or len(obj) > len(best):
+        best = obj
+
+chosen = best_complete if best_complete is not None else best
+if chosen is None:
+    print("No parseable JSON object found in agent output "
+          f"({len(raw)} bytes)", file=sys.stderr)
+    sys.exit(1)
+
+missing = [k for k in req if k not in chosen]
+if missing:
+    print(f"Missing required keys: {missing}", file=sys.stderr)
+    print(f"Agent's top-level keys were: {sorted(chosen.keys())}",
+          file=sys.stderr)
+    if len(candidates) > 1:
+        print(f"({len(candidates)} JSON candidates scanned)", file=sys.stderr)
+    sys.exit(1)
+
+json.dump(chosen, open(sys.argv[2], 'w'), indent=2)
+print(f"story.json written ({len(json.dumps(chosen))} chars, "
+      f"{len(chosen.get('scenes', []) or [])} scenes)")
+PYEOF
+        local rc=$?
+        if [[ $rc -ne 0 ]]; then
+            log "ERROR: story-creator JSON extraction failed (exit $rc)"
+            # Don't copy raw output — it's incomplete; let resume retry
+            return 1
+        fi
+    else
+        # Every other preset emits JSON too, and agents habitually wrap the object in
+        # a prose preamble ("Here's my review and the built prompt.") or a ```json
+        # fence. Copying raw stdout verbatim handed downstream consumers a mixed
+        # document that json.load() rejects, so their except-branches silently took
+        # the wrong path:
+        #   * HAS_DIALOGUE -> 'no'   => no dialogue audio on lip-sync clips
+        #   * VERDICT      -> 'FAIL' => a valid clip burns all MAX_RETRY attempts
+        # Prefer an artifact the agent wrote itself with its tools; otherwise extract
+        # the JSON object properly (brace-counted, nesting-safe).
+        if [ -s "$output_file" ] && \
+           python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$output_file" 2>/dev/null; then
+            log "  (kept agent-written $output_file)"
+        elif ! python3 "$PACK_DIR/extract_json.py" "$raw_output" "$output_file" \
+                 >>"$RUN_DIR/pipeline.log" 2>&1; then
+            log "WARNING: $preset emitted no parseable JSON — keeping raw stdout"
+            cp "$raw_output" "$output_file"
+        fi
+    fi
+
+    # Mid-run failure watcher: an empty artifact means the agent call itself
+    # failed (API/transport), which would otherwise silently cascade into
+    # downstream steps. Log + push to Discord so the run is never silently wrong.
+    if [[ ! -s "$output_file" ]]; then
+        log "ERROR: agent $preset produced an empty artifact: $output_file"
+        notify "Agent $preset produced EMPTY output during run $(basename "$RUN_DIR") — see pipeline.log" "Pipeline Warning"
+        return 1
+    fi
     log "Agent $preset done -> $output_file"
+    return 0
 }
 
 write_prompt() {
@@ -235,8 +454,7 @@ should_process_clip() {
 # ═══════════════════════════════════════════════════════════
 
 step "PHASE 1: PRE-PRODUCTION"
-notify "Phase 1: Pre-production starting (Qwen 3.5 122B)" "Pre-Production"
-swap_to_122b
+notify "Phase 1: Pre-production starting (DeepSeek V4 Pro via OpenCode Go)" "Pre-Production"
 
 # 1a. Story Creator
 if ! skip_if_done "$RUN_DIR/story.json" "Story Creator"; then
@@ -246,12 +464,14 @@ if ! skip_if_done "$RUN_DIR/story.json" "Story Creator"; then
 
 --- STORY ---
 $(cat "$RUN_DIR/input_story.md")"
-    run_dsh_agent "story-creator" "$RUN_DIR/prompt_story.txt" "$RUN_DIR/story.json"
+    run_dsh_agent "story-creator" "$RUN_DIR/prompt_story.txt" "$RUN_DIR/story.json" \
+        || die "story-creator failed — no story.json (check $RUN_DIR/pipeline.log)"
+    [ -s "$RUN_DIR/story.json" ] || die "story.json is empty — aborting"
 fi
 
 # Post story summary to Discord before continuing
 if [ -f "$RUN_DIR/story.json" ]; then
-    STORY_SUMMARY=$(python3 << 'PYEOF'
+    STORY_SUMMARY=$(python3 - "$RUN_DIR" << 'PYEOF'
 import json, sys
 try:
     with open("RUNDIR/story.json".replace("RUNDIR", sys.argv[1])) as f:
@@ -275,7 +495,7 @@ try:
 except Exception as e:
     print(f"(could not parse story: {e})")
 PYEOF
-    "$RUN_DIR" 2>/dev/null)
+)
 
     notify "$STORY_SUMMARY\n\nProceeding with directing and asset generation..." "Story Analysis"
     log "$STORY_SUMMARY"
@@ -291,12 +511,13 @@ if ! skip_if_done "$RUN_DIR/shot_list.json" "Director"; then
 - Mark which shots have DIALOGUE (needs lip sync) vs NARRATION (no lip sync)
 - Specify camera, characters, hand positions, identity anchors
 - Output valid JSON to be processed shot-by-shot."
-    run_dsh_agent "director" "$RUN_DIR/prompt_director.txt" "$RUN_DIR/shot_list.json"
+    run_dsh_agent "director" "$RUN_DIR/prompt_director.txt" "$RUN_DIR/shot_list.json" \
+        || die "director failed — no shot_list.json (check $RUN_DIR/pipeline.log)"
 fi
 
 # Post shot plan summary to Discord
 if [ -f "$RUN_DIR/shot_list.json" ]; then
-    SHOT_SUMMARY=$(python3 << 'PYEOF'
+    SHOT_SUMMARY=$(python3 - "$RUN_DIR" << 'PYEOF'
 import json, sys
 try:
     with open("RUNDIR/shot_list.json".replace("RUNDIR", sys.argv[1])) as f:
@@ -321,7 +542,7 @@ try:
 except Exception as e:
     print(f"(could not parse shot list: {e})")
 PYEOF
-    "$RUN_DIR" 2>/dev/null)
+)
 
     notify "$SHOT_SUMMARY\n\nGenerating character sheets and locations next..." "Shot Plan"
     log "$SHOT_SUMMARY"
@@ -331,11 +552,10 @@ fi
 if ! skip_if_done "$RUN_DIR/character_manifest.json" "Character Designer"; then
     step "1c. Character Designer — generating reference sheets"
     ensure_comfyui
-    stop_all_llms
-    swap_to_122b
     write_prompt "$RUN_DIR/prompt_characters.txt" \
         "Read $RUN_DIR/story.json. For each character, generate multi-angle reference sheets using Qwen Image 2.1 via ComfyUI API at $COMFYUI_URL. Model: qwen_image_2.1_bf16.safetensors. Create front, 3/4, side, back views at 2048x2048. Save to $RUN_DIR/characters/{name}/. Output a manifest JSON listing all generated files."
-    run_dsh_agent "character-designer" "$RUN_DIR/prompt_characters.txt" "$RUN_DIR/character_manifest.json"
+    run_dsh_agent "character-designer" "$RUN_DIR/prompt_characters.txt" "$RUN_DIR/character_manifest.json" \
+        || die "character-designer failed — no character_manifest.json (check $RUN_DIR/pipeline.log)"
     notify "Character reference sheets generated" "Character Designer"
 fi
 
@@ -344,7 +564,8 @@ if ! skip_if_done "$RUN_DIR/location_manifest.json" "Location Designer"; then
     step "1d. Location Designer — generating environments"
     write_prompt "$RUN_DIR/prompt_locations.txt" \
         "Read $RUN_DIR/story.json. For each location, generate reference images using Qwen Image 2.1 via ComfyUI at $COMFYUI_URL. Create establishing and medium shots with mood-appropriate lighting. Save to $RUN_DIR/locations/{name}/. Output a manifest JSON."
-    run_dsh_agent "location-designer" "$RUN_DIR/prompt_locations.txt" "$RUN_DIR/location_manifest.json"
+    run_dsh_agent "location-designer" "$RUN_DIR/prompt_locations.txt" "$RUN_DIR/location_manifest.json" \
+        || die "location-designer failed — no location_manifest.json (check $RUN_DIR/pipeline.log)"
     notify "Location references generated" "Location Designer"
 fi
 
@@ -414,7 +635,6 @@ for SHOT_ID in $SHOT_IDS; do
 
         # ── 2a. Screenplay Reviewer (122B) ──
         log "[$SHOT_ID] Prompt review..."
-        swap_to_122b
         CORRECTIONS=""
         [ -f "$CLIP_DIR/qa_verdict.json" ] && CORRECTIONS="Previous QA feedback: $(cat "$CLIP_DIR/qa_verdict.json")"
 
@@ -471,6 +691,17 @@ except:
         write_prompt "$CLIP_DIR/prompt_qa.txt" \
             "Review $CLIP_DIR/clip.mp4. Extract frames with ffmpeg. Check: hands (finger count, merging), face (distortion, symmetry), character identity (vs refs in $RUN_DIR/characters/), duplication, motion, lip sync (dialogue=lips move, narration=lips closed). Score 0-1 per category, threshold 0.85. Output JSON with verdict PASS/FAIL and corrections if FAIL."
         run_dsh_agent "qa-inspector" "$CLIP_DIR/prompt_qa.txt" "$CLIP_DIR/qa_verdict.json"
+
+        # qa-inspector writes its real report to qa_report.json with its own tools and prints a
+        # markdown review to stdout, so qa_verdict.json lands here as PROSE. The verdict read
+        # below catches the resulting json.load() failure and silently yields 'FAIL' — which is
+        # accidentally right when the clip really failed, but a false FAIL on a passing clip
+        # burns all MAX_RETRY attempts in H3 re-renders and ends with the clip ESCALATED.
+        QA_NORM=$(python3 "$PACK_DIR/normalise_qa_verdict.py" "$CLIP_DIR" "$RETRY" 2>&1 || true)
+        if [ -n "$QA_NORM" ]; then
+            log "  $QA_NORM"
+            echo "$QA_NORM" >> "$RUN_DIR/pipeline.log"
+        fi
 
         VERDICT=$(python3 -c "
 import json

@@ -1,73 +1,65 @@
-# Model Configuration — Which LLM drives which agent
+# Model Configuration — Cloud routing via OpenCode Go
 #
-# Two models available:
-#   - qwen3.5-122b-a10b: Complex reasoning, creative writing, structured prompt construction
-#   - qwen3.8-27b: Fast execution, tool use, API calls, vision-capable, lightweight
+# 2026-09-21: Switched from local LLMs to cloud models.
+# All agents run on OpenCode Go — no local LLM needed during production.
+# RTX 5090 is 100% dedicated to ComfyUI (image/video generation).
 #
-# Uses dsh-engine-switch plugin to route models per preset.
-# Priority: preset-level > engineByPreset mapping > default
+# dsh-engine-switch plugin is NOT installed (404s on npm), so per-preset
+# engine declarations in agent.cordis.yml are inert. Instead, run.sh
+# rewrites the agent-default-model section of ~/.dsh/settings.yaml
+# before each agent call via set_agent_model().
 
-# Default engine (fallback)
-defaultEngine: "qwen3.8-27b"
+# Per-preset model routing (managed by run.sh set_agent_model)
+routing:
+  # Reasoning agents → DeepSeek V4 Pro (text-only, 1M context, high effort)
+  # NOTE: V4 Pro REJECTS image input — only for text reasoning agents
+  reasoning_agents:
+    - story-creator
+    - director
+    - screenplay-reviewer
+    - character-designer
+    - location-designer
+  reasoning_provider: "opencode-go-deepseek-pro"
+  reasoning_model: "deepseek-v4-pro"
+  reasoning_effort: "high"
 
-# Per-preset model mapping
-engineByPreset:
-  # --- Heavy reasoning agents → Qwen 3.5 122B-A10B ---
-  story-creator: "qwen3.5-122b-a10b"       # Creative writing, story structure
-  director: "qwen3.5-122b-a10b"             # Multi-step shot planning, creative decisions
-  screenplay-reviewer: "qwen3.5-122b-a10b"  # Complex ref2va prompt construction, artifact prevention
-  character-designer: "qwen3.5-122b-a10b"   # Detailed visual design prompts
-  location-designer: "qwen3.5-122b-a10b"    # Environment art direction
+  # Execution agents → DeepSeek V4.1 Flash (text+image, 1M context, low effort)
+  # NOTE: V4.1 Flash ACCEPTS image input — used for QA vision analysis
+  execution_agents:
+    - storyboard-artist
+    - image-generator
+    - audio-producer
+    - music-composer
+    - video-generator
+    - qa-inspector
+    - pipeline-orchestrator
+    - subtitle-generator
+    - post-production-editor
+  execution_provider: "opencode-go-deepseek"
+  execution_model: "deepseek-v4.1-flash"
+  execution_effort: "low"
 
-  # --- Execution agents → Qwen 3.8 27B ---
-  storyboard-artist: "qwen3.8-27b"          # Quick sketch prompts, straightforward
-  image-generator: "qwen3.8-27b"            # ComfyUI API calls, workflow execution
-  audio-producer: "qwen3.8-27b"             # TTS API calls, voice selection logic
-  music-composer: "qwen3.8-27b"             # Music generation prompts
-  video-generator: "qwen3.8-27b"            # ComfyUI API calls, H3 workflow execution
-  qa-inspector: "qwen3.8-27b"               # Vision-capable! Can analyze frames directly
-  pipeline-orchestrator: "qwen3.8-27b"       # Service management, health checks
-  subtitle-generator: "qwen3.8-27b"          # Structured but simple SRT/ASS generation
-  post-production-editor: "qwen3.8-27b"      # FFmpeg commands, assembly logic
+# Cloud provider config (in ~/.dsh/settings.yaml)
+providers:
+  opencode-go-deepseek-pro:
+    base_url: "https://opencode.ai/zen/go/v1"
+    key_env: "OPENCODE_GO_API_KEY"
+    session_header: "x-opencode-session: production-pack"
+    stream_idle_timeout_ms: 1800000  # 30 min — long reasoning blocks
+    model: "deepseek-v4-pro"
+    input: [text]  # NO image support
+    context_window: 1000000
+    thinking_format: "deepseek"
 
-# --- Model serving configuration ---
-models:
-  qwen3.5-122b-a10b:
-    # MoE: 122B total, 10B active per token
-    backend: "vllm"                # or ollama, llama.cpp
-    quantization: "Q4_K_M"        # ~75 GB VRAM at Q4
-    context_length: 131072
-    api_url: "http://127.0.0.1:11434/v1"  # if using ollama
-    notes: |
-      Heavy model. Only loaded when a reasoning agent needs it.
-      Pipeline Orchestrator should unload this before image/video generation
-      to free VRAM, then reload for the next reasoning step.
+  opencode-go-deepseek:
+    base_url: "https://opencode.ai/zen/go/v1"
+    key_env: "OPENCODE_GO_API_KEY"
+    session_header: "x-opencode-session: production-pack"
+    stream_idle_timeout_ms: 1800000
+    model: "deepseek-v4.1-flash"
+    input: [text, image]  # Accepts images — for QA
+    context_window: 1000000
+    thinking_format: "deepseek"
 
-  qwen3.8-27b:
-    # Dense: 27B params, multimodal (text + vision)
-    backend: "vllm"
-    quantization: "Q4_K_M"        # ~16 GB VRAM at Q4
-    context_length: 262144
-    api_url: "http://127.0.0.1:11435/v1"  # separate port
-    notes: |
-      Lightweight model. Can stay loaded alongside ComfyUI generation.
-      Multimodal — QA Inspector can send frames directly to this model
-      instead of needing a separate Qwen2.5-VL instance.
-
-# --- VRAM budget planning ---
-# Assuming single GPU (RTX 4090 24GB) or dual setup:
-#
-# Scenario A: Reasoning phase (story, directing, prompt review)
-#   qwen3.5-122b-a10b (Q4): ~75 GB → needs 96+ GB system or dual GPU
-#   OR run via API/cloud if hardware can't fit it
-#
-# Scenario B: Generation phase
-#   qwen3.8-27b (Q4):      ~16 GB
-#   + ComfyUI + model:      ~8-12 GB (Qwen Image 2.1 or MiniMax H3)
-#   Total:                   ~24-28 GB → fits on 1-2 consumer GPUs
-#
-# Scenario C: QA phase
-#   qwen3.8-27b (Q4):      ~16 GB (multimodal — doubles as QA vision model)
-#   Total:                   ~16 GB → fits on single GPU
-#
-# The pipeline naturally phases between A, B, C — never all at once.
+# VRAM impact: NONE for LLM — all cloud
+# RTX 5090 32GB is fully available for ComfyUI generation
