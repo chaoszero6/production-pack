@@ -658,6 +658,8 @@ for SHOT_ID in $SHOT_IDS; do
         run_dsh_agent "screenplay-reviewer" "$CLIP_DIR/prompt_review.txt" "$CLIP_DIR/reviewed_prompt.json"
 
         # ── 2b. Dialogue audio (if needed) ──
+        # Check BOTH: prompt has <d> tags AND dialogue.wav actually exists
+        # On retries, the prompt may have tags but dialogue.wav may be missing
         HAS_DIALOGUE=$(python3 -c "
 import json
 try:
@@ -669,7 +671,19 @@ except:
     print('no')
 " 2>/dev/null)
 
+        # Generate dialogue if: prompt expects it AND (wav missing OR this is a retry)
+        NEED_DIALOGUE=false
         if [ "$HAS_DIALOGUE" = "yes" ]; then
+            if [ ! -s "$CLIP_DIR/dialogue.wav" ]; then
+                log "[$SHOT_ID] dialogue.wav MISSING — must generate before video"
+                NEED_DIALOGUE=true
+            elif [ $RETRY -gt 0 ]; then
+                log "[$SHOT_ID] Retry — regenerating dialogue audio with corrected emotion"
+                NEED_DIALOGUE=true
+            fi
+        fi
+
+        if [ "$NEED_DIALOGUE" = "true" ]; then
             log "[$SHOT_ID] Generating dialogue audio (before video for lip sync)..."
             swap_to_27b
             # Extract emotion info from shot list for the prompt
