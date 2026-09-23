@@ -11,10 +11,24 @@ Used by the QA Inspector agent to systematically review each generated clip.
 ## Inspection Protocol
 
 ### Step 1: Extract frames
-Extract frames from the video at 2 FPS for analysis:
+Extract frames from the video at 2 FPS for analysis.
+**Always use an absolute path under the run directory** — never a relative `output/qa/...`
+path (CWD is `$DSH_DIR`, so relative paths land in the harness sandbox and the pipeline
+gate never finds them):
+
 ```bash
-ffmpeg -i {clip_path} -vf fps=2 output/qa/{shot_id}/frame_%04d.png
+# {run_dir} = parent of clips/ (e.g. .../output/run_YYYYMMDD_HHMMSS)
+mkdir -p {run_dir}/qa/{shot_id}
+ffmpeg -i {clip_path} -vf fps=2 {run_dir}/qa/{shot_id}/frame_%04d.png
 ```
+
+**Write the structured report to BOTH of these absolute paths** (the normaliser
+searches them, newest mtime wins):
+
+1. `{run_dir}/qa/{shot_id}/qa_report.json`  ← preferred
+2. `{clip_dir}/qa_report.json`              ← also searched
+
+Do **not** write `qa_report.json` under `$DSH_DIR/output/qa/...`.
 
 ### Step 2: Prepare analysis prompts
 For each extracted frame, send to Qwen2.5-VL with this analysis prompt:

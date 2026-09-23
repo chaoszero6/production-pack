@@ -159,12 +159,21 @@ def run_dir_for(clip_dir):
 
 
 def candidate_reports(clip_dir):
-    """qa_report.json locations, newest mtime first (inspector is inconsistent about where it writes)."""
+    """qa_report.json locations, newest mtime first (inspector is inconsistent about where it writes).
+
+    A report older than clip.mp4 is from a PRIOR take and must not be bound to this
+    clip — a crashed/absent inspector would otherwise re-commit yesterday's FAIL.
+    """
     shot_id = os.path.basename(os.path.abspath(clip_dir.rstrip("/")))
     paths = [
         os.path.join(clip_dir, "qa_report.json"),
         os.path.join(run_dir_for(clip_dir), "qa", shot_id, "qa_report.json"),
     ]
+    # Skill historically said relative output/qa/{shot_id}/ — under dsh CWD=$DSH_DIR
+    # that lands in the harness sandbox, not the run dir. Search there too.
+    dsh_dir = os.environ.get("DSH_DIR") or "/root/desktop/deepseek-harness"
+    paths.append(os.path.join(dsh_dir, "output", "qa", shot_id, "qa_report.json"))
+    paths.append(os.path.join(dsh_dir, "qa", shot_id, "qa_report.json"))
 
     def mtime(p):
         try:
@@ -172,12 +181,31 @@ def candidate_reports(clip_dir):
         except OSError:
             return -1.0
 
-    return sorted([p for p in paths if os.path.isfile(p)], key=mtime, reverse=True)
+    clip_mp4 = os.path.join(clip_dir, "clip.mp4")
+    clip_m = mtime(clip_mp4)
+    fresh = []
+    for p in paths:
+        if not os.path.isfile(p):
+            continue
+        # Allow 2s clock skew; drop clearly-older prior-take reports.
+        if clip_m > 0 and mtime(p) + 2.0 < clip_m:
+            continue
+        fresh.append(p)
+    return sorted(fresh, key=mtime, reverse=True)
 
 
 def find_verdict(clip_dir):
     """Resolve (verdict, source, rich_report). Most reliable source first."""
     verdict_path = os.path.join(clip_dir, "qa_verdict.json")
+    clip_mp4 = os.path.join(clip_dir, "clip.mp4")
+
+    def _mtime(p):
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return -1.0
+
+    clip_m = _mtime(clip_mp4)
 
     rich = None
     rich_path = None
@@ -192,8 +220,10 @@ def find_verdict(clip_dir):
         src = "qa_report.json['verdict']" + (f" ({rich_path})" if rich_path else "")
         return v, src, rich
 
+    # An existing qa_verdict.json older than the current clip is a prior take —
+    # ignore it (agent crash must not re-bind last take's FAIL/PASS).
     existing = load_json(verdict_path)
-    if existing:
+    if existing and not (clip_m > 0 and _mtime(verdict_path) + 2.0 < clip_m):
         v = norm_verdict(existing.get("verdict"))
         if v:
             return v, "qa_verdict.json (already valid JSON)", rich or existing
@@ -202,6 +232,8 @@ def find_verdict(clip_dir):
         with open(verdict_path, encoding="utf-8", errors="replace") as fh:
             prose = fh.read()
     except Exception:
+        prose = ""
+    if clip_m > 0 and _mtime(verdict_path) + 2.0 < clip_m:
         prose = ""
 
     for obj in json_objects_in(prose):
@@ -375,7 +407,26 @@ def main():
 
     verdict, source, rich = find_verdict(clip_dir)
     if verdict is None:
-        print(f"qa-verdict: no verdict found in {clip_dir} — leaving file as-is")
+        # Unresolved = no fresh report and the existing qa_verdict.json is older than
+        # clip.mp4 (prior take). Leaving that stale FAIL in place makes run.sh's
+        # json.load().get('verdict') re-bind it and burn an H3 retry on an unjudged
+        # clip. Neutralise it so the gate sees an empty verdict and takes the
+        # infra-retry / escalate path instead.
+        verdict_path_unres = os.path.join(clip_dir, "qa_verdict.json")
+        if os.path.isfile(verdict_path_unres):
+            stale = (
+                os.path.join(clip_dir,
+                             f"qa_verdict_stale_{int(datetime.now().timestamp())}.json")
+            )
+            try:
+                os.replace(verdict_path_unres, stale)
+                print(f"qa-verdict: no fresh verdict in {clip_dir} — "
+                      f"moved prior-take verdict aside -> {stale}")
+            except OSError as exc:
+                print(f"qa-verdict: no verdict found in {clip_dir} — "
+                      f"could not neutralise prior verdict ({exc})")
+        else:
+            print(f"qa-verdict: no verdict found in {clip_dir} — leaving file as-is")
         return 1
 
     dir_shot_id = os.path.basename(os.path.abspath(clip_dir))

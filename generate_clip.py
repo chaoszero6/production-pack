@@ -36,6 +36,9 @@ def systemctl(action, service):
     subprocess.run(["systemctl", action, service], capture_output=True)
 
 def stop_llm():
+    if os.environ.get("CLOUD_ROUTING", "1") == "1":
+        log("CLOUD_ROUTING=1 — stop_llm is a no-op")
+        return
     log("Stopping LLM to free VRAM...")
     systemctl("stop", "qwen3.8-27b-q6k-cuda.service")
     systemctl("stop", "llama-qwen35-122b.service")
@@ -43,6 +46,9 @@ def stop_llm():
     time.sleep(2)
 
 def start_llm():
+    if os.environ.get("CLOUD_ROUTING", "1") == "1":
+        log("CLOUD_ROUTING=1 — start_llm is a no-op")
+        return True
     log("Starting LLM...")
     systemctl("start", "qwen3.8-27b-q6k-cuda.service")
     for i in range(60):
@@ -148,7 +154,11 @@ def main():
     gen_start_time = time.time()
 
     # Step 1: Ensure LLM is running for the agent
-    start_llm()
+    # Cloud routing: agents use OpenRouter — never start the local Qwen (VRAM hog).
+    if os.environ.get("CLOUD_ROUTING", "1") == "1":
+        log("CLOUD_ROUTING=1 — skipping local LLM start")
+    else:
+        start_llm()
 
     # Step 2: Read the prompt for the agent
     prompt_file = os.path.join(shot_dir, "prompt_video.txt")
@@ -201,14 +211,14 @@ def main():
         running, pending = get_queue_state()
 
         if (running > 0 or pending > 0) and not llm_stopped:
-            # Agent has queued a workflow — stop LLM to free VRAM for H3
-            # DO NOT restart ComfyUI — it would kill the running workflow!
-            # Just stop the LLM to free ~20GB VRAM for H3 model loading.
+            # Agent has queued a workflow — free VRAM for H3
             log(f"Workflow queued! (running={running}, pending={pending}) — stopping LLM for VRAM")
             stop_llm()
+            # Restart ComfyUI to reclaim VRAM
+            restart_comfyui()
             llm_stopped = True
             queue_detected = True
-            log("LLM stopped. ComfyUI keeps running with more VRAM available for H3.")
+            log("LLM stopped, ComfyUI restarted. Full VRAM for H3 generation.")
 
         if llm_stopped and running == 0 and pending == 0 and queue_detected:
             # Generation might be done — wait a bit to confirm
@@ -254,10 +264,14 @@ def main():
     with open(os.path.join(shot_dir, "generation_log.json"), "w") as f:
         json.dump(gen_log, f, indent=2)
 
-    # Step 7: Restart LLM for QA
-    log("Restarting LLM for QA...")
-    restart_comfyui()  # clean VRAM first
-    start_llm()
+    # Step 7: Restart LLM for QA (cloud routing: nothing to restart)
+    if os.environ.get("CLOUD_ROUTING", "1") == "1":
+        log("CLOUD_ROUTING=1 — skipping LLM restart for QA")
+        restart_comfyui()
+    else:
+        log("Restarting LLM for QA...")
+        restart_comfyui()  # clean VRAM first
+        start_llm()
 
     return 0 if os.path.exists(clip_path) else 1
 
