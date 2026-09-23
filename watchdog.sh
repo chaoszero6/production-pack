@@ -1,198 +1,244 @@
 #!/bin/bash
-# Watchdog — uses AI agent to diagnose crashes, fix, and auto-resume.
-# Usage: ./watchdog.sh <story.md>        (new production)
-#        ./watchdog.sh --resume          (resume latest)
+# ═══════════════════════════════════════════════════════════════════
+# Watchdog — smart monitor for the production pipeline.
+#
+# Behavior:
+#   1. If run.sh is running → sleep
+#   2. If pipeline down but an orphan agent has a ComfyUI job → wait
+#      (max 15 min) so the render isn't wasted
+#   3. If pipeline down and nothing in flight → kill leftovers, resume
+#   4. Exits when final/movie_4k60.mp4 exists
+#
+# Usage:
+#   ./watchdog.sh <story.md>         (new production)
+#   ./watchdog.sh --resume           (resume latest)
+#   ./watchdog.sh --resume <dir>     (resume specific)
+# ═══════════════════════════════════════════════════════════════════
+
+set -uo pipefail
 
 PACK_DIR="/root/production_pack"
 DSH_DIR="/root/desktop/deepseek-harness"
 NOTIFY="$PACK_DIR/pipeline/notify.sh"
-MAX_CRASHES=5
+COMFYUI_URL="http://127.0.0.1:8188"
+CHECK_INTERVAL=30          # seconds between monitor checks
+ORPHAN_RENDER_MAX=900      # 15 min max wait for orphan ComfyUI job
+MAX_CONSECUTIVE_CRASHES=5
 CRASH_COUNT=0
 
-notify() { bash "$NOTIFY" "$1" "${2:-}" 2>/dev/null; }
+notify() { bash "$NOTIFY" "$1" "${2:-}" 2>/dev/null & }
 log()    { echo "[watchdog $(date '+%H:%M:%S')] $*"; }
 
-ai_diagnose_and_fix() {
-    local exit_code="$1"
-    local run_dir
-    run_dir=$(find "$PACK_DIR/output" -maxdepth 1 -type d -name "run_2*" | sort -r | head -1)
-    if [ -z "$run_dir" ]; then
-        log "No run directory found — retrying blind"
-        notify "Watchdog: no run dir, retrying in 30s" "Watchdog"
-        sleep 30
-        return 0
-    fi
-
-    log "Calling AI agent to diagnose crash (exit=$exit_code) in $run_dir..."
-    notify "Pipeline crashed (exit $exit_code). AI agent diagnosing..." "Watchdog"
-
-    # Collect crash context
-    local crash_context=""
-    crash_context+="=== PIPELINE EXIT CODE: $exit_code ===\n"
-    crash_context+="=== LAST 80 LINES OF pipeline.log ===\n"
-    crash_context+="$(tail -80 "$run_dir/pipeline.log" 2>/dev/null)\n"
-    crash_context+="=== LAST 40 LINES OF run_latest.log ===\n"
-    crash_context+="$(tail -40 "$PACK_DIR/output/run_latest.log" 2>/dev/null)\n"
-    crash_context+="=== SERVICES ===\n"
-    crash_context+="comfyui: $(systemctl is-active comfyui.service 2>/dev/null)\n"
-    crash_context+="qwen35: $(systemctl is-active llama-qwen35-122b.service 2>/dev/null)\n"
-    crash_context+="qwen38: $(systemctl is-active qwen3.8-27b-q6k-cuda.service 2>/dev/null)\n"
-    crash_context+="=== GPU ===\n"
-    crash_context+="$(nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader 2>/dev/null)\n"
-    crash_context+="=== DISK ===\n"
-    crash_context+="$(df -h /root --output=avail 2>/dev/null | tail -1)\n"
-    crash_context+="=== LAST RAW AGENT OUTPUT ===\n"
-    local last_raw=$(ls -t "$run_dir"/*_raw.txt 2>/dev/null | head -1)
-    if [ -n "$last_raw" ]; then
-        crash_context+="$(tail -30 "$last_raw" 2>/dev/null)\n"
-    fi
-
-    # Write crash context to a temp file
-    local ctx_file="$run_dir/watchdog_crash_context.txt"
-    echo -e "$crash_context" > "$ctx_file"
-
-    # Write the diagnosis prompt
-    local prompt_file="$run_dir/watchdog_prompt.txt"
-    cat > "$prompt_file" << 'DIAG_PROMPT'
-You are the pipeline watchdog. The production pipeline just crashed. Your job:
-
-1. READ the crash context below
-2. DIAGNOSE the root cause (not symptoms)
-3. FIX the problem by running shell commands
-4. Report what you found and fixed
-
-Common crash causes and fixes:
-- YAML parse error in ~/.dsh/settings.yaml → restore from backup: cp $(ls -t ~/.dsh/settings.yaml.bak* | head -1) ~/.dsh/settings.yaml
-- Cloud API auth failure (401/MissingSessionID) → re-copy key: cp /root/.hermes/.env /root/desktop/deepseek-harness/.env
-- Cloud API rate limit (429) → just wait, report how long
-- Cloud API timeout → check internet: curl -s https://opencode.ai/health
-- ComfyUI crash/OOM → restart: systemctl restart comfyui.service; stop local LLMs to free VRAM
-- dsh hung process → pkill -f "dsh --profile"
-- Disk full → report, cannot auto-fix
-- JSON parse failure from agent → likely transient, just retry
-- settings.yaml agent-default-model section missing → the set_agent_model python script may have corrupted it
-
-After fixing, output a JSON summary:
-{
-  "diagnosis": "what went wrong",
-  "fix_applied": "what you did to fix it",
-  "can_resume": true/false,
-  "wait_seconds": 30
+# ── Detect the run directory ──────────────────────────────────
+find_run_dir() {
+    # Match only timestamped run dirs (run_YYYYMMDD_HHMMSS)
+    ls -td "$PACK_DIR/output/run_"[0-9]* 2>/dev/null | head -1 || true
 }
-DIAG_PROMPT
 
-    # Append crash context to prompt
-    echo -e "\n--- CRASH CONTEXT ---\n" >> "$prompt_file"
+# ── Check if final movie exists ───────────────────────────────
+is_movie_done() {
+    local run_dir
+    run_dir=$(find_run_dir)
+    [ -n "$run_dir" ] && [ -f "$run_dir/final/movie_4k60.mp4" ]
+}
+
+# ── Check if run.sh is alive ─────────────────────────────────
+is_pipeline_running() {
+    pgrep -f "run\.sh.*--resume\|run\.sh.*/run_" > /dev/null 2>&1
+}
+
+# ── Check if ComfyUI has an active job ────────────────────────
+comfyui_has_job() {
+    local queue
+    queue=$(curl -sf "$COMFYUI_URL/api/queue" 2>/dev/null) || return 1
+    local running pending
+    running=$(echo "$queue" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("queue_running",[])))' 2>/dev/null || echo 0)
+    pending=$(echo "$queue" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("queue_pending",[])))' 2>/dev/null || echo 0)
+    [ "$running" -gt 0 ] || [ "$pending" -gt 0 ]
+}
+
+# ── Check for orphan dsh agents ───────────────────────────────
+has_orphan_agents() {
+    pgrep -f "dsh --profile headless" > /dev/null 2>&1
+}
+
+# ── Kill leftover processes ───────────────────────────────────
+kill_leftovers() {
+    log "Cleaning up leftover processes..."
+    pkill -f "dsh --profile headless" 2>/dev/null || true
+    sleep 2
+    # Double-check: force kill if still alive
+    pkill -9 -f "dsh --profile headless" 2>/dev/null || true
+}
+
+# ── Wait for orphan ComfyUI render to finish ──────────────────
+wait_for_orphan_render() {
+    log "Orphan ComfyUI render detected — waiting up to ${ORPHAN_RENDER_MAX}s..."
+    notify "Pipeline down but ComfyUI is rendering — waiting for it to finish" "Watchdog"
+    local waited=0
+    while [ $waited -lt $ORPHAN_RENDER_MAX ]; do
+        if ! comfyui_has_job; then
+            log "Orphan render completed after ${waited}s"
+            # Copy any new outputs to the clip dir
+            return 0
+        fi
+        sleep 10
+        waited=$((waited + 10))
+        if [ $((waited % 60)) -eq 0 ]; then
+            log "  Still rendering... (${waited}s / ${ORPHAN_RENDER_MAX}s)"
+        fi
+    done
+    log "Orphan render timed out after ${ORPHAN_RENDER_MAX}s — killing"
+    notify "Orphan render timed out after ${ORPHAN_RENDER_MAX}s" "Watchdog"
+    return 1
+}
+
+# ── AI diagnosis on crash (uses local or cloud model) ─────────
+ai_diagnose() {
+    local run_dir
+    run_dir=$(find_run_dir)
+    [ -z "$run_dir" ] && return
+
+    log "AI agent diagnosing crash..."
+
+    local ctx_file="$run_dir/watchdog_crash_context.txt"
+    {
+        echo "=== PIPELINE CRASH CONTEXT ==="
+        echo "=== LAST 50 LINES OF pipeline.log ==="
+        tail -50 "$run_dir/pipeline.log" 2>/dev/null
+        echo "=== SERVICES ==="
+        echo "comfyui: $(systemctl is-active comfyui.service 2>/dev/null)"
+        echo "qwen38: $(systemctl is-active qwen3.8-27b-q6k-cuda.service 2>/dev/null)"
+        echo "=== GPU ==="
+        nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader 2>/dev/null
+        echo "=== DISK ==="
+        df -h /root --output=avail 2>/dev/null | tail -1
+    } > "$ctx_file" 2>/dev/null
+
+    local prompt_file="$run_dir/watchdog_prompt.txt"
+    cat > "$prompt_file" << 'DIAG'
+You are the pipeline watchdog. The production pipeline crashed. Your job:
+1. READ the crash context below
+2. DIAGNOSE the root cause
+3. FIX the problem by running shell commands
+4. Output JSON: {"diagnosis": "...", "fix_applied": "...", "can_resume": true/false, "wait_seconds": 30}
+DIAG
     cat "$ctx_file" >> "$prompt_file"
 
-    # Run the diagnosis agent using local Qwen 3.8 27B
-    local diag_output="$run_dir/watchdog_diagnosis.json"
-
-    # Set model to local for diagnosis
+    # Route to the right model
     cd "$DSH_DIR"
-    python3 - "/root/.dsh/settings.yaml" "local-qwen-q6k" "qwen3.8-27b" "xhigh" << 'PYEOF'
-import sys, re, os, tempfile
-path, provider, model, effort = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-text = open(path).read()
-m = re.search(r'(?m)^agent-default-model:[ \t]*$', text)
-if not m:
-    sys.exit(0)
-head, tail = text[:m.start()], text[m.end():]
-lines = tail.splitlines(keepends=True)
-rest = ''
-for i, ln in enumerate(lines):
-    if ln.strip() and ln[:1] not in (' ', '\t', '#'):
-        rest = ''.join(lines[i:])
-        break
-block = (
-    'agent-default-model:\n'
-    f'  provider: {provider}\n'
-    f'  model: {model}\n'
-    f'  reasoningEffort: {effort}\n'
-)
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.settings-', suffix='.tmp')
-with os.fdopen(fd, 'w') as fh:
-    fh.write(head + block + rest)
-os.replace(tmp, path)
-PYEOF
+    python3 "$PACK_DIR/pipeline/set_agent_model.py" "pipeline-orchestrator" 2>/dev/null || true
 
-    # Run agent
-    local prompt_text
-    prompt_text=$(cat "$prompt_file")
     export DSH_PERMISSION_MODE="${DSH_PERMISSION_MODE:-danger-full-access}"
-
-    pnpm dsh --profile headless \
+    local diag_raw="$run_dir/watchdog_diagnosis_raw.txt"
+    timeout 120 pnpm dsh --profile headless \
         --patch "$PACK_DIR/.dsh/.agent-presets/pipeline-orchestrator/agent.cordis.yml" \
-        "$prompt_text" \
-        > "$run_dir/watchdog_raw.txt" \
-        2>> "$run_dir/pipeline.log" || true
+        "$(cat "$prompt_file")" \
+        > "$diag_raw" 2>> "$run_dir/pipeline.log" || true
 
-    # Extract diagnosis JSON
-    python3 "$PACK_DIR/extract_json.py" \
-        "$run_dir/watchdog_raw.txt" "$diag_output" \
-        diagnosis fix_applied can_resume 2>/dev/null || true
+    # Extract diagnosis
+    local diag_json="$run_dir/watchdog_diagnosis.json"
+    python3 "$PACK_DIR/extract_json.py" "$diag_raw" "$diag_json" diagnosis 2>/dev/null || true
 
-    # Parse result
-    local can_resume="true"
-    local wait_secs=30
-    local diagnosis="unknown"
-    local fix="unknown"
-
-    if [ -s "$diag_output" ]; then
-        can_resume=$(python3 -c "import json; print(json.load(open('$diag_output')).get('can_resume', True))" 2>/dev/null || echo "true")
-        wait_secs=$(python3 -c "import json; print(json.load(open('$diag_output')).get('wait_seconds', 30))" 2>/dev/null || echo "30")
-        diagnosis=$(python3 -c "import json; print(json.load(open('$diag_output')).get('diagnosis', 'unknown'))" 2>/dev/null || echo "unknown")
-        fix=$(python3 -c "import json; print(json.load(open('$diag_output')).get('fix_applied', 'unknown'))" 2>/dev/null || echo "unknown")
+    if [ -s "$diag_json" ]; then
+        local diagnosis fix
+        diagnosis=$(python3 -c "import json; print(json.load(open('$diag_json')).get('diagnosis','unknown'))" 2>/dev/null || echo "unknown")
+        fix=$(python3 -c "import json; print(json.load(open('$diag_json')).get('fix_applied','unknown'))" 2>/dev/null || echo "unknown")
+        log "Diagnosis: $diagnosis"
+        log "Fix: $fix"
+        notify "Crash diagnosis: $diagnosis\nFix: $fix\nAttempt $CRASH_COUNT/$MAX_CONSECUTIVE_CRASHES" "Watchdog AI"
+    else
+        log "AI diagnosis produced no JSON"
+        notify "Pipeline crashed — AI diagnosis inconclusive. Retrying." "Watchdog"
     fi
-
-    log "Diagnosis: $diagnosis"
-    log "Fix: $fix"
-    log "Can resume: $can_resume, wait: ${wait_secs}s"
-    notify "Diagnosis: $diagnosis\nFix: $fix\nResume: $can_resume (wait ${wait_secs}s)\nAttempt $((CRASH_COUNT+1))/$MAX_CRASHES" "Watchdog AI Diagnosis"
-
-    if [ "$can_resume" = "False" ] || [ "$can_resume" = "false" ]; then
-        log "AI agent says cannot resume. Stopping."
-        return 1
-    fi
-
-    sleep "$wait_secs"
-    return 0
 }
 
-# ── Main loop ──
-# First run uses original args; subsequent runs use --resume with explicit run dir
+# ══════════════════════════════════════════════════════════════
+# MAIN MONITOR LOOP
+# ══════════════════════════════════════════════════════════════
+
+log "=== Watchdog started ==="
+log "Args: $*"
+
+# First run: start the pipeline
 FIRST_RUN=true
+ORIGINAL_ARGS=("$@")
 
 while true; do
-    log "Starting pipeline..."
-    "$PACK_DIR/run.sh" "$@"
-    EXIT=$?
-
-    if [ $EXIT -eq 0 ]; then
-        log "Pipeline completed successfully."
-        notify "Pipeline completed successfully!" "Watchdog"
-        break
+    # ── Check 4: Movie done? Exit. ──
+    if is_movie_done; then
+        log "Final movie exists! Production complete."
+        notify "Production COMPLETE! Movie ready." "Watchdog"
+        exit 0
     fi
 
-    CRASH_COUNT=$((CRASH_COUNT + 1))
-    log "Pipeline exited with code $EXIT (crash $CRASH_COUNT/$MAX_CRASHES)"
+    # ── Check 1: Pipeline running? Sleep. ──
+    if is_pipeline_running; then
+        sleep "$CHECK_INTERVAL"
+        continue
+    fi
 
-    if [ $CRASH_COUNT -ge $MAX_CRASHES ]; then
-        notify "Pipeline crashed $MAX_CRASHES times — AI agent could not fix it.\nLast exit: $EXIT\nManual intervention needed." "Watchdog STOPPED"
-        log "Max crashes reached. Giving up."
+    # Pipeline is NOT running.
+    # Is this the first iteration? Start it.
+    if [ "$FIRST_RUN" = "true" ]; then
+        FIRST_RUN=false
+        log "Starting pipeline..."
+        "$PACK_DIR/run.sh" "${ORIGINAL_ARGS[@]}" &
+        PIPELINE_PID=$!
+        log "Pipeline started (PID=$PIPELINE_PID)"
+        sleep "$CHECK_INTERVAL"
+        continue
+    fi
+
+    # Pipeline died. Increment crash count.
+    CRASH_COUNT=$((CRASH_COUNT + 1))
+    log "Pipeline is down (crash $CRASH_COUNT/$MAX_CONSECUTIVE_CRASHES)"
+
+    # ── Check max crashes ──
+    if [ "$CRASH_COUNT" -ge "$MAX_CONSECUTIVE_CRASHES" ]; then
+        notify "Pipeline crashed $MAX_CONSECUTIVE_CRASHES times — giving up.\nManual intervention needed." "Watchdog STOPPED"
+        log "Max crashes reached. Exiting."
         exit 1
     fi
 
-    ai_diagnose_and_fix $EXIT || break
+    # ── Check 2: Orphan ComfyUI render in flight? Wait for it. ──
+    if comfyui_has_job; then
+        wait_for_orphan_render
+        # After render finishes (or times out), the output may be in ComfyUI's dir.
+        # generate_clip.py's find_new_outputs will pick it up on resume.
+    fi
 
-    # Switch to resume mode with explicit run dir path
-    if [ "$FIRST_RUN" = "true" ]; then
-        FIRST_RUN=false
-        LATEST_RUN=$(ls -td "$PACK_DIR/output/run_"* 2>/dev/null | head -1)
-        if [ -n "$LATEST_RUN" ] && [ -d "$LATEST_RUN" ]; then
-            set -- --resume "$LATEST_RUN"
-        else
-            set -- --resume
+    # ── Check 3: Kill leftover agents, diagnose, resume. ──
+    if has_orphan_agents; then
+        kill_leftovers
+    fi
+
+    # AI diagnosis
+    ai_diagnose
+
+    # Find the run dir for resume
+    RUN_DIR=$(find_run_dir)
+    if [ -z "$RUN_DIR" ]; then
+        log "No run directory found — cannot resume"
+        notify "Watchdog: no run dir found" "Watchdog ERROR"
+        exit 1
+    fi
+
+    log "Resuming pipeline from $RUN_DIR..."
+    sleep 10  # brief cooldown
+
+    "$PACK_DIR/run.sh" --resume "$RUN_DIR" &
+    PIPELINE_PID=$!
+    log "Pipeline resumed (PID=$PIPELINE_PID)"
+
+    # Reset crash count on successful resume (checked next iteration)
+    sleep "$CHECK_INTERVAL"
+
+    # If pipeline survived CHECK_INTERVAL, reset crash counter
+    if is_pipeline_running; then
+        if [ "$CRASH_COUNT" -gt 0 ]; then
+            log "Pipeline stable after resume — resetting crash counter"
+            CRASH_COUNT=0
         fi
     fi
 done
