@@ -303,22 +303,50 @@ PYEOF
             return 1
         fi
     else
-        # Every other preset emits JSON too, and agents habitually wrap the object in
-        # a prose preamble ("Here's my review and the built prompt.") or a ```json
-        # fence. Copying raw stdout verbatim handed downstream consumers a mixed
-        # document that json.load() rejects, so their except-branches silently took
-        # the wrong path:
-        #   * HAS_DIALOGUE -> 'no'   => no dialogue audio on lip-sync clips
-        #   * VERDICT      -> 'FAIL' => a valid clip burns all MAX_RETRY attempts
-        # Prefer an artifact the agent wrote itself with its tools; otherwise extract
-        # the JSON object properly (brace-counted, nesting-safe).
+        # Agents on local models often write files via tools to paths they choose
+        # (e.g., prompts/S01_001_review.json) instead of printing JSON to stdout.
+        # Search strategy:
+        #   1. Agent wrote $output_file directly (exact path match)
+        #   2. Agent wrote a JSON file somewhere in $RUN_DIR recently (within 5 min)
+        #   3. Extract JSON from raw stdout
+        #   4. Fall back to raw stdout
         if [ -s "$output_file" ] && \
            python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$output_file" 2>/dev/null; then
             log "  (kept agent-written $output_file)"
-        elif ! python3 "$PACK_DIR/extract_json.py" "$raw_output" "$output_file" \
-                 >>"$RUN_DIR/pipeline.log" 2>&1; then
-            log "WARNING: $preset emitted no parseable JSON — keeping raw stdout"
-            cp "$raw_output" "$output_file"
+        else
+            # Search strategy for agent-written files:
+            # 1. Recently-written JSON (within 10 min, any depth)
+            # 2. Shot-specific files in prompts/ dir (from previous runs)
+            # 3. Extract JSON from raw stdout
+            local found_json=""
+
+            # Search 1: recent JSON files
+            found_json=$(find "$RUN_DIR" "$DSH_DIR" -maxdepth 4 -name "*.json" -newer "$prompt_file" -mmin -10 \
+                -exec python3 -c 'import json,sys; json.load(open(sys.argv[1])); print(sys.argv[1])' {} \; 2>/dev/null \
+                | grep -v "pipeline.log\|run_latest\|settings.yaml\|watchdog" | head -1)
+
+            # Search 2: shot-specific files in prompts/ directory (agent may have written here)
+            if [ -z "$found_json" ]; then
+                local shot_id_guess=""
+                shot_id_guess=$(basename "$(dirname "$output_file")" 2>/dev/null)
+                for candidate in "$RUN_DIR/prompts/${shot_id_guess}_review.json" \
+                                 "$RUN_DIR/prompts/${shot_id_guess}"_*.json; do
+                    if [ -f "$candidate" ] && \
+                       python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$candidate" 2>/dev/null; then
+                        found_json="$candidate"
+                        break
+                    fi
+                done
+            fi
+
+            if [ -n "$found_json" ] && [ "$found_json" != "$output_file" ]; then
+                log "  (found agent-written JSON at $found_json -> copying to $output_file)"
+                cp "$found_json" "$output_file"
+            elif ! python3 "$PACK_DIR/extract_json.py" "$raw_output" "$output_file" \
+                     >>"$RUN_DIR/pipeline.log" 2>&1; then
+                log "WARNING: $preset emitted no parseable JSON — keeping raw stdout"
+                cp "$raw_output" "$output_file"
+            fi
         fi
     fi
 
@@ -722,25 +750,33 @@ Save to $CLIP_DIR/dialogue.wav. Include emotion used in dialogue_metadata.json."
             "Generate frames for $SHOT_ID. Read $CLIP_DIR/reviewed_prompt.json for mode. If composited_i2v: load location ref, use Qwen Image 2.1 edit to composite characters. If reference: skip frame gen. If fl2va: extract last frame from previous clip. ComfyUI: $COMFYUI_URL. Save to $CLIP_DIR/"
         run_dsh_agent "image-generator" "$CLIP_DIR/prompt_image.txt" "$CLIP_DIR/frame_meta.json"
 
-        # ── 2d. Video Generation (stop LLM → restart ComfyUI → generate) ──
-        log "[$SHOT_ID] Stopping LLM, freeing VRAM for video generation..."
-        stop_all_llms
-        systemctl restart "$SVC_COMFYUI"
-        sleep 5
-        ensure_comfyui
-        log "[$SHOT_ID] Generating video clip (full VRAM to ComfyUI)..."
-        # Video gen agent needs LLM to drive ComfyUI API calls
-        ensure_local_llm_running
-        write_prompt "$CLIP_DIR/prompt_video.txt" \
-            "Generate video clip for $SHOT_ID via MiniMax H3 in ComfyUI ($COMFYUI_URL). Read $CLIP_DIR/reviewed_prompt.json for the H3 prompt and mode (ref2va/i2va/fl2va). If dialogue exists, upload $CLIP_DIR/dialogue.wav as audio reference. First frame: $CLIP_DIR/first_frame.png. Save clip to $CLIP_DIR/clip.mp4"
-        run_dsh_agent "video-generator" "$CLIP_DIR/prompt_video.txt" "$CLIP_DIR/generation_log.json"
+        # ── 2d. Video Generation (direct Python script — no LLM needed during generation) ──
+        # The generate_clip.py script handles the full cycle:
+        #   stop LLM → restart ComfyUI → upload refs → queue workflow → wait → download clip → restart LLM
+        log "[$SHOT_ID] Video generation (direct ComfyUI, no LLM during generation)..."
+        python3 "$PACK_DIR/pipeline/generate_clip.py" \
+            --shot-dir "$CLIP_DIR" \
+            --run-dir "$RUN_DIR" \
+            --comfyui-url "$COMFYUI_URL" \
+            --shot-id "$SHOT_ID" \
+            2>> "$RUN_DIR/pipeline.log"
+        GEN_EXIT=$?
 
-        # ── 2e. QA Review (restart ComfyUI to free VRAM → start LLM) ──
-        log "[$SHOT_ID] QA inspection..."
-        stop_all_llms
-        systemctl restart "$SVC_COMFYUI"
-        sleep 3
+        # Monitoring: regardless of generate_clip.py exit, ensure LLM is back up
+        # so QA can run. If generation failed, QA will catch the missing clip.
         ensure_local_llm_running
+
+        if [ $GEN_EXIT -ne 0 ]; then
+            log "[$SHOT_ID] WARNING: generate_clip.py exited $GEN_EXIT"
+            notify "Clip $SHOT_ID generation script failed (exit $GEN_EXIT)" "Generation Warning"
+        fi
+
+        if [ ! -f "$CLIP_DIR/clip.mp4" ]; then
+            log "[$SHOT_ID] WARNING: clip.mp4 not produced — QA will handle this"
+        fi
+
+        # ── 2e. QA Review (LLM already restarted by generate_clip.py or ensure above) ──
+        log "[$SHOT_ID] QA inspection..."
         write_prompt "$CLIP_DIR/prompt_qa.txt" \
             "Review $CLIP_DIR/clip.mp4. Extract frames with ffmpeg. Check: hands (finger count, merging), face (distortion, symmetry), character identity (vs refs in $RUN_DIR/characters/), duplication, motion, lip sync (dialogue=lips move, narration=lips closed). Score 0-1 per category, threshold 0.85. Output JSON with verdict PASS/FAIL and corrections if FAIL."
         run_dsh_agent "qa-inspector" "$CLIP_DIR/prompt_qa.txt" "$CLIP_DIR/qa_verdict.json"
