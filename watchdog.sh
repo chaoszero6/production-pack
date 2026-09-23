@@ -85,12 +85,12 @@ DIAG_PROMPT
     echo -e "\n--- CRASH CONTEXT ---\n" >> "$prompt_file"
     cat "$ctx_file" >> "$prompt_file"
 
-    # Run the diagnosis agent using flash (cheap, fast)
+    # Run the diagnosis agent using local Qwen 3.8 27B
     local diag_output="$run_dir/watchdog_diagnosis.json"
 
-    # Set model to flash for diagnosis
+    # Set model to local for diagnosis
     cd "$DSH_DIR"
-    python3 - "/root/.dsh/settings.yaml" "opencode-go-deepseek" "deepseek-v4.1-flash" "low" << 'PYEOF'
+    python3 - "/root/.dsh/settings.yaml" "local-qwen-q6k" "qwen3.8-27b" "xhigh" << 'PYEOF'
 import sys, re, os, tempfile
 path, provider, model, effort = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 text = open(path).read()

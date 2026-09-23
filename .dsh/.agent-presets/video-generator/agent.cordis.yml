@@ -81,10 +81,32 @@
       - Character lips sync to dialogue, stay closed during narration timing
       - Narration overlaid in post
 
-      ## Generation Parameters
-      - Resolution: 1920x1080 (follows input frame aspect ratio)
+      ## Generation Parameters — TURBO LoRA
+      Use turbo LoRAs for faster generation. Apply the LoRA BEFORE the sampler.
+
+      ### For ref2va clips (58 of 74):
+      - LoRA: `minimax/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors`
+      - Load via MiniMaxH3TurboLoRA node, strength 0.75
+      - Steps: 8 (instead of 20-50)
+      - Sampler: res_multistep, scheduler: simple
+      - Resolution: 1344x768 (768p — upscaled to 4K later)
+
+      ### For fl2va clips (8 of 74):
+      - LoRA: `minimax/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors`
+      - Load via MiniMaxH3TurboLoRA node, strength 0.75
+      - Steps: 4 (instead of 20-50)
+      - Sampler: res_multistep, scheduler: simple
+      - Resolution: 1344x768
+
+      ### Workflow structure:
+      1. Load MiniMax H3 base model
+      2. Load turbo LoRA (MiniMaxH3TurboLoRA node, pick ref2va or fl2va LoRA)
+      3. Load references / frames
+      4. Use MiniMaxH3TurboSampler with correct step count
+      5. Decode with VAE
+      6. Save clip
+
       - Duration: As specified by Director (3-15s, default 6s)
-      - Steps: 50 (configurable — lower for drafts, higher for final)
       - ComfyUI version: 0.30.0+ required for H3 nodes
 
       ## Error Handling

@@ -79,20 +79,29 @@ image_generation:
 # Video generation settings (MiniMax H3)
 video_generation:
   model: "MiniMax-H3"
-  min_duration: 3            # seconds per clip (minimum)
-  max_duration: 15           # seconds per clip (maximum)
-  default_duration: 6        # seconds per clip
-  output_resolution: "1920x1080"
-  steps: 50
-  default_mode: "reference"   # ref2va — default for most clips (best identity consistency)
-  mode_selection: "auto"      # Director decides per clip based on need:
-    # ref2va  — DEFAULT. Up to 9 images + 3 video + 3 audio refs. Best for identity locking.
-    # fl2va   — Only when continuity from previous clip is needed (captures last frame as first frame).
-    # i2va    — When a single strong first-frame is sufficient.
-    # t2va    — AVOID. Inconsistent output. Only for abstract/establishing shots with no characters.
+  min_duration: 3
+  max_duration: 15
+  default_duration: 6
+  output_resolution: "1344x768"   # 768p for turbo LoRA, upscaled to 4K in post
+  default_mode: "reference"
+
+  # Turbo LoRA configuration — faster generation with fewer steps
+  turbo:
+    ref2va:
+      lora: "minimax/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
+      steps: 8
+      sampler: "res_multistep"
+      scheduler: "simple"
+      lora_strength: 0.75
+    fl2va:
+      lora: "minimax/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
+      steps: 4
+      sampler: "res_multistep"
+      scheduler: "simple"
+      lora_strength: 0.75
+
   avoid_modes:
-    - "text_to_video"        # t2va — inconsistent output, avoid
-  audio_enabled: true        # native H3 audio (but prefer separate overlay)
+    - "text_to_video"
 
 # QA settings
 qa:

@@ -43,19 +43,12 @@ LLM_PORT=8085
 LLM_URL="http://127.0.0.1:$LLM_PORT"
 COMFYUI_URL="http://127.0.0.1:8188"
 
-# Cloud LLM routing (2026-09-21): EVERY production-pack agent runs on the
-# OpenCode Go cloud — deepseek-v4-pro for the five reasoning agents, and
-# deepseek-v4.1-flash for the other nine. No local LLM is involved, so the RTX
-# 5090 is left entirely to ComfyUI. dsh loads .env from the invocation cwd
-# ($DSH_DIR) or $DSH_HOME, neither of which carries OPENCODE_GO_API_KEY, so
-# mirror the Hermes env into $DSH_HOME and export it for the dsh process.
+# LLM routing: ALL agents use local Qwen 3.8 27B Q6_K on port 8085.
+# No cloud API needed. dsh settings point to local-qwen-q6k provider.
 DSH_SETTINGS="/root/.dsh/settings.yaml"
+# Still copy .env for any cloud fallback tools the agents might use
 if [ -f /root/.hermes/.env ]; then
-    cp /root/.hermes/.env "$DSH_DIR/.env"
-    OPENCODE_GO_API_KEY=$(sed -n 's/^OPENCODE_GO_API_KEY=//p' /root/.hermes/.env | head -1) || true
-    export OPENCODE_GO_API_KEY
-    # `log` is not defined yet at this point in the file — use a raw echo
-    [ -n "${OPENCODE_GO_API_KEY:-}" ] || echo "[$(date '+%H:%M:%S')] WARNING: OPENCODE_GO_API_KEY not found in /root/.hermes/.env — cloud agents will fail auth"
+    cp /root/.hermes/.env "$DSH_DIR/.env" 2>/dev/null || true
 fi
 
 SVC_122B="llama-qwen35-122b.service"
@@ -88,29 +81,38 @@ wait_for_health() {
     die "$name failed to start within ${timeout}s"
 }
 
-# ── Local LLM management (VRAM only) ────────────────────────
-# 2026-09-21: EVERY production-pack agent runs on the OpenCode Go cloud, so no
-# local LLM is needed for agent work. The 27B on :8085 (which also backs the
-# interactive Hermes session) therefore stays stopped for the whole run so
-# ComfyUI owns the full RTX 5090 for image/video generation. The swap_* names
-# are kept as shims so the existing call sites keep working.
-ensure_llms_stopped() {
+# ── Local LLM management ────────────────────────────────────
+# ALL agents run on local Qwen 3.8 27B Q6_K (port 8085).
+# LLM must be RUNNING for agent work, STOPPED during heavy ComfyUI generation
+# (both compete for VRAM on the same RTX 5090).
+ensure_local_llm_running() {
     systemctl stop "$SVC_122B" 2>/dev/null || true
-    if systemctl is-active --quiet "$SVC_27B"; then
-        log "Stopping $SVC_27B (frees ~27GB VRAM for ComfyUI; Hermes falls back to cloud)"
-        systemctl stop "$SVC_27B" 2>/dev/null || true
+    if ! systemctl is-active --quiet "$SVC_27B"; then
+        log "Starting $SVC_27B for agent work..."
+        systemctl restart "$SVC_COMFYUI"  # free VRAM cache first
+        sleep 3
+        systemctl start "$SVC_27B"
+        wait_for_health "$LLM_URL/health" "$WAIT_27B" "Qwen 3.8 27B"
     fi
-    # the docker container sometimes outlives the systemd unit
+}
+
+stop_all_llms() {
+    systemctl stop "$SVC_122B" 2>/dev/null || true
+    systemctl stop "$SVC_27B" 2>/dev/null || true
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^qwen38'; then
         docker stop qwen38-27b-q6k > /dev/null 2>&1 || true
     fi
     sleep 2
 }
 
-swap_to_122b()        { ensure_llms_stopped; }   # shim: cloud routing, nothing to swap
-swap_to_122b_legacy() { ensure_llms_stopped; }   # shim: cloud routing, nothing to swap
-swap_to_27b()         { ensure_llms_stopped; }   # shim: cloud routing, nothing to swap
-stop_all_llms()       { ensure_llms_stopped; }
+swap_to_122b()  { ensure_local_llm_running; }
+swap_to_27b()   { ensure_local_llm_running; }
+stop_all_llms_for_generation() {
+    log "Stopping LLM to free VRAM for ComfyUI generation..."
+    stop_all_llms
+    systemctl restart "$SVC_COMFYUI"
+    sleep 3
+}
 
 ensure_comfyui() {
     if ! curl -sf "$COMFYUI_URL/api/system_stats" > /dev/null 2>&1; then
@@ -134,28 +136,20 @@ start_hermes() {
     systemctl start "$SVC_HERMES" 2>/dev/null || true
 }
 
-# ── Per-agent cloud model routing ───────────────────────────
-# dsh's headless bundle resolves the model for every agent from the
-# `agent-default-model` section of settings.yaml at launch — there is no
-# per-preset override (the `engine:` plugin the presets reference,
-# @yuki-takuya-kun/dsh-engine-switch, is not installed and 404s on npm, so
-# those lines are inert). So we rewrite that one section before each call:
-#   deepseek-v4-pro              -> reasoning agents (text-only)
-#   deepseek-v4-flash-vision-exp -> QA inspector (ONLY vision model on OpenCode Go)
-#   deepseek-v4.1-flash          -> execution agents (image gen, video gen, audio, etc.)
-MODEL_PRO_PRESETS="story-creator director screenplay-reviewer character-designer location-designer"
-MODEL_VISION_PRESETS="qa-inspector"
+# ── Per-agent model routing ────────────────────────────────
+# ALL agents now run on local Qwen 3.8 27B Q6_K (port 8085)
+# Single model for everything — reasoning, execution, QA vision (multimodal)
+# Service: qwen3.8-27b-q6k-cuda.service
+LOCAL_MODEL_PROVIDER="local-qwen-q6k"
+LOCAL_MODEL_ID="qwen3.8-27b"
+LOCAL_MODEL_EFFORT="xhigh"  # local model — no cost per token, max reasoning
 
 set_agent_model() {
-    local preset="$1" provider="opencode-go-deepseek" model="deepseek-v4.1-flash" effort="low"
-    case " $MODEL_VISION_PRESETS " in
-        *" $preset "*)
-            provider="opencode-go-deepseek-vision"; model="deepseek-v4-flash-vision-exp"; effort="high" ;;
-    esac
-    case " $MODEL_PRO_PRESETS " in
-        *" $preset "*)
-            provider="opencode-go-deepseek-pro"; model="deepseek-v4-pro"; effort="high" ;;
-    esac
+    local preset="$1"
+    local provider="$LOCAL_MODEL_PROVIDER"
+    local model="$LOCAL_MODEL_ID"
+    local effort="$LOCAL_MODEL_EFFORT"
+    # All presets use local Qwen 3.8 27B Q6_K with xhigh reasoning
 
     python3 - "$DSH_SETTINGS" "$provider" "$model" "$effort" << 'PYEOF'
 import sys, re, os, tempfile
@@ -721,31 +715,32 @@ Save to $CLIP_DIR/dialogue.wav. Include emotion used in dialogue_metadata.json."
             run_dsh_agent "audio-producer" "$CLIP_DIR/prompt_dialogue.txt" "$CLIP_DIR/dialogue_meta.json"
         fi
 
-        # ── 2c. Free VRAM for generation ──
-        log "[$SHOT_ID] Freeing VRAM..."
-        stop_all_llms
-        sleep 3
-        ensure_comfyui
-
-        # ── 2d. Image Generation (ComfyUI — no LLM needed) ──
+        # ── 2c. Image Generation (LLM plans, then stop LLM, ComfyUI executes) ──
         log "[$SHOT_ID] Generating frames..."
-        swap_to_27b
+        ensure_local_llm_running
         write_prompt "$CLIP_DIR/prompt_image.txt" \
             "Generate frames for $SHOT_ID. Read $CLIP_DIR/reviewed_prompt.json for mode. If composited_i2v: load location ref, use Qwen Image 2.1 edit to composite characters. If reference: skip frame gen. If fl2va: extract last frame from previous clip. ComfyUI: $COMFYUI_URL. Save to $CLIP_DIR/"
         run_dsh_agent "image-generator" "$CLIP_DIR/prompt_image.txt" "$CLIP_DIR/frame_meta.json"
 
-        # ── 2e. Video Generation (ComfyUI — GPU heavy) ──
-        log "[$SHOT_ID] Generating video clip..."
+        # ── 2d. Video Generation (stop LLM → restart ComfyUI → generate) ──
+        log "[$SHOT_ID] Stopping LLM, freeing VRAM for video generation..."
         stop_all_llms
-        sleep 2
+        systemctl restart "$SVC_COMFYUI"
+        sleep 5
         ensure_comfyui
-        swap_to_27b
+        log "[$SHOT_ID] Generating video clip (full VRAM to ComfyUI)..."
+        # Video gen agent needs LLM to drive ComfyUI API calls
+        ensure_local_llm_running
         write_prompt "$CLIP_DIR/prompt_video.txt" \
             "Generate video clip for $SHOT_ID via MiniMax H3 in ComfyUI ($COMFYUI_URL). Read $CLIP_DIR/reviewed_prompt.json for the H3 prompt and mode (ref2va/i2va/fl2va). If dialogue exists, upload $CLIP_DIR/dialogue.wav as audio reference. First frame: $CLIP_DIR/first_frame.png. Save clip to $CLIP_DIR/clip.mp4"
         run_dsh_agent "video-generator" "$CLIP_DIR/prompt_video.txt" "$CLIP_DIR/generation_log.json"
 
-        # ── 2f. QA Review (27B is multimodal) ──
+        # ── 2e. QA Review (restart ComfyUI to free VRAM → start LLM) ──
         log "[$SHOT_ID] QA inspection..."
+        stop_all_llms
+        systemctl restart "$SVC_COMFYUI"
+        sleep 3
+        ensure_local_llm_running
         write_prompt "$CLIP_DIR/prompt_qa.txt" \
             "Review $CLIP_DIR/clip.mp4. Extract frames with ffmpeg. Check: hands (finger count, merging), face (distortion, symmetry), character identity (vs refs in $RUN_DIR/characters/), duplication, motion, lip sync (dialogue=lips move, narration=lips closed). Score 0-1 per category, threshold 0.85. Output JSON with verdict PASS/FAIL and corrections if FAIL."
         run_dsh_agent "qa-inspector" "$CLIP_DIR/prompt_qa.txt" "$CLIP_DIR/qa_verdict.json"
