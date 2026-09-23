@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-agent model routing for the production pack (OpenRouter, all-cloud).
+"""Per-agent model routing with automatic cloud→local fallback.
 
 Single source of truth for "which model does agent <preset> use". Both run.sh
 (via set_agent_model) and pipeline/generate_clip.py call this, so a subprocess
@@ -13,27 +13,36 @@ Rewrites the `agent-default-model` section of /root/.dsh/settings.yaml
 atomically (write temp + os.replace) so a killed run can never leave a
 truncated settings.yaml.
 
+FALLBACK: If the cloud provider returns 402/429 (budget/rate limit), the
+script detects it and falls back to local Qwen 3.8 27B Q6_K. This requires:
+  - qwen3.8-27b-q6k-cuda.service to be startable
+  - CLOUD_ROUTING in run.sh switches to 0 for VRAM management
+
 NOTE: dsh resolves the model from this section AT LAUNCH, so it must be
 rewritten before every dsh call. The `engine:` field in presets is a no-op.
 """
 import os
 import re
+import subprocess
 import sys
 import tempfile
+import time
+
+try:
+    import requests
+except ImportError:
+    requests = None
 
 SETTINGS = os.environ.get("DSH_SETTINGS", "/root/.dsh/settings.yaml")
 
-# The one provider every agent routes through.
-PROVIDER = "openrouter"
+# ── Cloud tier (OpenRouter) ──────────────────────────────────
+CLOUD_PROVIDER = "openrouter"
 
-# Reasoning tier — heavy text-only thinking. Verified: this model REJECTS
-# image input (HTTP 404 "No endpoints found that support image input"), so it
-# must never be given a vision job.
+# Reasoning tier — heavy text-only thinking.
 PRO_MODEL = "deepseek/deepseek-v4-pro"
 PRO_EFFORT = "high"
 
-# Vision tier — qa-inspector is the ONLY agent that needs to see pixels; it
-# extracts frames at 2 FPS and scores hands/face/identity per frame.
+# Vision tier — qa-inspector needs to see pixels.
 VISION_MODEL = "google/gemini-3-flash-preview"
 VISION_EFFORT = "high"
 
@@ -41,10 +50,20 @@ VISION_EFFORT = "high"
 FLASH_MODEL = "deepseek/deepseek-v4.1-flash"
 FLASH_EFFORT = "low"
 
+# Budget fallback for vision (6x cheaper)
+VISION_MODEL_BUDGET = "qwen/qwen3-vl-32b-instruct"
+
+# ── Local fallback tier (Qwen 3.8 27B Q6_K on port 8085) ────
+LOCAL_PROVIDER = "local-qwen-q6k"
+LOCAL_MODEL = "qwen3.8-27b"
+LOCAL_EFFORT = "xhigh"
+LOCAL_LLM_SERVICE = "qwen3.8-27b-q6k-cuda.service"
+LOCAL_HEALTH_URL = "http://127.0.0.1:8085/health"
+
 PRO_PRESETS = {
     "story-creator",
     "director",
-    "screenplay-reviewer",   # runs once per clip — highest leverage agent
+    "screenplay-reviewer",
     "character-designer",
     "location-designer",
 }
@@ -52,18 +71,152 @@ VISION_PRESETS = {
     "qa-inspector",
 }
 
-# Cheaper alternative for the vision tier (6x cheaper, ~910 tok/frame vs
-# ~1100). Swap VISION_MODEL to this if the OpenRouter budget gets tight.
-VISION_MODEL_BUDGET = "qwen/qwen3-vl-32b-instruct"
+# State file to track fallback mode across calls
+FALLBACK_STATE = "/root/production_pack/output/.cloud_fallback_state"
+
+
+def _is_cloud_exhausted():
+    """Check if we've already detected cloud exhaustion this session."""
+    if os.path.exists(FALLBACK_STATE):
+        try:
+            mtime = os.path.getmtime(FALLBACK_STATE)
+            # Fallback state expires after 1 hour — retry cloud periodically
+            if time.time() - mtime < 3600:
+                return True
+        except:
+            pass
+    return False
+
+
+def _mark_cloud_exhausted(reason):
+    """Mark cloud as exhausted so subsequent calls skip the probe."""
+    os.makedirs(os.path.dirname(FALLBACK_STATE), exist_ok=True)
+    with open(FALLBACK_STATE, "w") as f:
+        f.write(f"{reason}\n{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    print(f"CLOUD EXHAUSTED: {reason} — switching to local Qwen 3.8 27B", file=sys.stderr)
+
+
+def _clear_cloud_exhausted():
+    """Clear fallback state (cloud is working again)."""
+    if os.path.exists(FALLBACK_STATE):
+        os.remove(FALLBACK_STATE)
+
+
+def _probe_cloud():
+    """Quick probe to check if cloud API is accepting requests.
+    Returns True if cloud is available, False if exhausted/down."""
+    if _is_cloud_exhausted():
+        return False
+
+    if not requests:
+        return True  # can't probe, assume OK
+
+    # Read OpenRouter API key from dsh settings or env
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        env_file = "/root/.hermes/.env"
+        if os.path.exists(env_file):
+            for line in open(env_file):
+                if line.startswith("OPENROUTER_API_KEY="):
+                    api_key = line.split("=", 1)[1].strip()
+                    break
+
+    if not api_key:
+        return True  # no key to probe with, assume OK
+
+    try:
+        r = requests.get(
+            "https://openrouter.ai/api/v1/auth/key",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            # Check remaining credits
+            limit = data.get("limit")
+            usage = data.get("usage")
+            if limit is not None and usage is not None:
+                remaining = limit - usage
+                if remaining <= 0:
+                    _mark_cloud_exhausted(f"credits exhausted (used {usage}/{limit})")
+                    return False
+            _clear_cloud_exhausted()
+            return True
+        elif r.status_code in (401, 402, 429):
+            _mark_cloud_exhausted(f"API returned {r.status_code}")
+            return False
+    except Exception as e:
+        # Network error — don't mark exhausted, just fall back for this call
+        print(f"Cloud probe failed: {e}", file=sys.stderr)
+        return False
+
+    return True
+
+
+def _ensure_local_llm():
+    """Start local LLM if not running. Also signals run.sh to use VRAM management."""
+    try:
+        r = None
+        if requests:
+            r = requests.get(LOCAL_HEALTH_URL, timeout=3)
+        if r and r.status_code == 200:
+            return True
+    except:
+        pass
+
+    print("Starting local LLM for fallback...", file=sys.stderr)
+    subprocess.run(["systemctl", "start", LOCAL_LLM_SERVICE], capture_output=True)
+
+    for i in range(60):
+        try:
+            if requests:
+                r = requests.get(LOCAL_HEALTH_URL, timeout=3)
+                if r.status_code == 200:
+                    print(f"Local LLM ready ({i+1}s)", file=sys.stderr)
+                    return True
+        except:
+            pass
+        time.sleep(1)
+
+    print("WARNING: Local LLM failed to start in 60s", file=sys.stderr)
+    return False
 
 
 def route_for(preset):
-    """Return (provider, model, effort) for a preset."""
-    if preset in PRO_PRESETS:
-        return PROVIDER, PRO_MODEL, PRO_EFFORT
-    if preset in VISION_PRESETS:
-        return PROVIDER, VISION_MODEL, VISION_EFFORT
-    return PROVIDER, FLASH_MODEL, FLASH_EFFORT
+    """Return (provider, model, effort) for a preset.
+    Falls back to local Qwen 3.8 27B if cloud is exhausted."""
+
+    cloud_ok = _probe_cloud()
+
+    if cloud_ok:
+        if preset in PRO_PRESETS:
+            return CLOUD_PROVIDER, PRO_MODEL, PRO_EFFORT
+        if preset in VISION_PRESETS:
+            return CLOUD_PROVIDER, VISION_MODEL, VISION_EFFORT
+        return CLOUD_PROVIDER, FLASH_MODEL, FLASH_EFFORT
+    else:
+        # Cloud exhausted — fall back to local Qwen 3.8 27B
+        _ensure_local_llm()
+
+        # Signal run.sh and generate_clip.py to use VRAM management
+        os.environ["CLOUD_ROUTING"] = "0"
+
+        # Write signal file so run.sh detects fallback across subprocesses
+        signal_file = "/root/production_pack/output/.use_local_llm"
+        if not os.path.exists(signal_file):
+            with open(signal_file, "w") as f:
+                f.write("cloud_exhausted\n")
+            # Notify via Discord
+            subprocess.run(
+                ["bash", "/root/production_pack/pipeline/notify.sh",
+                 "Cloud API exhausted — falling back to local Qwen 3.8 27B Q6_K.\n"
+                 "VRAM management active: LLM stops during video generation.",
+                 "Cloud Fallback"],
+                capture_output=True,
+            )
+
+        # Local 27B is multimodal — handles all tiers including vision
+        return LOCAL_PROVIDER, LOCAL_MODEL, LOCAL_EFFORT
 
 
 def rewrite(provider, model, effort, path=SETTINGS):

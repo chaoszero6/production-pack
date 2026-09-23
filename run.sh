@@ -146,16 +146,19 @@ start_hermes() {
     systemctl start "$SVC_HERMES" 2>/dev/null || true
 }
 
-# ── Cloud routing (OpenRouter) ─────────────────────────────
-# Every agent runs on the OpenRouter cloud. There is NO local LLM in this mode:
-#   * kills the per-clip "stop LLM -> render -> restart LLM" VRAM dance
-#     (that dance is also what killed the video-generator agent with exit 1 —
-#     generate_clip.py stopped the LLM while the agent was still reasoning)
-#   * leaves the whole RTX 5090 to ComfyUI / MiniMax H3
-# Per-agent model table lives in pipeline/set_agent_model.py (single source of
-# truth, shared with generate_clip.py so a subprocess can never inherit a
-# stale route). Set CLOUD_ROUTING=0 to fall back to the retired local layout.
-export CLOUD_ROUTING="${CLOUD_ROUTING:-1}"
+# ── Cloud routing (OpenRouter) with automatic local fallback ──
+# Every agent runs on the OpenRouter cloud by default. When cloud tokens are
+# exhausted, set_agent_model.py detects it (402/429), writes a signal file
+# (.use_local_llm), and falls back to local Qwen 3.8 27B Q6_K.
+# In local mode: VRAM management is active (stop LLM during ComfyUI gen).
+# Per-agent model table lives in pipeline/set_agent_model.py.
+LOCAL_FALLBACK_SIGNAL="$OUTPUT_DIR/.use_local_llm"
+if [ -f "$LOCAL_FALLBACK_SIGNAL" ]; then
+    export CLOUD_ROUTING="0"
+    log "LOCAL FALLBACK ACTIVE — cloud exhausted, using Qwen 3.8 27B Q6_K"
+else
+    export CLOUD_ROUTING="${CLOUD_ROUTING:-1}"
+fi
 
 # Fallback local layout (only used when CLOUD_ROUTING=0)
 LOCAL_MODEL_PROVIDER="local-qwen-q6k"

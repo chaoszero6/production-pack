@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Video generation wrapper — monitors ComfyUI and manages VRAM.
 
-Strategy:
+Strategy (CLOUD_ROUTING=1 — current):
+1. Route the video-generator agent explicitly (pipeline/set_agent_model.py)
+2. Run the dsh video-generator agent (OpenRouter cloud — no local LLM)
+3. Monitor ComfyUI queue — when a job appears, the agent has queued it
+4. Wait for ComfyUI to finish   (no LLM to stop; full 5090 goes to H3)
+5. Download output, save as clip.mp4
+
+Strategy (CLOUD_ROUTING=0 — retired local layout):
 1. Start LLM (for the video-generator agent to plan + queue the workflow)
 2. Run the dsh video-generator agent
 3. Monitor ComfyUI queue — when a job appears, the agent has queued it
@@ -9,9 +16,6 @@ Strategy:
 5. Wait for ComfyUI to finish
 6. Download output, save as clip.mp4
 7. Restart LLM for QA
-
-This solves the VRAM problem: LLM is only loaded during planning,
-stopped during the GPU-heavy H3 generation.
 
 Usage:
     python3 generate_clip.py --shot-dir <dir> --run-dir <dir> --comfyui-url <url>
@@ -35,7 +39,39 @@ def log(msg):
 def systemctl(action, service):
     subprocess.run(["systemctl", action, service], capture_output=True)
 
+# ── Cloud routing (OpenRouter) ──────────────────────────────
+# With CLOUD_ROUTING=1 every agent runs on the OpenRouter cloud, so no local
+# LLM exists to start or stop. The old juggle was also actively harmful:
+# stop_llm() fires the moment a ComfyUI workflow appears in the queue — i.e.
+# while the video-generator agent is still reasoning — which killed that
+# agent's own LLM request (console: "Agent exited with code 1", every clip).
+# Under cloud routing the agent's request is remote and survives generation.
+# Set CLOUD_ROUTING=0 for the retired local layout.
+CLOUD_ROUTING = os.environ.get("CLOUD_ROUTING", "1") == "1"
+
+
+def set_agent_route(preset):
+    """Point agent-default-model at this preset's model before launching dsh.
+
+    This agent is started from a subprocess, and dsh reads the route from
+    settings.yaml at launch — so without this it silently inherits whatever
+    route the *previous* agent call left behind.
+    """
+    script = os.path.join(PACK_DIR, "pipeline", "set_agent_model.py")
+    try:
+        r = subprocess.run([sys.executable, script, preset],
+                           capture_output=True, text=True, check=True)
+        log(f"Model route: {r.stdout.strip()}")
+    except subprocess.CalledProcessError as e:
+        log(f"WARNING: could not set model route for {preset}: "
+            f"{(e.stderr or e.stdout or '').strip()[:200]}")
+        return False
+    return True
+
+
 def stop_llm():
+    if CLOUD_ROUTING:
+        return
     log("Stopping LLM to free VRAM...")
     systemctl("stop", "qwen3.8-27b-q6k-cuda.service")
     systemctl("stop", "llama-qwen35-122b.service")
@@ -43,6 +79,8 @@ def stop_llm():
     time.sleep(2)
 
 def start_llm():
+    if CLOUD_ROUTING:
+        return True
     log("Starting LLM...")
     systemctl("start", "qwen3.8-27b-q6k-cuda.service")
     for i in range(60):
@@ -147,8 +185,13 @@ def main():
     # Record time before generation (to find new outputs)
     gen_start_time = time.time()
 
-    # Step 1: Ensure LLM is running for the agent
+    # Step 1: Ensure LLM is running for the agent (no-op under cloud routing)
     start_llm()
+
+    # Step 1b: Route this agent explicitly — dsh resolves the model from
+    # settings.yaml at launch, so a subprocess would otherwise inherit the
+    # previous agent call's route.
+    set_agent_route("video-generator")
 
     # Step 2: Read the prompt for the agent
     prompt_file = os.path.join(shot_dir, "prompt_video.txt")
@@ -225,8 +268,10 @@ def main():
 
         time.sleep(3)
 
-    # Step 5: Find the generated clip
-    comfyui_output = "/opt/comfyui/output"
+    # Step 5: Find the generated clip. ComfyUI's real output dir is
+    # /opt/comfyui/ComfyUI/output (where the agent's own script reads from);
+    # /opt/comfyui/output is an empty dir, so watching it misses every clip.
+    comfyui_output = "/opt/comfyui/ComfyUI/output"
     new_videos = find_new_outputs(comfyui_output, gen_start_time)
 
     clip_path = os.path.join(shot_dir, "clip.mp4")
@@ -255,9 +300,14 @@ def main():
         json.dump(gen_log, f, indent=2)
 
     # Step 7: Restart LLM for QA
-    log("Restarting LLM for QA...")
-    restart_comfyui()  # clean VRAM first
-    start_llm()
+    # Under cloud routing QA is remote and needs no VRAM, so neither the
+    # ComfyUI restart (was: "clean VRAM first") nor the LLM start is needed.
+    if CLOUD_ROUTING:
+        log("Cloud routing: skipping ComfyUI restart + LLM start (QA is remote)")
+    else:
+        log("Restarting LLM for QA...")
+        restart_comfyui()  # clean VRAM first
+        start_llm()
 
     return 0 if os.path.exists(clip_path) else 1
 
