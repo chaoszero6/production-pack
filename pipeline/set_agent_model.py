@@ -164,6 +164,9 @@ def _ensure_local_llm():
     except:
         pass
 
+    print("Restarting ComfyUI to free VRAM before starting local LLM...", file=sys.stderr)
+    subprocess.run(["systemctl", "restart", "comfyui.service"], capture_output=True)
+    time.sleep(5)
     print("Starting local LLM for fallback...", file=sys.stderr)
     subprocess.run(["systemctl", "start", LOCAL_LLM_SERVICE], capture_output=True)
 
