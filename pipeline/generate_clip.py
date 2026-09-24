@@ -69,30 +69,60 @@ def set_agent_route(preset):
     return True
 
 
+ALL_LLM_SERVICES = [
+    "qwen3.8-27b-q6k-cuda.service",
+    "llama-qwen35-122b.service",
+    "ninfer.service",
+    "ninfer-us.service",
+]
+LOCAL_HEALTH_ENDPOINTS = [
+    ("ninfer.service",    "http://127.0.0.1:8080/health"),
+    ("ninfer-us.service", "http://127.0.0.1:8081/health"),
+    ("qwen3.8-27b-q6k-cuda.service", "http://127.0.0.1:8085/health"),
+]
+
+
 def stop_llm():
     if CLOUD_ROUTING:
         return
-    log("Stopping LLM to free VRAM...")
-    systemctl("stop", "qwen3.8-27b-q6k-cuda.service")
-    systemctl("stop", "llama-qwen35-122b.service")
+    log("Stopping ALL LLM services to free VRAM...")
+    for svc in ALL_LLM_SERVICES:
+        systemctl("stop", svc)
     subprocess.run(["docker", "stop", "qwen38-27b-q6k"], capture_output=True)
     time.sleep(2)
+
 
 def start_llm():
     if CLOUD_ROUTING:
         return True
-    log("Starting LLM...")
-    systemctl("start", "qwen3.8-27b-q6k-cuda.service")
-    for i in range(60):
+    # Check if any local LLM is already healthy
+    for svc, url in LOCAL_HEALTH_ENDPOINTS:
         try:
-            r = requests.get("http://127.0.0.1:8085/health", timeout=3)
+            r = requests.get(url, timeout=3)
             if r.status_code == 200:
-                log(f"LLM ready ({i+1}s)")
+                log(f"LLM already running: {svc}")
                 return True
         except:
             pass
-        time.sleep(1)
-    log("WARNING: LLM failed to start in 60s")
+    # None healthy — restart ComfyUI first to free VRAM, then start preferred
+    log("Starting local LLM (restarting ComfyUI first to free VRAM)...")
+    systemctl("restart", "comfyui.service")
+    time.sleep(5)
+    # Try ninfer-us first (it's the primary fallback), then ninfer, then q6k
+    for svc, url in LOCAL_HEALTH_ENDPOINTS:
+        systemctl("start", svc)
+        for i in range(120):
+            try:
+                r = requests.get(url, timeout=3)
+                if r.status_code == 200:
+                    log(f"LLM ready ({i+1}s): {svc}")
+                    return True
+            except:
+                pass
+            time.sleep(1)
+        log(f"{svc} didn't start, trying next...")
+        systemctl("stop", svc)
+    log("WARNING: No local LLM started in time")
     return False
 
 def restart_comfyui():

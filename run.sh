@@ -90,13 +90,32 @@ ensure_local_llm_running() {
         return 0
     fi
     systemctl stop "$SVC_122B" 2>/dev/null || true
-    if ! systemctl is-active --quiet "$SVC_27B"; then
-        log "Starting $SVC_27B for agent work..."
-        systemctl restart "$SVC_COMFYUI"  # free VRAM cache first
-        sleep 3
-        systemctl start "$SVC_27B"
-        wait_for_health "$LLM_URL/health" "$WAIT_27B" "Qwen 3.8 27B"
-    fi
+    # Check if any local LLM is already healthy (NInfer preferred)
+    for url in "http://127.0.0.1:8080/health" "http://127.0.0.1:8081/health" "http://127.0.0.1:8085/health"; do
+        if curl -sf --max-time 3 "$url" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    # None healthy — restart ComfyUI to free VRAM, then start preferred service
+    log "Starting local LLM for agent work..."
+    systemctl restart "$SVC_COMFYUI"  # free VRAM cache first
+    sleep 3
+    # Try ninfer-us first (primary fallback), then ninfer, then q6k
+    for svc in ninfer-us.service ninfer.service "$SVC_27B"; do
+        systemctl start "$svc" 2>/dev/null || true
+        for i in $(seq 1 120); do
+            for url in "http://127.0.0.1:8080/health" "http://127.0.0.1:8081/health" "http://127.0.0.1:8085/health"; do
+                if curl -sf --max-time 3 "$url" >/dev/null 2>&1; then
+                    log "Local LLM ready (${i}s): $svc"
+                    return 0
+                fi
+            done
+            sleep 1
+        done
+        log "$svc didn't start, trying next..."
+        systemctl stop "$svc" 2>/dev/null || true
+    done
+    die "No local LLM started within timeout"
 }
 
 stop_all_llms() {
@@ -105,6 +124,9 @@ stop_all_llms() {
     fi
     systemctl stop "$SVC_122B" 2>/dev/null || true
     systemctl stop "$SVC_27B" 2>/dev/null || true
+    # NInfer services (used in cloud→local fallback)
+    systemctl stop ninfer.service 2>/dev/null || true
+    systemctl stop ninfer-us.service 2>/dev/null || true
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^qwen38'; then
         docker stop qwen38-27b-q6k > /dev/null 2>&1 || true
     fi
