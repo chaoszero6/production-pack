@@ -43,8 +43,8 @@ LLM_PORT=8085
 LLM_URL="http://127.0.0.1:$LLM_PORT"
 COMFYUI_URL="http://127.0.0.1:8188"
 
-# LLM routing: ALL agents use local Qwen 3.8 27B Q6_K on port 8085.
-# No cloud API needed. dsh settings point to local-qwen-q6k provider.
+# LLM routing: default is cloud (OpenRouter). Local fallback uses NInfer
+# providers `ninfer` (:8080) / `ninfer-us` (:8081) registered in dsh settings.
 DSH_SETTINGS="/root/.dsh/settings.yaml"
 # Still copy .env for any cloud fallback tools the agents might use
 if [ -f /root/.hermes/.env ]; then
@@ -149,19 +149,22 @@ start_hermes() {
 # ── Cloud routing (OpenRouter) with automatic local fallback ──
 # Every agent runs on the OpenRouter cloud by default. When cloud tokens are
 # exhausted, set_agent_model.py detects it (402/429), writes a signal file
-# (.use_local_llm), and falls back to local Qwen 3.8 27B Q6_K.
+# (.use_local_llm), and falls back to local NInfer (ninfer / ninfer-us).
 # In local mode: VRAM management is active (stop LLM during ComfyUI gen).
 # Per-agent model table lives in pipeline/set_agent_model.py.
 LOCAL_FALLBACK_SIGNAL="$OUTPUT_DIR/.use_local_llm"
 if [ -f "$LOCAL_FALLBACK_SIGNAL" ]; then
     export CLOUD_ROUTING="0"
-    log "LOCAL FALLBACK ACTIVE — cloud exhausted, using Qwen 3.8 27B Q6_K"
+    log "LOCAL FALLBACK ACTIVE — cloud exhausted, using local NInfer (ninfer / ninfer-us)"
 else
     export CLOUD_ROUTING="${CLOUD_ROUTING:-1}"
 fi
 
-# Fallback local layout (only used when CLOUD_ROUTING=0)
-LOCAL_MODEL_PROVIDER="local-qwen-q6k"
+# Fallback local layout (only used when CLOUD_ROUTING=0).
+# Prefer ninfer (8080); ninfer-us (8081) is the alternate dsh provider.
+# set_agent_model.py picks whichever local endpoint is healthy when
+# it drives the fallback itself.
+LOCAL_MODEL_PROVIDER="ninfer"
 LOCAL_MODEL_ID="qwen3.8-27b"
 LOCAL_MODEL_EFFORT="xhigh"
 
@@ -218,6 +221,7 @@ run_dsh_agent() {
     # dsh headless: takes task as positional arg, prints final answer to stdout
     # For story-creator: extract valid JSON (strip any preamble/summary)
     local raw_output="$RUN_DIR/${preset}_raw.txt"
+    local err_output="$RUN_DIR/${preset}_stderr.log"
 
     # all agents are cloud-hosted: point agent-default-model at the right model
     # (pro for the reasoning agents, flash for everything else) before launch
@@ -228,7 +232,47 @@ run_dsh_agent() {
         --patch "$PACK_DIR/.dsh/.agent-presets/$preset/agent.cordis.yml" \
         "$prompt_text" \
         > "$raw_output" \
-        2>> "$RUN_DIR/pipeline.log" || agent_exit=$?
+        2> "$err_output" || agent_exit=$?
+
+    # Append stderr to pipeline.log for post-mortem
+    if [[ -s "$err_output" ]]; then
+        cat "$err_output" >> "$RUN_DIR/pipeline.log"
+    fi
+
+    # ── Runtime cloud-exhaustion catch ──
+    # The pre-launch probe in set_agent_model.py checks the key's monthly
+    # limit, but OpenRouter can still 402 when account credits can't cover
+    # max_tokens ("can only afford N tokens"). dsh surfaces that as
+    # `PI_AI_ERROR: 402` on stderr and exits non-zero — without this block
+    # the run just retries the same broken cloud route forever.
+    if [[ $agent_exit -ne 0 ]] && grep -qE 'PI_AI_ERROR:\s*(402|429|401)' "$err_output" 2>/dev/null; then
+        local http_code
+        http_code=$(grep -oE 'PI_AI_ERROR:\s*(402|429|401)' "$err_output" | head -1 | grep -oE '(402|429|401)')
+        log "Cloud API $http_code for $preset — marking exhausted and falling back to local Qwen"
+        # Mark exhausted (writes .cloud_fallback_state + .use_local_llm).
+        # Call route_for via the Python CLI WITHOUT --show so it also runs
+        # _ensure_local_llm (starts the service, waits for health) and
+        # rewrites settings.yaml to the local provider — the bash
+        # CLOUD_ROUTING=0 path only rewrites YAML and would leave the LLM down.
+        python3 "$PACK_DIR/pipeline/set_agent_model.py" --mark-exhausted "runtime $http_code from $preset"
+        export CLOUD_ROUTING="0"
+        local fallback_route
+        fallback_route=$(python3 "$PACK_DIR/pipeline/set_agent_model.py" "$preset") || {
+            log "ERROR: local fallback route failed for $preset"
+        }
+        log "Model route (fallback): $fallback_route"
+        # Retry once on local
+        agent_exit=0
+        pnpm dsh --profile headless \
+            --patch "$PACK_DIR/.dsh/.agent-presets/$preset/agent.cordis.yml" \
+            "$prompt_text" \
+            > "$raw_output" \
+            2> "$err_output" || agent_exit=$?
+        if [[ -s "$err_output" ]]; then
+            cat "$err_output" >> "$RUN_DIR/pipeline.log"
+        fi
+    fi
+
     if [[ $agent_exit -ne 0 ]]; then
         log "WARNING: Agent $preset exited non-zero (exit $agent_exit). Check $RUN_DIR/pipeline.log"
         # Save raw output even on failure for resume

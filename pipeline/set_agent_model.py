@@ -14,8 +14,9 @@ atomically (write temp + os.replace) so a killed run can never leave a
 truncated settings.yaml.
 
 FALLBACK: If the cloud provider returns 402/429 (budget/rate limit), the
-script detects it and falls back to local Qwen 3.8 27B Q6_K. This requires:
-  - qwen3.8-27b-q6k-cuda.service to be startable
+script detects it and falls back to local NInfer (ninfer :8080, then
+ninfer-us :8081, then qwen q6k :8085 — first healthy wins). This requires:
+  - one of those services to be startable (ninfer/ninfer-us Conflicts= each other)
   - CLOUD_ROUTING in run.sh switches to 0 for VRAM management
 
 NOTE: dsh resolves the model from this section AT LAUNCH, so it must be
@@ -53,12 +54,22 @@ FLASH_EFFORT = "low"
 # Budget fallback for vision (6x cheaper)
 VISION_MODEL_BUDGET = "qwen/qwen3-vl-32b-instruct"
 
-# ── Local fallback tier (Qwen 3.8 27B Q6_K on port 8085) ────
-LOCAL_PROVIDER = "local-qwen-q6k"
+# ── Local fallback tier (NInfer, 262k KV) ──────────────────
+# Prefer whichever ninfer unit is actually healthy; both are registered
+# as dsh providers. systemd Conflicts= means only one runs at a time.
+LOCAL_PROVIDER = "ninfer"
 LOCAL_MODEL = "qwen3.8-27b"
 LOCAL_EFFORT = "xhigh"
-LOCAL_LLM_SERVICE = "qwen3.8-27b-q6k-cuda.service"
-LOCAL_HEALTH_URL = "http://127.0.0.1:8085/health"
+LOCAL_ALTS = (
+    ("ninfer", "qwen3.8-27b", "ninfer.service", "http://127.0.0.1:8080/health"),
+    (
+        "ninfer-us",
+        "qwen38-huihui-abliterated-ninfer-nvfp4",
+        "ninfer-us.service",
+        "http://127.0.0.1:8081/health",
+    ),
+    ("local-qwen-q6k", "qwen3.8-27b", "qwen3.8-27b-q6k-cuda.service", "http://127.0.0.1:8085/health"),
+)
 
 PRO_PRESETS = {
     "story-creator",
@@ -80,9 +91,17 @@ def _is_cloud_exhausted():
     if os.path.exists(FALLBACK_STATE):
         try:
             mtime = os.path.getmtime(FALLBACK_STATE)
-            # Fallback state expires after 1 hour — retry cloud periodically
-            if time.time() - mtime < 3600:
+            # Fallback state persists for the whole run (24h) — OpenRouter
+            # monthly credits don't refill mid-run, and a short TTL caused
+            # the route to bounce back to cloud after 1h and 402 again.
+            # Manual clear: delete .cloud_fallback_state + .use_local_llm.
+            if time.time() - mtime < 86400:
                 return True
+        except:
+            pass
+        # Expired/stale — clear so a future explicit cloud retry works
+        try:
+            os.remove(FALLBACK_STATE)
         except:
             pass
     return False
@@ -132,15 +151,56 @@ def _probe_cloud():
         )
         if r.status_code == 200:
             data = r.json().get("data", {})
-            # Check remaining credits
+            # Key monthly limit (may differ from OpenRouter account credits —
+            # a request can still 402 when key remaining > 0 if account
+            # credits can't cover max_tokens; runtime 402 handling in
+            # run.sh catches that case via --mark-exhausted).
             limit = data.get("limit")
             usage = data.get("usage")
-            if limit is not None and usage is not None:
+            limit_remaining = data.get("limit_remaining")
+            if limit_remaining is not None:
+                remaining = limit_remaining
+            elif limit is not None and usage is not None:
                 remaining = limit - usage
-                if remaining <= 0:
-                    _mark_cloud_exhausted(f"credits exhausted (used {usage}/{limit})")
+            else:
+                remaining = None
+            if remaining is not None and remaining <= 0:
+                _mark_cloud_exhausted(f"credits exhausted (remaining={remaining})")
+                return False
+            # auth/key only reflects the KEY's monthly limit — OpenRouter
+            # account credits are checked per-request and can 402 even when
+            # key remaining > 0 ("can only afford N tokens" for large
+            # max_tokens). Probe with the SAME max_tokens dsh uses so the
+            # credit check matches real requests; a 402 here costs nothing.
+            try:
+                pr = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "deepseek/deepseek-v4.1-flash",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 32768,
+                    },
+                    timeout=15,
+                )
+                if pr.status_code in (401, 402, 429):
+                    _mark_cloud_exhausted(
+                        f"probe completion returned {pr.status_code}: "
+                        f"{pr.text[:200]}"
+                    )
                     return False
-            _clear_cloud_exhausted()
+            except Exception as e:
+                # Probe POST failed — don't hard-fail, auth/key already said OK
+                print(f"Completion probe failed: {e}", file=sys.stderr)
+            # DO NOT clear exhausted state here on success alone — if we
+            # entered this branch because _is_cloud_exhausted() was false
+            # (state expired or never set), clearing is harmless; but if a
+            # prior runtime 402 set the state and this probe somehow passes
+            # (race, temporary), clearing would bounce us back to cloud.
+            # Only clear when the caller explicitly requests a cloud retry.
             return True
         elif r.status_code in (401, 402, 429):
             _mark_cloud_exhausted(f"API returned {r.status_code}")
@@ -153,41 +213,53 @@ def _probe_cloud():
     return True
 
 
-def _ensure_local_llm():
-    """Start local LLM if not running. Also signals run.sh to use VRAM management."""
+def _health(url):
+    if not requests:
+        return False
     try:
-        r = None
-        if requests:
-            r = requests.get(LOCAL_HEALTH_URL, timeout=3)
-        if r and r.status_code == 200:
-            return True
-    except:
-        pass
+        r = requests.get(url, timeout=3)
+        return r is not None and r.status_code == 200
+    except Exception:
+        return False
 
+
+def _pick_local():
+    """Return the first healthy (provider, model) local route."""
+    for provider, model, _svc, health in LOCAL_ALTS:
+        if _health(health):
+            return provider, model
+    return LOCAL_PROVIDER, LOCAL_MODEL
+
+
+def _ensure_local_llm():
+    """Start a local LLM if none is healthy. Prefer ninfer, then ninfer-us, then q6k."""
+    for provider, model, _svc, health in LOCAL_ALTS:
+        if _health(health):
+            return True, provider, model
+
+    # Nothing healthy — free VRAM then start the preferred service (ninfer).
     print("Restarting ComfyUI to free VRAM before starting local LLM...", file=sys.stderr)
     subprocess.run(["systemctl", "restart", "comfyui.service"], capture_output=True)
     time.sleep(5)
-    print("Starting local LLM for fallback...", file=sys.stderr)
-    subprocess.run(["systemctl", "start", LOCAL_LLM_SERVICE], capture_output=True)
+    provider, model, svc, health = LOCAL_ALTS[0]
+    print(f"Starting {svc} for fallback...", file=sys.stderr)
+    subprocess.run(["systemctl", "start", svc], capture_output=True)
 
-    for i in range(60):
-        try:
-            if requests:
-                r = requests.get(LOCAL_HEALTH_URL, timeout=3)
-                if r.status_code == 200:
-                    print(f"Local LLM ready ({i+1}s)", file=sys.stderr)
-                    return True
-        except:
-            pass
+    # Wait on any alt becoming healthy (start of preferred may fail if Conflicts/VRAM).
+    for i in range(120):
+        for provider, model, svc2, h in LOCAL_ALTS:
+            if _health(h):
+                print(f"Local LLM ready ({i+1}s): {provider}/{model}", file=sys.stderr)
+                return True, provider, model
         time.sleep(1)
 
-    print("WARNING: Local LLM failed to start in 60s", file=sys.stderr)
-    return False
+    print("WARNING: Local LLM failed to start in 120s", file=sys.stderr)
+    return False, LOCAL_PROVIDER, LOCAL_MODEL
 
 
 def route_for(preset):
     """Return (provider, model, effort) for a preset.
-    Falls back to local Qwen 3.8 27B if cloud is exhausted."""
+    Falls back to local NInfer if cloud is exhausted."""
 
     cloud_ok = _probe_cloud()
 
@@ -198,8 +270,8 @@ def route_for(preset):
             return CLOUD_PROVIDER, VISION_MODEL, VISION_EFFORT
         return CLOUD_PROVIDER, FLASH_MODEL, FLASH_EFFORT
     else:
-        # Cloud exhausted — fall back to local Qwen 3.8 27B
-        _ensure_local_llm()
+        # Cloud exhausted — fall back to whichever local NInfer/Qwen is healthy
+        _ok, local_provider, local_model = _ensure_local_llm()
 
         # Signal run.sh and generate_clip.py to use VRAM management
         os.environ["CLOUD_ROUTING"] = "0"
@@ -212,14 +284,15 @@ def route_for(preset):
             # Notify via Discord
             subprocess.run(
                 ["bash", "/root/production_pack/pipeline/notify.sh",
-                 "Cloud API exhausted — falling back to local Qwen 3.8 27B Q6_K.\n"
+                 "Cloud API exhausted — falling back to local "
+                 f"{local_provider}/{local_model}.\n"
                  "VRAM management active: LLM stops during video generation.",
                  "Cloud Fallback"],
                 capture_output=True,
             )
 
-        # Local 27B is multimodal — handles all tiers including vision
-        return LOCAL_PROVIDER, LOCAL_MODEL, LOCAL_EFFORT
+        # Local models handle all tiers including vision (text+image providers)
+        return local_provider, local_model, LOCAL_EFFORT
 
 
 def rewrite(provider, model, effort, path=SETTINGS):
@@ -258,6 +331,23 @@ def rewrite(provider, model, effort, path=SETTINGS):
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
+
+    # External trigger: mark cloud exhausted without rewriting a route.
+    # Used by run.sh when a live dsh call returns PI_AI_ERROR 402/429 —
+    # the pre-launch probe can miss account-credit exhaustion that only
+    # surfaces on the actual completion request.
+    if sys.argv[1] == "--mark-exhausted":
+        reason = sys.argv[2] if len(sys.argv) > 2 else "runtime 402/429 from dsh"
+        _mark_cloud_exhausted(reason)
+        # Also write the persistent signal so run.sh flips CLOUD_ROUTING
+        # for VRAM management across subprocesses / future resumes.
+        signal_file = "/root/production_pack/output/.use_local_llm"
+        os.makedirs(os.path.dirname(signal_file), exist_ok=True)
+        if not os.path.exists(signal_file):
+            with open(signal_file, "w") as f:
+                f.write(f"{reason}\n{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        return
+
     preset = sys.argv[1]
     provider, model, effort = route_for(preset)
 
