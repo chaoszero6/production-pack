@@ -192,45 +192,14 @@ LOCAL_MODEL_EFFORT="xhigh"
 
 set_agent_model() {
     local preset="$1"
-    if [[ "$CLOUD_ROUTING" == "1" ]]; then
-        local route
-        route=$(python3 "$PACK_DIR/pipeline/set_agent_model.py" "$preset") || {
-            die "set_agent_model failed for preset '$preset'"
-        }
-        log "Model route: $route"
-        return 0
-    fi
-
-    python3 - "$DSH_SETTINGS" "$LOCAL_MODEL_PROVIDER" "$LOCAL_MODEL_ID" "$LOCAL_MODEL_EFFORT" << 'PYEOF'
-import sys, re, os, tempfile
-path, provider, model, effort = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-text = open(path).read()
-m = re.search(r'(?m)^agent-default-model:[ \t]*$', text)
-if not m:
-    sys.exit('agent-default-model section not found in ' + path)
-head, tail = text[:m.start()], text[m.end():]
-# drop the section body: everything until the next line that starts at column 0
-# (blank lines and indented/comment lines belong to this section)
-lines = tail.splitlines(keepends=True)
-rest = ''
-for i, ln in enumerate(lines):
-    if ln.strip() and ln[:1] not in (' ', '\t', '#'):
-        rest = ''.join(lines[i:])
-        break
-block = (
-    'agent-default-model:\n'
-    '  # Managed by production_pack/run.sh (per-agent routing) — do not hand-edit.\n'
-    f'  provider: {provider}\n'
-    f'  model: {model}\n'
-    f'  reasoningEffort: {effort}\n'
-)
-# atomic write so a killed run can never leave a truncated settings.yaml
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.settings-', suffix='.tmp')
-with os.fdopen(fd, 'w') as fh:
-    fh.write(head + block + rest)
-os.replace(tmp, path)
-PYEOF
-    log "Model route: $preset -> $LOCAL_MODEL_PROVIDER / $LOCAL_MODEL_ID (effort=$LOCAL_MODEL_EFFORT)"
+    # Always use set_agent_model.py — it dynamically picks the healthy provider
+    # (cloud or local) and writes the route atomically. The old CLOUD_ROUTING=0
+    # path hardcoded LOCAL_MODEL_PROVIDER which didn't match the running service.
+    local route
+    route=$(python3 "$PACK_DIR/pipeline/set_agent_model.py" "$preset") || {
+        die "set_agent_model failed for preset '$preset'"
+    }
+    log "Model route: $route"
 }
 
 run_dsh_agent() {
