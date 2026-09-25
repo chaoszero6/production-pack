@@ -65,6 +65,23 @@
       - FIX: Break complex actions into simpler 4-6 second clips
       - FIX: Describe motion in physical terms, not effect names
 
+      **Spatial Geometry Collapse (Room Morphing) — EXIT/ENTRANCE SHOTS**
+      - H3 loses spatial coherence when a character walks away from camera toward a door/exit
+      - The room warps, furniture shifts, walls deform, doors/windows dissolve entirely
+      - Worse on clips >7 seconds with significant character displacement
+      - FIX: Add explicit environment anchoring:
+        "[0s-END] STATIC ENVIRONMENT: walls, floor, ceiling, door, furniture maintain
+        exact position and appearance throughout the entire clip."
+      - FIX: Pin specific landmarks: "grandfather clock LEFT wall, arched door CENTER,
+        workbench RIGHT — all fixed in place"
+      - FIX: Keep exit/entrance clips to 6 seconds max
+      - FIX: Prefer cutting BEFORE character fully exits — match-cut to next shot
+      - Add negative: "no room deformation, no morphing walls, no vanishing doors,
+        no shifting furniture, no melting textures"
+      - TRIGGER WORDS to watch for: "exits", "leaves", "walks to door", "walks away",
+        "departs", "steps out", "heads toward the door"
+        → ANY of these = apply the spatial anchoring pattern automatically
+
       ### Prompt Structure Rules
 
       1. **Temporal Decomposition** — Use [0-2s], [2-4s], [4-6s] time blocks
@@ -91,6 +108,8 @@
       - [ ] Reference images have explicit role assignments
       - [ ] No conflicting depth cues between reference and prompt
       - [ ] Camera movement described physically
+      - [ ] **EXIT/ENTRANCE shots** have environment anchoring + pinned landmarks + "no morphing" negative
+      - [ ] **EXIT clip duration** is 6s or shorter (geometry breaks after ~7s)
       - [ ] **DIALOGUE DURATION CHECK**: count words in each dialogue line,
             divide by 2.5 → must fit within clip duration minus 1s buffer.
             If too long, REJECT and ask Director to split or extend clip.

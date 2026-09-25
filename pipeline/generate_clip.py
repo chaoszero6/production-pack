@@ -74,6 +74,8 @@ ALL_LLM_SERVICES = [
     "llama-qwen35-122b.service",
     "ninfer.service",
     "ninfer-us.service",
+    "orpheus-backend.service",
+    "orpheus-tts.service",
 ]
 LOCAL_HEALTH_ENDPOINTS = [
     ("ninfer.service",    "http://127.0.0.1:8080/health"),

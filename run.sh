@@ -66,7 +66,7 @@ NOTIFY="$PACK_DIR/pipeline/notify.sh"
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 die()  { log "ERROR: $*"; notify "ERROR: $*"; exit 1; }
 step() { echo; echo "════════════════════════════════════════"; log "STEP: $*"; echo "════════════════════════════════════════"; }
-notify() { bash "$NOTIFY" "$1" "${2:-}" 2>/dev/null & }
+notify() { bash "$NOTIFY" "$1" "${2:-}" "${3:-}" 2>/dev/null & }
 
 wait_for_health() {
     local url="$1" timeout="$2" name="$3"
@@ -127,6 +127,9 @@ stop_all_llms() {
     # NInfer services (used in cloud→local fallback)
     systemctl stop ninfer.service 2>/dev/null || true
     systemctl stop ninfer-us.service 2>/dev/null || true
+    # TTS services (Orpheus uses GPU for llama.cpp inference)
+    systemctl stop orpheus-tts.service 2>/dev/null || true
+    systemctl stop orpheus-backend.service 2>/dev/null || true
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^qwen38'; then
         docker stop qwen38-27b-q6k > /dev/null 2>&1 || true
     fi
@@ -816,7 +819,7 @@ if ! skip_if_done "$RUN_DIR/audio/voices/voice_config.json" "Voice Design"; then
     step "1e. Audio Producer — voice design"
     swap_to_27b
     write_prompt "$RUN_DIR/prompt_voices.txt" \
-        "Read $RUN_DIR/story.json. For each character, design a voice profile and generate a 5-second reference clip using Chatterbox (port 9882) or CosyVoice (port 50000). Select narrator voice from Kokoro (port 9881). Save voice refs to $RUN_DIR/audio/voices/. Output voice config JSON."
+        "Read $RUN_DIR/story.json. For each character, design a voice profile and assign an Orpheus 3B voice (port 9883, voices: tara/leah/jess/leo/dan/mia/zac/zoe). Fallback: Chatterbox (port 9882) for cloning. Select narrator voice from Kokoro (port 9881). Save voice refs to $RUN_DIR/audio/voices/. Output voice config JSON with engine and voice per character."
     run_dsh_agent "audio-producer" "$RUN_DIR/prompt_voices.txt" "$RUN_DIR/audio/voices/voice_config.json"
     notify "Voice profiles created" "Audio Producer"
 fi
@@ -852,11 +855,11 @@ for SHOT_ID in $SHOT_IDS; do
         continue
     fi
 
-    # Resume: skip clips that already passed QA and are upscaled
-    if [ "$RESUME" = "true" ] && [ -z "$ONLY_CLIP" ] && [ -f "$CLIP_DIR/qa_verdict.json" ] && [ -f "$CLIP_DIR/clip_4k60.mp4" ]; then
+    # Resume: skip clips that already passed QA
+    if [ "$RESUME" = "true" ] && [ -z "$ONLY_CLIP" ] && [ -f "$CLIP_DIR/qa_verdict.json" ]; then
         PREV_VERDICT=$(python3 -c "import json; print(json.load(open('$CLIP_DIR/qa_verdict.json')).get('verdict',''))" 2>/dev/null)
         if [ "$PREV_VERDICT" = "PASS" ]; then
-            log "SKIP (resume): $SHOT_ID — already passed QA + upscaled"
+            log "SKIP (resume): $SHOT_ID — already passed QA"
             continue
         fi
     fi
@@ -869,21 +872,20 @@ for SHOT_ID in $SHOT_IDS; do
     if [ "$RESUME" = "true" ] && [ -f "$CLIP_DIR/qa_verdict.json" ]; then
         RETRY=$(python3 -c "import json; print(json.load(open('$CLIP_DIR/qa_verdict.json')).get('retry_count', 0))" 2>/dev/null || echo 0)
     fi
-    MAX_RETRY=3
+    MAX_RETRY=5
     PASSED=false
 
     # ── Stage-level resume ──────────────────────────────────
-    # PASS already earned but clip_4k60 missing/stale → skip 2a–2e, only upscale.
-    # Stage gates below apply only when RESUME, not ONLY_CLIP (force regen),
-    # and RETRY==0 (RETRY>0 is a corrective full re-run with QA feedback).
+    # PASS already earned → nothing left in this loop (upscale is batch now).
+    # This shouldn't normally trigger (the resume skip above catches it), but
+    # handles edge cases like RETRY>0 with a stale PASS verdict file.
     SKIP_TO_UPSCALE=false
     if [ "$RESUME" = "true" ] && [ -z "$ONLY_CLIP" ] && [ $RETRY -eq 0 ] \
        && [ -f "$CLIP_DIR/qa_verdict.json" ]; then
         PREV_VERDICT=$(python3 -c "import json; print(json.load(open('$CLIP_DIR/qa_verdict.json')).get('verdict',''))" 2>/dev/null || echo FAIL)
         if [ "$PREV_VERDICT" = "PASS" ]; then
-            SKIP_TO_UPSCALE=true
-            PASSED=true
-            log "[$SHOT_ID] Stage resume: QA already PASS — skipping to 4K60 upscale"
+            log "[$SHOT_ID] QA already PASS — skipping (upscale deferred to batch)"
+            continue
         fi
     fi
 
@@ -898,6 +900,78 @@ for SHOT_ID in $SHOT_IDS; do
         # Corrective retries must re-run every stage with QA feedback
         [ $RETRY -gt 0 ] && STAGE_OK=false
 
+        # ── Cross-clip continuity: extract reference frames from scene ──
+        CONTINUITY_REFS=""
+        CONTINUITY_FRAME_INFO=$(python3 -c "
+import json, sys, os
+shot_id = '$SHOT_ID'
+run_dir = '$RUN_DIR'
+try:
+    shots = json.load(open(os.path.join(run_dir, 'shot_list.json')))['shots']
+    idx = next(i for i, s in enumerate(shots) if s.get('shot_id') == shot_id)
+    scene_id = shots[idx]['scene_id']
+    result = {}
+    # Previous clip in same scene → last frame (start-of-clip anchor)
+    if idx > 0 and shots[idx-1]['scene_id'] == scene_id:
+        prev_id = shots[idx-1]['shot_id']
+        prev_clip = os.path.join(run_dir, 'clips', prev_id, 'clip.mp4')
+        if os.path.exists(prev_clip):
+            result['prev'] = prev_id
+    # First clip in scene → first frame (establishing shot anchor for room layout)
+    scene_first = next(s for s in shots if s['scene_id'] == scene_id)
+    if scene_first['shot_id'] != shot_id:
+        first_id = scene_first['shot_id']
+        first_clip = os.path.join(run_dir, 'clips', first_id, 'clip.mp4')
+        if os.path.exists(first_clip) and first_id != result.get('prev'):
+            result['first'] = first_id
+    # Next clip in same scene → first frame (if already generated, for end-of-clip anchor)
+    if idx < len(shots) - 1 and shots[idx+1]['scene_id'] == scene_id:
+        next_id = shots[idx+1]['shot_id']
+        next_clip = os.path.join(run_dir, 'clips', next_id, 'clip.mp4')
+        if os.path.exists(next_clip):
+            result['next'] = next_id
+    print(json.dumps(result))
+except Exception:
+    print('{}')
+" 2>/dev/null || echo "{}")
+
+        PREV_CLIP_ID=$(echo "$CONTINUITY_FRAME_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin).get('prev',''))" 2>/dev/null || echo "")
+        FIRST_CLIP_ID=$(echo "$CONTINUITY_FRAME_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin).get('first',''))" 2>/dev/null || echo "")
+        NEXT_CLIP_ID=$(echo "$CONTINUITY_FRAME_INFO" | python3 -c "import json,sys; print(json.load(sys.stdin).get('next',''))" 2>/dev/null || echo "")
+
+        # Extract previous clip's last frame (most important — start-of-clip anchor)
+        if [ -n "$PREV_CLIP_ID" ]; then
+            PREV_LASTFRAME="$CLIP_DIR/prev_clip_lastframe.png"
+            if [ ! -f "$PREV_LASTFRAME" ] || [ $RETRY -gt 0 ]; then
+                ffmpeg -y -sseof -0.1 -i "$RUN_DIR/clips/$PREV_CLIP_ID/clip.mp4" -frames:v 1 -q:v 2 "$PREV_LASTFRAME" 2>/dev/null && \
+                    log "[$SHOT_ID] Extracted last frame from prev clip $PREV_CLIP_ID" || \
+                    log "[$SHOT_ID] WARNING: Could not extract last frame from $PREV_CLIP_ID"
+            fi
+            [ -f "$PREV_LASTFRAME" ] && CONTINUITY_REFS="CONTINUITY ANCHOR (previous clip $PREV_CLIP_ID last frame): $PREV_LASTFRAME — Include as <Picture N> ref with role 'continuity anchor: match spatial layout, lighting, prop positions, character state'. This clip's FIRST FRAME must visually match this."
+        fi
+
+        # Extract scene establishing shot's first frame (room layout anchor)
+        if [ -n "$FIRST_CLIP_ID" ]; then
+            SCENE_FIRSTFRAME="$CLIP_DIR/scene_establishing_frame.png"
+            if [ ! -f "$SCENE_FIRSTFRAME" ] || [ $RETRY -gt 0 ]; then
+                ffmpeg -y -i "$RUN_DIR/clips/$FIRST_CLIP_ID/clip.mp4" -frames:v 1 -q:v 2 "$SCENE_FIRSTFRAME" 2>/dev/null && \
+                    log "[$SHOT_ID] Extracted establishing frame from scene first clip $FIRST_CLIP_ID" || \
+                    log "[$SHOT_ID] WARNING: Could not extract establishing frame from $FIRST_CLIP_ID"
+            fi
+            [ -f "$SCENE_FIRSTFRAME" ] && CONTINUITY_REFS="$CONTINUITY_REFS SCENE LAYOUT ANCHOR (establishing shot $FIRST_CLIP_ID first frame): $SCENE_FIRSTFRAME — Include as <Picture N> ref with role 'scene layout anchor: room geometry, window/door positions, furniture arrangement must match this establishing shot'."
+        fi
+
+        # Extract next clip's first frame if it exists (end-of-clip anchor for retries)
+        if [ -n "$NEXT_CLIP_ID" ]; then
+            NEXT_FIRSTFRAME="$CLIP_DIR/next_clip_firstframe.png"
+            if [ ! -f "$NEXT_FIRSTFRAME" ] || [ $RETRY -gt 0 ]; then
+                ffmpeg -y -i "$RUN_DIR/clips/$NEXT_CLIP_ID/clip.mp4" -frames:v 1 -q:v 2 "$NEXT_FIRSTFRAME" 2>/dev/null && \
+                    log "[$SHOT_ID] Extracted first frame from next clip $NEXT_CLIP_ID" || \
+                    log "[$SHOT_ID] WARNING: Could not extract first frame from $NEXT_CLIP_ID"
+            fi
+            [ -f "$NEXT_FIRSTFRAME" ] && CONTINUITY_REFS="$CONTINUITY_REFS END-OF-CLIP ANCHOR (next clip $NEXT_CLIP_ID first frame): $NEXT_FIRSTFRAME — Include as <Picture N> ref with role 'end anchor: this clip must END in a state that transitions smoothly to this frame'."
+        fi
+
         # ── 2a. Screenplay Reviewer — skip if reviewed_prompt.json already done ──
         if [ "$STAGE_OK" = "true" ] && [ -s "$CLIP_DIR/reviewed_prompt.json" ]; then
             log "[$SHOT_ID] SKIP (resume): prompt review — reviewed_prompt.json exists"
@@ -907,7 +981,7 @@ for SHOT_ID in $SHOT_IDS; do
             [ -f "$CLIP_DIR/qa_verdict.json" ] && CORRECTIONS="Previous QA feedback: $(cat "$CLIP_DIR/qa_verdict.json")"
 
             write_prompt "$CLIP_DIR/prompt_review.txt" \
-                "Review shot $SHOT_ID from $RUN_DIR/shot_list.json. Build the MiniMax H3 ref2va prompt in 6-section format (subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape, non_diegetic_music). Apply rules from knowledge/minimax_h3_rules.md. Character refs: $RUN_DIR/characters/. Location refs: $RUN_DIR/locations/. DIALOGUE lines get <d> tags + <Audio> ref. NARRATION clips: NO <d> tags, describe characters with closed lips. $CORRECTIONS"
+                "Review shot $SHOT_ID from $RUN_DIR/shot_list.json. Build the MiniMax H3 ref2va prompt in 6-section format (subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape, non_diegetic_music). Apply rules from knowledge/minimax_h3_rules.md. Character refs: $RUN_DIR/characters/. Location refs: $RUN_DIR/locations/. DIALOGUE lines get <d> tags + <Audio> ref. NARRATION clips: NO <d> tags, describe characters with closed lips. $CONTINUITY_REFS $CORRECTIONS"
 
             run_dsh_agent "screenplay-reviewer" "$CLIP_DIR/prompt_review.txt" "$CLIP_DIR/reviewed_prompt.json"
         fi
@@ -992,6 +1066,22 @@ sys.exit(1 if (d.get('failed') or str(d.get('status','')).lower() in ('failed','
         if [ "$NEED_DIALOGUE" = "true" ]; then
             log "[$SHOT_ID] Generating dialogue audio (before video for lip sync)..."
             swap_to_27b
+            # Start Orpheus TTS if not running (primary dialogue engine)
+            if ! curl -sf http://127.0.0.1:9883/v1/models > /dev/null 2>&1; then
+                log "[$SHOT_ID] Starting Orpheus TTS..."
+                systemctl start orpheus-backend.service 2>/dev/null || true
+                sleep 3
+                systemctl start orpheus-tts.service 2>/dev/null || true
+                for _w in $(seq 1 30); do
+                    curl -sf http://127.0.0.1:9883/v1/models > /dev/null 2>&1 && break
+                    sleep 1
+                done
+                if curl -sf http://127.0.0.1:9883/v1/models > /dev/null 2>&1; then
+                    log "[$SHOT_ID] Orpheus TTS ready on :9883"
+                else
+                    log "[$SHOT_ID] WARNING: Orpheus TTS not responding — agent will fall back to Chatterbox"
+                fi
+            fi
             # Extract emotion info from shot list for the prompt
             DIALOGUE_INFO=$(python3 -c "
 import json
@@ -1006,24 +1096,55 @@ if shot:
         print(f\"Start: {d.get('start_time',0)}s  End: {d.get('end_time','?')}s\")
         print()
 " 2>/dev/null)
+            # Extract emotional beat from shot list
+            EMOTIONAL_BEAT=$(python3 -c "
+import json
+with open('$RUN_DIR/shot_list.json') as f:
+    shots = json.load(f)['shots']
+shot = next((s for s in shots if s['shot_id'] == '$SHOT_ID'), None)
+if shot:
+    print(shot.get('emotional_beat', 'neutral'))
+" 2>/dev/null || echo "neutral")
+
             write_prompt "$CLIP_DIR/prompt_dialogue.txt" \
-                "Generate dialogue audio for $SHOT_ID with CORRECT EMOTION.
+                "Generate dialogue audio for $SHOT_ID. This must sound like a REAL ACTOR performing in a Pixar movie — expressive, natural, alive.
 
 Voice refs: $RUN_DIR/audio/voices/
 Shot data from shot_list.json:
 $DIALOGUE_INFO
 
-CRITICAL: Apply the emotion to the TTS generation:
-- Chatterbox (port 9882): use exaggeration parameter (0.3=subtle, 0.7=strong) matching the emotion intensity. Also add paralinguistic tags in the text: [laugh], [sigh], [gasp] where the emotion calls for it.
-- CosyVoice (port 50000): use instruction-based emotion control — append the emotion as an instruction.
-- Orpheus 3B (port 9883): use emotion tags <happy>, <sad>, <angry>, <whisper> for intense emotions.
+Scene emotional beat: $EMOTIONAL_BEAT
 
-Choose the TTS engine based on the emotion:
-- Subtle emotions (warm, curious, gentle) → Chatterbox with low exaggeration
-- Strong emotions (angry, crying, shouting) → Orpheus 3B with emotion tags
-- Multilingual → CosyVoice with emotion instruction
+ENGINE PRIORITY — USE ORPHEUS 3B (port 9883) AS DEFAULT:
+Orpheus produces the most natural, expressive speech. Use it for ALL dialogue unless unavailable.
+API: POST http://localhost:9883/v1/audio/speech
+Body: {"model":"orpheus","input":"<text>","voice":"<voice>","response_format":"wav"}
+Voices: tara, leah, jess, leo, dan, mia, zac, zoe
 
-Save to $CLIP_DIR/dialogue.wav. Include emotion used in dialogue_metadata.json."
+1. Orpheus controls emotion through NATURAL PROSODY from text context, NOT emotion-name tags.
+   Write the dialogue with expressive punctuation and word choice.
+   Add inline paralinguistic sounds where natural:
+   - <laugh> — laughter    - <chuckle> — soft chuckle
+   - <sigh> — sigh         - <gasp> — gasp of surprise
+   - <sniffle> — sniffle   - <groan> — groan
+   Example: 'Tobias love <chuckle> you have got a gear in your porridge again!'
+   Example: '<gasp> You found the missing piece!'
+   Example: '<sigh> I suppose you are right about that...'
+
+2. Don't over-tag — one or two sounds per line max. Let the text carry the emotion.
+
+3. If Orpheus (9883) is DOWN, fall back to Chatterbox (9882) with:
+   - exaggeration=0.5 for moderate emotion, 0.7 for strong
+   - Paralinguistic tags: [laugh], [sigh], [gasp] in the text
+
+4. Voice reference: use the character's ref WAV from $RUN_DIR/audio/voices/
+   Assign each character a consistent Orpheus voice (e.g., elderly woman=leah, child=jess).
+
+QUALITY STANDARD: The output must NOT sound robotic, monotone, or flat.
+It should sound like a warm, expressive human performance with natural
+breath patterns, rhythm variation, and emotional coloring matching the scene.
+
+Save to $CLIP_DIR/dialogue.wav and $CLIP_DIR/dialogue_meta.json (include engine_used, voice, character_id)."
             run_dsh_agent "audio-producer" "$CLIP_DIR/prompt_dialogue.txt" "$CLIP_DIR/dialogue_meta.json"
         fi
 
@@ -1044,7 +1165,7 @@ except Exception:
             log "[$SHOT_ID] Generating frames..."
             ensure_local_llm_running
             write_prompt "$CLIP_DIR/prompt_image.txt" \
-                "Generate frames for $SHOT_ID. Read $CLIP_DIR/reviewed_prompt.json for mode. If composited_i2v: load location ref, use Qwen Image 2.1 edit to composite characters. If reference: skip frame gen. If fl2va: extract last frame from previous clip. ComfyUI: $COMFYUI_URL. Save to $CLIP_DIR/"
+                "Generate frames for $SHOT_ID. Read $CLIP_DIR/reviewed_prompt.json for mode. If composited_i2v: load location ref, use Qwen Image 2.1 edit to composite characters. If reference: skip frame gen. If fl2va: use prev_clip_lastframe.png as first frame input. CONTINUITY REFERENCES (use as visual guides for spatial layout, lighting, character positions): prev_clip_lastframe.png = end of previous clip (match this for start of current), scene_establishing_frame.png = room layout anchor (doors, windows, furniture positions), next_clip_firstframe.png = start of next clip (match this for end of current, if available). ComfyUI: $COMFYUI_URL. Save to $CLIP_DIR/"
             run_dsh_agent "image-generator" "$CLIP_DIR/prompt_image.txt" "$CLIP_DIR/frame_meta.json"
         fi
 
@@ -1093,8 +1214,59 @@ except Exception:
         # Infra failures (agent crash / no parseable verdict) re-run QA only —
         # they must never consume a clip retry or restart 2a–2d.
         log "[$SHOT_ID] QA inspection..."
+
+        # Build cross-clip continuity context
+        CROSS_CLIP_CTX=$(python3 "$PACK_DIR/pipeline/qa_context.py" "$SHOT_ID" "$RUN_DIR" 2>/dev/null || echo "")
+
         write_prompt "$CLIP_DIR/prompt_qa.txt" \
-            "Review $CLIP_DIR/clip.mp4. Extract frames with ffmpeg. Check: hands (finger count, merging), face (distortion, symmetry), character identity (vs refs in $RUN_DIR/characters/), duplication, motion, lip sync (dialogue=lips move, narration=lips closed). Score 0-1 per category, threshold 0.85. Output JSON with verdict PASS/FAIL and corrections if FAIL."
+            "Review $CLIP_DIR/clip.mp4 for a Pixar-quality animated movie. This must look like a GREAT movie — be strict.
+
+CLIP CONTEXT: Shot $SHOT_ID from $RUN_DIR/shot_list.json.
+Character references: $RUN_DIR/characters/
+Location references: $RUN_DIR/locations/
+
+FRAME EXTRACTION: Extract frames with ffmpeg at 2fps for general review, 10fps for motion, 30fps for lip sync.
+
+QUALITY CHECKS (score 0.0-1.0 each, threshold 0.85):
+1. HANDS & LIMBS: Count fingers, check merging, extra limbs, impossible positions
+2. FACE & EXPRESSION: Symmetry, distortion, morphing, expression matches story beat
+3. CHARACTER IDENTITY: Match against reference sheets — hair, clothes, accessories, prosthetics
+4. DUPLICATION: No cloned characters, doubled props, ghost objects
+5. MOTION: Smooth, physically plausible, no jitter/teleporting
+6. LIP SYNC: Dialogue clips = lips move in sync; Narration clips = lips CLOSED
+7. TEXTURE & VISUAL: No swimming textures, resolution drops, banding, noise
+8. COMPOSITION: Framing matches Director spec, camera angle correct
+
+CROSS-CLIP CONTINUITY CHECKS (score 0.0-1.0, threshold 0.85):
+9. CONTINUITY: Compare against adjacent clips in the same scene.
+   If the previous clip exists, extract its LAST FRAME and compare with this clip's FIRST FRAME.
+   Check: prop continuity (objects don't appear/disappear), character facing direction,
+   180-degree rule, spatial layout (window/door/furniture positions stable), lighting,
+   character state (sitting/standing), costume consistency, match-cut visual connection.
+
+$CROSS_CLIP_CTX
+
+VOICE QUALITY (dialogue clips only, score 0.0-1.0, threshold 0.85):
+10. VOICE QUALITY: Analyze the dialogue.wav stem in this clip directory.
+    Check for robotic indicators: monotone pitch, flat prosody, metallic timbre,
+    missing breath sounds, emotion mismatch with the scene's emotional beat.
+    Must sound like a REAL ACTOR — warm, expressive, naturally paced.
+    Voice quality below 0.70 = critical failure (robotic voice is unacceptable).
+    For narration-only clips (no dialogue.wav): skip, mark N/A.
+
+CINEMATIC QUALITY (score 0.0-1.0, threshold 0.80):
+11. FILM QUALITY: Does this look like a frame from a professional animated movie?
+    Check: appealing color palette, proper depth of field, cinematic lighting,
+    natural character posing, clean composition with visual weight balance,
+    environment detail and atmosphere. A great movie doesn't just avoid artifacts —
+    it looks BEAUTIFUL.
+
+VERDICT RULES:
+- ALL categories 1-10 must score >= 0.85
+- FILM QUALITY (11) must score >= 0.80
+- Any critical issue in categories 1-10 = automatic FAIL regardless of score
+- Voice quality below 0.70 = CRITICAL FAIL (robotic voice breaks immersion)
+- Output JSON with verdict PASS/FAIL, all 11 scores, and detailed corrections if FAIL"
         VERDICT=""
         QA_NORM=""
         for QA_TRY in 1 2 3; do
@@ -1130,61 +1302,53 @@ except Exception:
         if [ "$VERDICT" = "PASS" ]; then
             PASSED=true
             log "[$SHOT_ID] QA PASSED"
-            notify "Clip $CURRENT/$TOTAL ($SHOT_ID): QA PASSED" "QA Result"
+            # Build QA score summary for Discord
+            QA_SCORES=$(python3 -c "
+import json
+try:
+    d = json.load(open('$CLIP_DIR/qa_verdict.json'))
+    s = d.get('scores', {})
+    parts = []
+    for k in ('hands','face','character_identity','continuity','voice_quality','film_quality'):
+        v = s.get(k, {})
+        score = v.get('score', '?')
+        parts.append(f'{k}: {score}')
+    print(' | '.join(parts))
+except: print('')
+" 2>/dev/null || echo "")
+            notify "Clip $CURRENT/$TOTAL ($SHOT_ID): QA PASSED\n$QA_SCORES" "QA PASS" "$CLIP_DIR/clip.mp4"
         else
             RETRY=$((RETRY + 1))
             log "[$SHOT_ID] QA FAILED (attempt $RETRY/$MAX_RETRY)"
-            notify "Clip $CURRENT/$TOTAL ($SHOT_ID): QA FAILED (retry $RETRY/$MAX_RETRY)" "QA Result"
+            # Build failure summary for Discord
+            QA_ISSUES=$(python3 -c "
+import json
+try:
+    d = json.load(open('$CLIP_DIR/qa_verdict.json'))
+    issues = d.get('issues', d.get('corrections', []))
+    if isinstance(issues, list):
+        for i in issues[:3]:
+            if isinstance(i, dict):
+                print(f\"- {i.get('category','?')}: {i.get('description', i.get('issue','?'))}\")
+            else:
+                print(f'- {i}')
+    s = d.get('scores', {})
+    fails = [f\"{k}: {v.get('score','?')}\" for k,v in s.items() if isinstance(v,dict) and not v.get('pass',True)]
+    if fails: print('Failed: ' + ', '.join(fails[:5]))
+except: print('')
+" 2>/dev/null || echo "")
+            notify "Clip $CURRENT/$TOTAL ($SHOT_ID): QA FAILED (attempt $RETRY/$MAX_RETRY)\n$QA_ISSUES" "QA FAIL" "$CLIP_DIR/clip.mp4"
         fi
     done
 
     if [ "$PASSED" = "false" ]; then
         log "[$SHOT_ID] ESCALATED after $MAX_RETRY retries"
-        notify "Clip $SHOT_ID ESCALATED — failed $MAX_RETRY attempts" "ESCALATION"
+        notify "Clip $SHOT_ID ESCALATED — failed $MAX_RETRY attempts\nNeeds manual review or shot redesign" "ESCALATION" "$CLIP_DIR/clip.mp4"
     fi
 
-    # ── 2g. Upscale to 4K 60fps (GPU: RTX VSR + RIFE; CPU ffmpeg fallback) ──
-    # Needs VRAM: stop local LLM first (ComfyUI stays up). Rebuild when missing
-    # OR stale (clip.mp4 newer than clip_4k60.mp4 after a re-render).
-    if [ -f "$CLIP_DIR/clip.mp4" ]; then
-        NEED_UPSCALE=false
-        if [ ! -f "$CLIP_DIR/clip_4k60.mp4" ]; then
-            NEED_UPSCALE=true
-        elif [ "$CLIP_DIR/clip.mp4" -nt "$CLIP_DIR/clip_4k60.mp4" ]; then
-            NEED_UPSCALE=true
-            log "[$SHOT_ID] clip_4k60.mp4 is older than clip.mp4 — rebuilding"
-        fi
-
-        if [ "$NEED_UPSCALE" = "true" ]; then
-            log "[$SHOT_ID] Upscaling to 4K 60fps (GPU RTX VSR + RIFE, per-clip)..."
-            stop_all_llms
-            ensure_comfyui
-            UPS_FORCE=""
-            [ -f "$CLIP_DIR/clip_4k60.mp4" ] && UPS_FORCE="--force"
-            if python3 "$PACK_DIR/pipeline/upscale_clip.py" \
-                --shot-dir "$CLIP_DIR" \
-                --comfyui-url "$COMFYUI_URL" \
-                $UPS_FORCE \
-                2>> "$RUN_DIR/pipeline.log"; then
-                log "[$SHOT_ID] 4K60 master ready (GPU) ($(stat -c%s "$CLIP_DIR/clip_4k60.mp4") bytes)"
-            else
-                log "[$SHOT_ID] WARNING GPU upscale failed — CPU ffmpeg fallback"
-                if ffmpeg -y -v error \
-                    -i "$CLIP_DIR/clip.mp4" \
-                    -vf "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1:me_mode=bidir:me=epzs,format=yuv420p,scale=3840:2160:flags=lanczos" \
-                    -c:v libx264 -preset medium -crf 17 -c:a aac \
-                    "$CLIP_DIR/clip_4k60.mp4"; then
-                    log "[$SHOT_ID] 4K60 master ready (CPU fallback) ($(stat -c%s "$CLIP_DIR/clip_4k60.mp4") bytes)"
-                else
-                    log "[$SHOT_ID] WARNING CPU upscale failed, using original"
-                    cp "$CLIP_DIR/clip.mp4" "$CLIP_DIR/clip_4k60.mp4"
-                fi
-            fi
-            ensure_local_llm_running
-        else
-            log "[$SHOT_ID] 4K60 master already up to date"
-        fi
-    fi
+    # ── 2g. Upscale deferred to batch pass after all clips generated ──
+    # Per-clip upscale removed: wastes VRAM cycles during generation.
+    # Batch upscale runs between Phase 2 and Phase 3.
 
     log "[$SHOT_ID] DONE ($CURRENT/$TOTAL)"
 
@@ -1195,6 +1359,65 @@ except Exception:
         exit 0
     fi
 done
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 2g: BATCH UPSCALE (all passed clips → 4K 60fps)
+# ═══════════════════════════════════════════════════════════
+
+step "PHASE 2g: BATCH UPSCALE TO 4K 60fps"
+notify "All clips generated. Batch upscaling to 4K 60fps..." "Upscale"
+stop_all_llms
+ensure_comfyui
+
+UPS_DONE=0
+UPS_SKIP=0
+UPS_FAIL=0
+for SHOT_ID in $SHOT_IDS; do
+    CLIP_DIR="$RUN_DIR/clips/$SHOT_ID"
+    [ -f "$CLIP_DIR/clip.mp4" ] || continue
+
+    # Only upscale clips that passed QA
+    if [ -f "$CLIP_DIR/qa_verdict.json" ]; then
+        UPS_VERDICT=$(python3 -c "import json; print(json.load(open('$CLIP_DIR/qa_verdict.json')).get('verdict',''))" 2>/dev/null)
+        [ "$UPS_VERDICT" != "PASS" ] && continue
+    else
+        continue
+    fi
+
+    # Skip if already up to date
+    if [ -f "$CLIP_DIR/clip_4k60.mp4" ] && [ "$CLIP_DIR/clip_4k60.mp4" -nt "$CLIP_DIR/clip.mp4" ]; then
+        UPS_SKIP=$((UPS_SKIP + 1))
+        continue
+    fi
+
+    log "[$SHOT_ID] Upscaling to 4K 60fps..."
+    UPS_FORCE=""
+    [ -f "$CLIP_DIR/clip_4k60.mp4" ] && UPS_FORCE="--force"
+    if python3 "$PACK_DIR/pipeline/upscale_clip.py" \
+        --shot-dir "$CLIP_DIR" \
+        --comfyui-url "$COMFYUI_URL" \
+        $UPS_FORCE \
+        2>> "$RUN_DIR/pipeline.log"; then
+        log "[$SHOT_ID] 4K60 ready ($(stat -c%s "$CLIP_DIR/clip_4k60.mp4") bytes)"
+        UPS_DONE=$((UPS_DONE + 1))
+    else
+        log "[$SHOT_ID] WARNING GPU upscale failed — CPU ffmpeg fallback"
+        if ffmpeg -y -v error \
+            -i "$CLIP_DIR/clip.mp4" \
+            -vf "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1:me_mode=bidir:me=epzs,format=yuv420p,scale=3840:2160:flags=lanczos" \
+            -c:v libx264 -preset medium -crf 17 -c:a aac \
+            "$CLIP_DIR/clip_4k60.mp4"; then
+            log "[$SHOT_ID] 4K60 ready (CPU fallback)"
+            UPS_DONE=$((UPS_DONE + 1))
+        else
+            log "[$SHOT_ID] WARNING upscale failed, using original"
+            cp "$CLIP_DIR/clip.mp4" "$CLIP_DIR/clip_4k60.mp4"
+            UPS_FAIL=$((UPS_FAIL + 1))
+        fi
+    fi
+done
+log "Batch upscale complete: $UPS_DONE upscaled, $UPS_SKIP already done, $UPS_FAIL failed"
+notify "Batch upscale done: $UPS_DONE new, $UPS_SKIP skipped, $UPS_FAIL failed" "Upscale"
 
 # ═══════════════════════════════════════════════════════════
 # PHASE 3: POST-PRODUCTION [Qwen 3.8 27B]

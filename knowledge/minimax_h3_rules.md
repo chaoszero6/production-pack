@@ -103,6 +103,37 @@ and unnatural movements.
 - Describe motion physically: "arm rises slowly to the right" not "dramatic gesture"
 - Use static or slow camera for fast character motion (and vice versa)
 
+### 2.4 Spatial Geometry Collapse (Room Morphing)
+**Problem:** When a character moves away from camera (especially toward a door/exit),
+H3 loses spatial coherence — the room geometry warps, furniture shifts, walls deform,
+and architectural elements (doors, windows, archways) dissolve or vanish entirely.
+The environment "melts" once the character is no longer anchoring the scene.
+**Triggers:**
+- Character walking away from camera toward a door or exit
+- Character exiting frame entirely (room left without an anchor subject)
+- Wide shots where the character becomes small relative to the environment
+- Transition from medium/close-up to wide as character moves away
+- Clips longer than 8 seconds with significant character displacement
+**Prevention:**
+- CRITICAL: Add explicit environment anchoring to EVERY exit/entrance shot:
+  `"The workshop interior maintains fixed geometry throughout — walls, doorframe,
+  furniture, and all mounted objects remain stationary and unchanged."`
+- Pin specific landmarks: "The grandfather clock stays on the LEFT wall.
+  The arched wooden door remains at CENTER. The workbench stays at RIGHT."
+- Use [START-END] time blocks to describe the room as STATIC while character moves:
+  `[0s-END] STATIC ENVIRONMENT: walls, floor, ceiling, door, furniture, clocks maintain
+  exact position and appearance throughout the entire clip.`
+- For exit shots: keep clip to 6 seconds max — geometry breaks after ~7s
+- Prefer cutting BEFORE the character fully exits — match-cut to next shot
+  showing the empty room from a DIFFERENT angle (resets H3's spatial model)
+- If the door must close: describe it as a single physical action:
+  "Character pulls door shut behind them" rather than showing the room after
+- Add negative: "no room deformation, no morphing walls, no vanishing doors,
+  no shifting furniture, no melting textures"
+**Known Failure Case:** S02_008 — character exits through arched door, room textures
+swim, geometry warps, door dissolves entirely by final frames. Root cause: no
+environment anchoring in prompt, clip too long (11.5s), no spatial landmarks pinned.
+
 ---
 
 ## 3. PROMPT FORMAT — MiniMax H3 Official Structure
@@ -241,6 +272,8 @@ Before any prompt is sent to MiniMax H3:
 - [ ] **No frontal hand extension** toward camera
 - [ ] **Face detail shots** use close-up or medium close-up only
 - [ ] **Wide shots** use back views or rear angles for characters
+- [ ] **Exit/entrance shots** have explicit environment anchoring (pinned landmarks, static geometry constraint)
+- [ ] **Exit clips** are 6 seconds or shorter (geometry collapses after ~7s)
 - [ ] **Audio strategy** decided: native H3 audio or separate overlay
 
 ---

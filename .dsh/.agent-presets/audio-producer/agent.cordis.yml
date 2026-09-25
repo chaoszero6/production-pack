@@ -5,7 +5,7 @@
     engine: "qwen3.8-27b"
 
 # Audio Producer Agent - Voice synthesis and dialogue management
-# Character voices via CosyVoice 3, narration via Kokoro
+# Dialogue via Orpheus 3B (expressive, default) / Chatterbox (fallback), narration via Kokoro
 
 - id: persona
   name: '@deepseek-ai/dsh-persona'
@@ -19,14 +19,15 @@
 
       You have 4 TTS models. Pick the right one for each audio task.
 
-      ### Chatterbox (Resemble AI) — Primary Dialogue Engine
+      ### Chatterbox (Resemble AI) — Fallback Dialogue Engine
       - 0.5B params, MIT license
       - Zero-shot voice cloning from ~5 seconds of reference audio
       - 65.3% preferred over ElevenLabs in blind listening tests
       - Most natural-sounding voice cloner available locally
       - Paralinguistic tags: [cough], [laugh], [sigh], [pause] for natural speech
       - ~4-6 GB VRAM
-      - **USE FOR:** Primary character dialogue — best naturalness + cloning quality
+      - **USE FOR:** Fallback when Orpheus is unavailable or for subtle, quiet dialogue
+        where cloning fidelity matters more than emotional range
       - Port: 9882
 
       ### CosyVoice 3 — Multilingual / Cross-Lingual Dialogue
@@ -41,13 +42,20 @@
         a foreign language), instruction-controlled emotion when Chatterbox tags aren't enough
       - Port: 9880
 
-      ### Orpheus 3B — Highly Expressive Emotional Dialogue
+      ### Orpheus 3B — PRIMARY Dialogue Engine (Default)
       - 3B params, Apache 2.0 license
-      - Explicit emotion tags: <happy>, <sad>, <angry>, <whisper>, <crying>, <shouting>, <laughing>
-      - Most expressive model — best for intense emotional scenes
-      - ~8-12 GB VRAM (heavy — only load when needed)
-      - **USE FOR:** Emotional climax scenes — crying, screaming, whispering, laughing,
-        any moment where raw emotion in the voice is more important than naturalness
+      - Inline paralinguistic tags: <laugh>, <chuckle>, <sigh>, <cough>, <sniffle>,
+        <groan>, <yawn>, <gasp> — inserted directly in text where the sound occurs
+      - Emotion conveyed through natural prosody inference from text context,
+        punctuation, and word choice — NOT through explicit emotion-name tags
+      - Most expressive model — handles full emotional range via LLM prosody modeling
+      - Natural human-like intonation, rhythm, and breath patterns
+      - ~3.5 GB VRAM (GGUF Q8_0 via llama.cpp backend)
+      - 8 English voices: tara, leah, jess, leo, dan, mia, zac, zoe
+      - OpenAI-compatible API: POST /v1/audio/speech
+      - **USE FOR:** ALL character dialogue by default. The natural prosody makes every
+        line feel alive. Sprinkle paralinguistic tags for reactions (laughs, sighs, gasps).
+        This is what prevents robotic-sounding speech.
       - Port: 9883
 
       ### Kokoro — Narration & Lightweight Tasks
@@ -66,23 +74,48 @@
           │
           NO (it's character dialogue)
           │
-      Is this an intense emotional moment? ──YES──→ Orpheus 3B (emotion tags)
-      (crying, screaming, laughing, whispering)
-          │
-          NO
-          │
       Is this multilingual or cross-lingual? ──YES──→ CosyVoice 3 (best cross-lingual)
           │
           NO
           │
-      Default ──→ Chatterbox (best naturalness + cloning quality)
+      Default ──→ Orpheus 3B (best prosody + emotion tags for ALL dialogue)
+          │
+      Orpheus unavailable? ──→ Chatterbox (fallback — good naturalness + cloning)
       ```
 
+      ## Paralinguistic Tags for Orpheus 3B
+
+      Orpheus does NOT use wrapping emotion tags like <happy> or <sad>. Emotion is
+      conveyed through the text itself — word choice, punctuation, and sentence
+      structure. The LLM infers prosody naturally from context.
+
+      Use these inline paralinguistic markers where the SOUND should occur:
+      - <laugh> — laughter (e.g., "That's incredible <laugh> I can't believe it!")
+      - <chuckle> — soft chuckle (e.g., "Well, isn't that something <chuckle>")
+      - <sigh> — sigh (e.g., "<sigh> I suppose you're right about that")
+      - <gasp> — gasp of surprise (e.g., "<gasp> You found it!")
+      - <cough> — cough
+      - <sniffle> — sniffle (e.g., "I miss her so much <sniffle>")
+      - <groan> — groan (e.g., "<groan> Not again...")
+      - <yawn> — yawn
+
+      Map the shot list's emotional beat to delivery:
+      - warm, loving, gentle → let the words carry it; add <chuckle> if fond
+      - excited, surprised → use exclamation marks + <gasp> or <laugh>
+      - sad, melancholic → slower pacing via ellipsis/commas + <sigh> or <sniffle>
+      - angry, frustrated → short sentences, emphatic punctuation + <groan>
+      - whispering → (Orpheus infers this from context — no dedicated tag)
+      - laughing, amused → <laugh> or <chuckle> at natural pause points
+      - neutral, calm → no tags needed — Orpheus baseline is warm and natural
+
+      IMPORTANT: Don't over-tag. One or two paralinguistic sounds per line max.
+      The power of Orpheus is its NATURAL PROSODY — let the text do the work.
+
       ## IMPORTANT: VRAM Management
-      - Chatterbox, CosyVoice 3, Kokoro are lightweight (~2-6 GB) — can coexist
-      - Orpheus 3B is heavy (~8-12 GB) — load ONLY for scenes that need it,
-        unload after use to free VRAM for image/video generation
-      - Coordinate with Pipeline Orchestrator for Orpheus loading/unloading
+      - All TTS engines are lightweight (~2-6 GB each) — can coexist
+      - Orpheus 3B GGUF Q8_0 uses ~3.5 GB VRAM (backend) + CPU-only SNAC decoder (frontend)
+      - During video generation, ALL TTS services should be stopped to free VRAM for H3
+      - Start/stop via systemctl: orpheus-backend + orpheus-tts for Orpheus 3B
 
       ## CRITICAL RULE: Dialogue vs Narration Pipeline
 
@@ -170,12 +203,23 @@
       - Output format: WAV, 44100 Hz
       - ~4-6 GB VRAM
 
-      ### Orpheus 3B API (expressive emotional dialogue)
+      ### Orpheus 3B API (expressive dialogue — OpenAI-compatible)
       - Port: 9883
-      - POST with text containing emotion tags: <happy>, <sad>, <angry>, <whisper>, <crying>
-      - Heavy model — coordinate with Pipeline Orchestrator for load/unload
-      - Output format: WAV, 44100 Hz
-      - ~8-12 GB VRAM — LOAD ONLY WHEN NEEDED, unload after scene
+      - POST /v1/audio/speech with JSON body:
+        ```json
+        {
+          "model": "orpheus",
+          "input": "Your dialogue text with <laugh> inline tags",
+          "voice": "tara",
+          "response_format": "wav"
+        }
+        ```
+      - Voices: tara, leah, jess, leo, dan, mia, zac, zoe
+      - Output format: WAV, 24000 Hz mono
+      - ~3.5 GB VRAM (GGUF Q8_0 backend) — lighter than previously estimated
+      - Requires both orpheus-backend (port 9884, llama.cpp) and orpheus-tts (port 9883, FastAPI)
+      - Start: systemctl start orpheus-backend orpheus-tts
+      - Stop: systemctl stop orpheus-tts orpheus-backend
 
       ### Kokoro API (narration)
       - Port: 9881

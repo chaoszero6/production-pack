@@ -23,26 +23,47 @@ Each agent is a dsh preset in `.dsh/.agent-presets/` with skills in `.dsh/skills
  PER-CLIP LOOP
 ═══════════════════════════════════════════════════════════════
 
-  ┌─ PHASE A: REASONING [load 122B] ──────────────────────────┐
+  ┌─ CROSS-CLIP CONTINUITY FRAME EXTRACTION ───────────────────┐
+  │  Extract reference frames from adjacent clips in scene:    │
+  │  • prev_clip_lastframe.png  (start anchor)                 │
+  │  • scene_establishing_frame.png  (room layout anchor)      │
+  │  • next_clip_firstframe.png  (end anchor, if exists)       │
+  ├────────────────────────────────────────────────────────────┤
+  │ PHASE A: REASONING [load 122B] ────────────────────────────┤
   │  Screenplay Reviewer (builds H3-format prompt)             │
+  │    • Receives continuity frames as <Picture N> refs        │
+  │    • Applies spatial anchoring for exit/entrance shots      │
   │       ↓                                                    │
-  │  Has Dialogue? ──YES──→ Audio Producer generates voice     │
-  │       │                  (Chatterbox/CosyVoice/Orpheus)    │
+  │  Has Dialogue? ──YES──→ Audio Producer (Orpheus 3B default)│
+  │       │                  → generates voice on port 9883    │
   │       │                  → becomes <Audio N> ref + <d> tags│
   │       NO → skip (narration added in post, no lip sync)     │
   ├────────────────────────────────────────────────────────────┤
   │ PHASE B: GENERATION [unload 122B → load 27B + ComfyUI]     │
   │  Image Generator → scene compositing / frames              │
+  │    • Uses continuity frames as visual reference             │
   │       ↓                                                    │
-  │  Video Generator → clip (MiniMax H3)                       │
+  │  Video Generator → clip (MiniMax H3, turbo LoRA)           │
   │       • Dialogue: <Audio> ref + <d> tags = lip sync        │
   │       • Narration: NO <Audio>, NO <d> = no lip movement    │
   ├────────────────────────────────────────────────────────────┤
-  │ PHASE C: QA [27B stays loaded — it's multimodal!]           │
-  │  QA Inspector → analyzes frames via Qwen 3.8 27B vision   │
-  │       → PASS → next clip                                   │
-  │       → FAIL → back to Phase A (reload 122B for rewrite)   │
+  │ PHASE C: QA [11-category inspection, max 5 retries]        │
+  │  QA Inspector → 11 scoring categories:                     │
+  │    1-8: hands, face, identity, duplication, motion,        │
+  │         lip sync, texture, composition                     │
+  │    9:   cross-clip continuity (frame comparison)           │
+  │    10:  voice quality (anti-robotic check)                 │
+  │    11:  film quality (cinematic polish)                    │
+  │       → PASS → send clip to Discord → next clip            │
+  │       → FAIL → send clip to Discord → retry (max 5)        │
+  │       → ESCALATED → send to Discord for manual review      │
   └────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════
+ BATCH UPSCALE  [ComfyUI only, no LLM]
+═══════════════════════════════════════════════════════════════
+
+  All passed clips → 4K 60fps upscale (GPU or CPU fallback)
 
 ═══════════════════════════════════════════════════════════════
  POST-PRODUCTION  [Qwen 3.8 27B loaded, lightweight]
@@ -112,9 +133,11 @@ The pipeline phases naturally — reasoning and generation never run simultaneou
 ### 6. Screenplay Reviewer
 **Preset:** `.dsh/.agent-presets/screenplay-reviewer/`
 - Reviews all prompts before they reach MiniMax H3
-- Applies knowledge base of known H3 artifacts and bugs
+- Applies knowledge base of known H3 artifacts and bugs (`knowledge/minimax_h3_rules.md`)
 - Prevents: character duplication, hand anomalies, face distortion in wide shots,
-  POV hand issues, text rendering problems, audio crosstalk
+  POV hand issues, text rendering problems, spatial geometry collapse
+- Applies spatial anchoring for exit/entrance shots (pins room geometry, limits clip to 6s)
+- Includes continuity frame references as `<Picture N>` in H3 prompts
 - Structures prompts with temporal decomposition [START-END] format
 - Adds negative constraints to prevent common failures
 
@@ -128,10 +151,13 @@ The pipeline phases naturally — reasoning and generation never run simultaneou
 ### 8. Audio Producer
 **Preset:** `.dsh/.agent-presets/audio-producer/`
 - 4 TTS engines, chosen per task:
-  - **Chatterbox** — primary dialogue (best naturalness, zero-shot cloning, MIT)
-  - **CosyVoice 3** — multilingual/cross-lingual dialogue, instruction-based emotion
-  - **Orpheus 3B** — intense emotional scenes (crying, shouting, whispering — load on demand)
-  - **Kokoro** — narration only (lightweight, 54 built-in voices)
+  - **Orpheus 3B** — PRIMARY dialogue engine (best prosody, natural emotion via LLM inference)
+    - Paralinguistic tags: `<laugh>`, `<sigh>`, `<gasp>`, `<chuckle>`, `<sniffle>`, `<groan>`
+    - 8 voices: tara, leah, jess, leo, dan, mia, zac, zoe
+    - ~3.5 GB VRAM (GGUF Q8_0 via llama.cpp), port 9883
+  - **Chatterbox** — fallback dialogue (zero-shot cloning, MIT license), port 9882
+  - **CosyVoice 3** — multilingual/cross-lingual dialogue, port 9880
+  - **Kokoro** — narration only (lightweight, 54 built-in voices), port 9881
 - Dialogue generated BEFORE video (for H3 lip sync via `<Audio>` ref)
 - Narration generated AFTER all clips (overlaid in post, NO lip sync)
 
@@ -151,12 +177,17 @@ The pipeline phases naturally — reasoning and generation never run simultaneou
 
 ### 11. QA Inspector
 **Preset:** `.dsh/.agent-presets/qa-inspector/`
-- Reviews each generated clip using Qwen2.5-VL vision model
-- Checks for: hand anomalies, face distortion, character duplication,
-  motion artifacts, texture instability, identity drift, audio quality
-- Issues PASS/FAIL verdict with detailed feedback
-- On FAIL: provides specific prompt corrections for regeneration
-- Tracks retry count and escalates after max retries
+- Reviews each generated clip using Qwen 3.8 27B vision model
+- 11 scoring categories (all must score >= 0.85, film quality >= 0.80):
+  1. Hands & limbs  2. Face & expression  3. Character identity
+  4. Duplication  5. Motion quality  6. Lip sync  7. Texture & visual
+  8. Composition  9. Cross-clip continuity  10. Voice quality  11. Film quality
+- Cross-clip continuity: extracts last frame of previous clip, compares with first frame
+  Checks props, character direction, 180-degree rule, spatial layout, lighting, costume
+- Voice quality: detects robotic speech (monotone pitch, flat prosody, metallic timbre)
+- No CONDITIONAL PASS — strict binary verdict
+- Max 5 retries before escalation to director review
+- Sends clip video to Discord on every QA pass, fail, or escalation
 
 ### 12. Pipeline Orchestrator
 **Preset:** `.dsh/.agent-presets/pipeline-orchestrator/`
@@ -189,9 +220,9 @@ The pipeline phases naturally — reasoning and generation never run simultaneou
 | ComfyUI         | Image Gen, Video Gen           | 8188  | varies   | Workflow execution engine           |
 | Qwen Image 2.1  | Image Generator                | -     | ~8-10 GB | Via ComfyUI node                    |
 | MiniMax H3      | Video Generator                | -     | ~8-12 GB | Via ComfyUI node                    |
-| Chatterbox      | Audio Producer                 | 9882  | ~4-6 GB  | Primary dialogue (best naturalness) |
+| Orpheus 3B      | Audio Producer                 | 9883  | ~3.5 GB  | PRIMARY dialogue (GGUF Q8, llama.cpp) |
+| Chatterbox      | Audio Producer                 | 9882  | ~4-6 GB  | Fallback dialogue (zero-shot cloning) |
 | CosyVoice 3     | Audio Producer                 | 9880  | ~4-6 GB  | Multilingual / cross-lingual voice  |
-| Orpheus 3B      | Audio Producer                 | 9883  | ~8-12 GB | Emotional dialogue (load on demand) |
 | Kokoro          | Audio Producer                 | 9881  | ~2-3 GB  | Narration only (lightweight)        |
 
 ## Output Structure
