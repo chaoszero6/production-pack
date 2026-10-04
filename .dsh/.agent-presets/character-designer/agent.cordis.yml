@@ -2,7 +2,7 @@
 - id: engine
   name: '@yuki-takuya-kun/dsh-engine-switch'
   config:
-    engine: "qwen3.5-122b-a10b"
+    engine: "deepseek-v4-pro"
 
 # Character Designer Agent - Multi-angle character reference sheets
 # Generates consistent character references via Qwen Image 2.1
@@ -63,6 +63,7 @@
     complete: false
     includeRuntimeContext: true
 
-- insert:
-    - id: tools
-      name: '@deepseek-ai/dsh-tools'
+- id: tools
+  name: '@deepseek-ai/dsh-tools'
+  config:
+    enabled: true

@@ -43,8 +43,25 @@ LLM_PORT=8085
 LLM_URL="http://127.0.0.1:$LLM_PORT"
 COMFYUI_URL="http://127.0.0.1:8188"
 
-# LLM routing: default is cloud (OpenRouter). Local fallback uses NInfer
-# providers `ninfer` (:8080) / `ninfer-us` (:8081) registered in dsh settings.
+# LLM routing: all providers are configurable at startup via environment variables.
+# Default is OpenRouter for all tiers. Override any tier independently:
+#
+#   DSH_REASONING_PROVIDER=openrouter         # reasoning agents (director, story-creator, etc.)
+#   DSH_REASONING_MODEL="deepseek/deepseek-v4-pro"  # model name on that provider
+#   DSH_REASONING_EFFORT=high                 # off|low|medium|high|max|xhigh
+#
+#   DSH_EXECUTION_PROVIDER=openrouter         # execution agents (image-gen, video-gen, audio-producer)
+#   DSH_EXECUTION_MODEL="deepseek/deepseek-v4.1-flash"
+#   DSH_EXECUTION_EFFORT=low
+#
+#   DSH_VISION_PROVIDER=openrouter            # qa-inspector (needs pixel vision)
+#   DSH_VISION_MODEL="google/gemini-3-flash-preview"
+#   DSH_VISION_EFFORT=high
+#
+# Examples:
+#   DSH_REASONING_PROVIDER=tokenharbor DSH_EXECUTION_PROVIDER=tokenharbor ./run.sh story.md
+#   DSH_REASONING_PROVIDER=opencode-go-deepseek-pro ./run.sh --resume
+#   export DSH_*=tokenharbor  # use Token Harbor for everything
 DSH_SETTINGS="/root/.dsh/settings.yaml"
 # Still copy .env for any cloud fallback tools the agents might use
 if [ -f /root/.hermes/.env ]; then
@@ -61,6 +78,22 @@ WAIT_27B=30
 
 DISCORD_CHANNEL="discord:#film-maker"
 NOTIFY="$PACK_DIR/pipeline/notify.sh"
+
+# ── Phase-based Service Management ──────────────────────────
+# Sourced by pipeline runs. Provides:
+#   svc_transition <phase>  — atomic stop-all/start-phase-services
+#   svc_is_healthy <svc>    — health check
+# All older stop/ensure functions below delegate to these.
+source "$PACK_DIR/pipeline/services.sh" 2>/dev/null || true
+
+VRAM_MONITOR="${PACK_DIR}/pipeline/vram_monitor.sh"
+# vram_report / vram_check_now are DEFINED here, not called — without sourcing,
+# every agent call logged "command not found" at run.sh:716/724.
+# The file has an entry-point guard, so sourcing only declares functions/vars.
+if [[ -f "$VRAM_MONITOR" ]]; then
+    # shellcheck source=/dev/null
+    source "$VRAM_MONITOR" 2>/dev/null || true
+fi
 
 # ── Helpers ─────────────────────────────────────────────────
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -81,26 +114,100 @@ wait_for_health() {
     die "$name failed to start within ${timeout}s"
 }
 
-# ── Local LLM management ────────────────────────────────────
-# RETIRED under cloud routing (CLOUD_ROUTING=1): no agent needs a local LLM,
-# so these are no-ops and the 5090 stays free for ComfyUI/H3. The bodies below
-# are kept for `CLOUD_ROUTING=0` rollback.
-ensure_local_llm_running() {
-    if [[ "${CLOUD_ROUTING:-1}" == "1" ]]; then
-        return 0
-    fi
-    systemctl stop "$SVC_122B" 2>/dev/null || true
-    # Check if any local LLM is already healthy (NInfer preferred)
-    for url in "http://127.0.0.1:8080/health" "http://127.0.0.1:8081/health" "http://127.0.0.1:8085/health"; do
-        if curl -sf --max-time 3 "$url" >/dev/null 2>&1; then
+# Non-fatal wait — used by retry loops that must not abort the whole run.
+_wait_url() {
+    local url="$1" timeout="$2" name="$3" i
+    log "Waiting for $name (max ${timeout}s)..."
+    for i in $(seq 1 "$timeout"); do
+        if curl -sf --max-time 5 "$url" > /dev/null 2>&1; then
+            log "$name ready (${i}s)"
+            return 0
+        fi
+        sleep 1
+    done
+    log "$name NOT ready after ${timeout}s"
+    return 1
+}
+
+# ── Local LLM lifecycle for agent turns ─────────────────────
+# Every dsh agent is served by the local NInfer model, so an agent turn must
+# ALWAYS have an LLM up. What it must never do is stop ComfyUI: ComfyUI idles
+# at ~0.6 GB (models unload via POST /free), and killing it mid-turn is what
+# made `wait_for_health ComfyUI` time out and kill a run. Heavy GPU work
+# (ComfyUI renders, TTS synthesis) is serialized outside agent turns by the
+# wrapper scripts in pipeline/, not by stopping the LLM the agent is using.
+LLM_HEALTH_URLS=("http://127.0.0.1:8080/health"
+                 "http://127.0.0.1:8081/health"
+                 "http://127.0.0.1:8085/health")
+
+llm_healthy() {
+    local u
+    for u in "${LLM_HEALTH_URLS[@]}"; do
+        if curl -sf --max-time 3 "$u" > /dev/null 2>&1; then
             return 0
         fi
     done
-    # None healthy — restart ComfyUI to free VRAM, then start preferred service
-    log "Starting local LLM for agent work..."
-    systemctl restart "$SVC_COMFYUI"  # free VRAM cache first
+    return 1
+}
+
+# Drop ComfyUI's loaded models (Qwen Image 2.1 ~10 GB / H3 ~12-14 GB) without
+# touching the server process. Safe to call when ComfyUI is down.
+comfyui_release_models() {
+    curl -sf --max-time 10 -X POST "$COMFYUI_URL/free" \
+        -H 'Content-Type: application/json' \
+        -d '{"unload_models":true,"free_memory":true}' > /dev/null 2>&1 || true
+}
+
+ensure_agent_llm() {
+    if [[ "${CLOUD_ROUTING:-1}" == "1" ]]; then
+        return 0
+    fi
+    if llm_healthy; then
+        return 0
+    fi
+    log "Local LLM not healthy — starting one for this agent turn..."
+    comfyui_release_models
+
+    local attempt
+    for attempt in 1 2; do
+        systemctl start ninfer.service 2>/dev/null || true
+        if _wait_url "http://127.0.0.1:8080/health" 90 "NInfer (:8080)"; then
+            return 0
+        fi
+        log "NInfer not healthy (attempt $attempt/2) — releasing VRAM and retrying..."
+        systemctl stop ninfer.service 2>/dev/null || true
+        comfyui_release_models
+        if [ "$attempt" -eq 2 ]; then
+            # Last resort: park ComfyUI so NInfer can load. ensure_comfyui
+            # will bring it back up on the next phase that needs it.
+            systemctl stop "$SVC_COMFYUI" 2>/dev/null || true
+            sleep 3
+        fi
+        sleep 2
+    done
+    die "No local LLM could be started for agent turn (ninfer :8080 unhealthy)"
+}
+
+# ── Phase-aware service management (wrappers for run.sh compatibility) ──
+# These preserve the original function signatures used throughout run.sh
+# but delegate to the centralized phase-based service manager.
+#
+# Under CLOUD_ROUTING=1 (default): all local-service functions are no-ops
+# because agents use OpenRouter cloud. Only ComfyUI management applies.
+#
+# Under CLOUD_ROUTING=0: full VRAM-aware lifecycle via svc_transition.
+
+ensure_local_llm_running() {
+    # Under CLOUD_ROUTING=0 the agent is served by NInfer, so this must make
+    # the LLM healthy WITHOUT disturbing ComfyUI — the old body called
+    # svc_transition "thinking", which stops ComfyUI right before steps that
+    # need it (image generation, QA frame extraction).
+    ensure_agent_llm
+}
+
+_legacy_start_llm() {
+    systemctl restart "$SVC_COMFYUI" 2>/dev/null || true
     sleep 3
-    # Try ninfer-us first (primary fallback), then ninfer, then q6k
     for svc in ninfer-us.service ninfer.service "$SVC_27B"; do
         systemctl start "$svc" 2>/dev/null || true
         for i in $(seq 1 120); do
@@ -112,7 +219,6 @@ ensure_local_llm_running() {
             done
             sleep 1
         done
-        log "$svc didn't start, trying next..."
         systemctl stop "$svc" 2>/dev/null || true
     done
     die "No local LLM started within timeout"
@@ -122,12 +228,19 @@ stop_all_llms() {
     if [[ "${CLOUD_ROUTING:-1}" == "1" ]]; then
         return 0
     fi
+    if [[ -f "$PACK_DIR/pipeline/services.sh" ]]; then
+        source "$PACK_DIR/pipeline/services.sh"
+        cmd_stop_all 2>/dev/null || true
+    else
+        _legacy_stop_all_llms
+    fi
+}
+
+_legacy_stop_all_llms() {
     systemctl stop "$SVC_122B" 2>/dev/null || true
     systemctl stop "$SVC_27B" 2>/dev/null || true
-    # NInfer services (used in cloud→local fallback)
     systemctl stop ninfer.service 2>/dev/null || true
     systemctl stop ninfer-us.service 2>/dev/null || true
-    # TTS services (Orpheus uses GPU for llama.cpp inference)
     systemctl stop orpheus-tts.service 2>/dev/null || true
     systemctl stop orpheus-backend.service 2>/dev/null || true
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^qwen38'; then
@@ -138,23 +251,43 @@ stop_all_llms() {
 
 swap_to_122b()  { ensure_local_llm_running; }
 swap_to_27b()   { ensure_local_llm_running; }
+
 stop_all_llms_for_generation() {
     if [[ "${CLOUD_ROUTING:-1}" == "1" ]]; then
-        # Nothing to free: no local LLM is loaded. Do NOT restart ComfyUI here.
+        # Nothing to free: no local LLM is loaded. Just ensure ComfyUI is healthy.
+        ensure_comfyui
         return 0
     fi
     log "Stopping LLM to free VRAM for ComfyUI generation..."
-    stop_all_llms
-    systemctl restart "$SVC_COMFYUI"
-    sleep 3
+    if [[ -f "$PACK_DIR/pipeline/services.sh" ]]; then
+        source "$PACK_DIR/pipeline/services.sh"
+        svc_transition "video_gen" 2>/dev/null || true
+    else
+        stop_all_llms
+        systemctl restart "$SVC_COMFYUI"
+        sleep 3
+    fi
 }
 
 ensure_comfyui() {
-    if ! curl -sf "$COMFYUI_URL/api/system_stats" > /dev/null 2>&1; then
-        log "Starting ComfyUI..."
-        systemctl start "$SVC_COMFYUI"
-        wait_for_health "$COMFYUI_URL/api/system_stats" 120 "ComfyUI"
+    local attempt
+    if curl -sf --max-time 5 "$COMFYUI_URL/api/system_stats" > /dev/null 2>&1; then
+        return 0
     fi
+    # ComfyUI idles at ~0.6 GB — it does NOT need the LLM parked to boot, and
+    # stopping the LLM here is exactly what raced the pipeline (idle_monitor
+    # saw a non-active ComfyUI mid-`systemctl start` and reclaimed the GPU).
+    for attempt in 1 2 3; do
+        log "Starting ComfyUI (attempt $attempt/3)..."
+        systemctl start "$SVC_COMFYUI" 2>/dev/null || true
+        if _wait_url "$COMFYUI_URL/api/system_stats" 120 "ComfyUI"; then
+            return 0
+        fi
+        log "ComfyUI did not come up in 120s (attempt $attempt/3) — restarting it"
+        systemctl restart "$SVC_COMFYUI" 2>/dev/null || true
+        sleep 3
+    done
+    die "ComfyUI failed to start within 360s — check: journalctl -u $SVC_COMFYUI -n 50"
 }
 
 stop_hermes() {
@@ -172,23 +305,12 @@ start_hermes() {
 }
 
 # ── Cloud routing (OpenRouter) with automatic local fallback ──
-# Every agent runs on the OpenRouter cloud by default. When cloud tokens are
-# exhausted, set_agent_model.py detects it (402/429), writes a signal file
-# (.use_local_llm), and falls back to local NInfer (ninfer / ninfer-us).
-# In local mode: VRAM management is active (stop LLM during ComfyUI gen).
+# All agents run on local NInfer (ninfer:8080). Cloud routing is disabled.
+# VRAM management is always active (stop LLM during ComfyUI/TTS gen).
 # Per-agent model table lives in pipeline/set_agent_model.py.
-LOCAL_FALLBACK_SIGNAL="$OUTPUT_DIR/.use_local_llm"
-if [ -f "$LOCAL_FALLBACK_SIGNAL" ]; then
-    export CLOUD_ROUTING="0"
-    log "LOCAL FALLBACK ACTIVE — cloud exhausted, using local NInfer (ninfer / ninfer-us)"
-else
-    export CLOUD_ROUTING="${CLOUD_ROUTING:-1}"
-fi
+export CLOUD_ROUTING="0"
 
-# Fallback local layout (only used when CLOUD_ROUTING=0).
-# Prefer ninfer (8080); ninfer-us (8081) is the alternate dsh provider.
-# set_agent_model.py picks whichever local endpoint is healthy when
-# it drives the fallback itself.
+# Local layout — ninfer (8080) is the primary provider.
 LOCAL_MODEL_PROVIDER="ninfer"
 LOCAL_MODEL_ID="qwen3.8-27b"
 LOCAL_MODEL_EFFORT="xhigh"
@@ -205,7 +327,37 @@ set_agent_model() {
     log "Model route: $route"
 }
 
-run_dsh_agent() {
+# Last-resort fallback when an agent emitted no parseable JSON: keep its raw
+# stdout as the artifact. For .json outputs only accept raw stdout that really
+# IS json — a crashed agent's console output ("[ELIFECYCLE] Command failed...")
+# is 47 bytes and would otherwise be frozen in place by skip_if_done() on every
+# later resume (that is exactly how character_manifest.json, location_manifest.json
+# and voice_config.json ended up unparsable).
+# Always returns 0: this runs under `set -e`, and the caller's own
+# `[ ! -s "$output_file" ]` check is what turns a missing artifact into a failure.
+store_raw_artifact() {
+    local preset="$1" raw="$2" out="$3"
+    case "$out" in
+        *.json)
+            if python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$raw" >/dev/null 2>&1; then
+                cp "$raw" "$out" 2>/dev/null || true
+                log "WARNING: $preset raw stdout is valid JSON — kept as $out"
+                return 0
+            fi
+            if [ -s "$out" ] && ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$out" >/dev/null 2>&1; then
+                mv -f "$out" "${out%.json}_bad_$(date +%s).json" 2>/dev/null || true
+            fi
+            log "WARNING: $preset emitted no parseable JSON and raw stdout is not JSON — leaving $out absent so resume retries"
+            return 0
+            ;;
+        *)
+            cp "$raw" "$out" 2>/dev/null || true
+            return 0
+            ;;
+    esac
+}
+
+_run_dsh_agent_internal() {
     local preset="$1" prompt_file="$2" output_file="$3"
     log "Running agent: $preset"
     local prompt_text
@@ -328,7 +480,10 @@ for blob in balanced_objects(raw):
     except Exception:
         pass
 
-req = ['title', 'logline', 'theme', 'characters', 'locations', 'acts', 'scenes']
+req = ['title', 'logline', 'characters', 'locations', 'acts', 'scenes']
+# 'theme' is nice-to-have: if the agent omits it, derive one from the logline
+# so a single omission never kills the run.
+optional = ['theme']
 
 # Prefer a candidate that satisfies the schema; otherwise the richest object,
 # so the error message below can name exactly what the agent omitted.
@@ -349,13 +504,42 @@ if chosen is None:
     sys.exit(1)
 
 missing = [k for k in req if k not in chosen]
+# Last-resort: auto-fill any missing key we can derive, so a single omission
+# degrades gracefully instead of aborting the whole production.
 if missing:
-    print(f"Missing required keys: {missing}", file=sys.stderr)
-    print(f"Agent's top-level keys were: {sorted(chosen.keys())}",
-          file=sys.stderr)
-    if len(candidates) > 1:
-        print(f"({len(candidates)} JSON candidates scanned)", file=sys.stderr)
-    sys.exit(1)
+    scenes = chosen.get('scenes', []) or []
+    if 'title' not in chosen:
+        chosen['title'] = (chosen.get('meta', {}) or {}).get('title') \
+            or (scenes[0].get('title') if scenes and isinstance(scenes[0], dict) else 'Untitled')
+    if 'logline' not in chosen:
+        chosen['logline'] = (chosen.get('meta', {}) or {}).get('logline', '')
+    if 'theme' not in chosen:
+        chosen['theme'] = chosen.get('logline', '')
+    if 'acts' not in chosen:
+        # Derive a single-act wrapper from the scene list
+        chosen['acts'] = [{'act': 1, 'title': 'Main', 'scene_ids':
+                           [s.get('scene_id') for s in scenes if isinstance(s, dict)]}]
+    if 'characters' not in chosen:
+        chosen['characters'] = []
+    if 'locations' not in chosen:
+        chosen['locations'] = []
+    if 'scenes' not in chosen:
+        chosen['scenes'] = []
+    refilled = [k for k in missing if k in chosen]
+    print(f"Auto-filled missing keys: {refilled}", file=sys.stderr)
+    still_missing = [k for k in req if k not in chosen]
+    if still_missing:
+        print(f"Still missing after refill: {still_missing}", file=sys.stderr)
+        sys.exit(1)
+
+# Auto-fill optional keys the agent skipped (e.g. theme) so downstream agents
+# always have them.
+for k in optional:
+    if k not in chosen:
+        if k == 'theme':
+            chosen['theme'] = chosen.get('logline', 'A story of repair and renewal').strip()
+        else:
+            chosen[k] = ""
 
 json.dump(chosen, open(sys.argv[2], 'w'), indent=2)
 print(f"story.json written ({len(json.dumps(chosen))} chars, "
@@ -537,8 +721,7 @@ with open(out_path, "w", encoding="utf-8") as fh:
 print(f"OK: wrapped screenplay prose -> {out_path} ({len(final)} char final_prompt)")
 PYEOF
                 if [ $wrap_rc -ne 0 ]; then
-                    log "WARNING: $preset emitted no parseable JSON and prose wrap failed — keeping raw stdout"
-                    cp "$raw_output" "$output_file"
+                    store_raw_artifact "$preset" "$raw_output" "$output_file"
                 fi
             elif [[ "$preset" == "qa-inspector" ]]; then
                 # Never fall back to prose-as-verdict: that forces json.load FAIL below.
@@ -548,8 +731,7 @@ PYEOF
                     mv -f "$output_file" "${output_file%.json}_bad_$(date +%s).json" 2>/dev/null || true
                 fi
             else
-                log "WARNING: $preset emitted no parseable JSON — keeping raw stdout"
-                cp "$raw_output" "$output_file"
+                store_raw_artifact "$preset" "$raw_output" "$output_file"
             fi
         fi
     fi
@@ -564,6 +746,134 @@ PYEOF
     fi
     log "Agent $preset done -> $output_file"
     return 0
+}
+
+# ── Phase-Aware Agent Runner ─────────────────────────────────
+# Predecessor to run_dsh_agent that handles service phase transitions.
+# Call this instead of run_dsh_agent for all pipeline agents.
+# Under cloud routing (default), it's a thin pass-through.
+# Under local mode, it ensures the correct services are running.
+
+# Preset → phase mapping (mirrors run_dsh_agent.sh but inline here)
+declare -A _AGENT_PHASE=(
+    ["story-creator"]="thinking" ["director"]="thinking" ["screenplay-reviewer"]="thinking"
+    ["character-designer"]="video_gen" ["location-designer"]="video_gen"
+    ["image-generator"]="video_gen" ["storyboard-artist"]="video_gen"
+    ["video-generator"]="video_gen"
+    ["audio-producer"]="audio_gen" ["music-composer"]="audio_gen"
+    ["qa-inspector"]="thinking"
+    ["subtitle-generator"]="monitoring" ["post-production-editor"]="monitoring"
+    ["pipeline-orchestrator"]="monitoring"
+)
+
+_agent_phase_of() {
+    echo "${_AGENT_PHASE[$1]:-thinking}"
+}
+
+_run_dsh_agent_with_phase() {
+    local preset="$1"
+    shift
+    # After shift: "$@" = (prompt_file, output_file) — matches _run_dsh_agent_internal's args
+    local phase
+    phase=$(_agent_phase_of "$preset")
+
+    # Cloud routing: skip all service management
+    if [[ "${CLOUD_ROUTING:-1}" == "1" ]]; then
+        # Ensure ComfyUI is up if this agent uses it
+        case "$phase" in
+            video_gen) ensure_comfyui ;;
+        esac
+        _run_dsh_agent_internal "$preset" "$@"
+        return $?
+    fi
+
+    # Local routing. The agent ITSELF is served by the local LLM, so every
+    # phase must leave an LLM healthy — the old body stopped it first
+    # (svc_transition video_gen / stop_all_llms_for_generation), which is why
+    # character-designer, location-designer, image-generator and
+    # audio-producer all died with "dsh: TRANSPORT: Connection error" and
+    # wrote 47-byte [ELIFECYCLE] artifacts. Generation work that truly needs
+    # exclusive VRAM runs in pipeline/*.sh with the LLM parked, never inside
+    # an agent turn.
+    case "$phase" in
+        video_gen)
+            # Agent needs the LLM to reason and ComfyUI up to call its API.
+            # ComfyUI idles at ~0.6 GB, so both coexist; models are released
+            # with POST /free when the agent is about to render.
+            ensure_agent_llm
+            ensure_comfyui
+            ;;
+        audio_gen)
+            # CPU-only TTS engines are free next to the LLM. Orpheus (~8 GB)
+            # is started by generate_dialogue_audio.py's own VRAM dance —
+            # starting it here would OOM against ninfer's ~28 GB.
+            ensure_agent_llm
+            local _tts _free_mb
+            _free_mb=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | tr -dc '0-9' || echo 0)
+            if [ "${_free_mb:-0}" -ge 5000 ]; then
+                for _tts in chatterbox-tts.service cosyvoice.service kokoro-tts.service; do
+                    systemctl start "$_tts" 2>/dev/null || true
+                done
+                log "audio_gen: TTS engines started (free VRAM ${_free_mb} MiB)"
+            else
+                log "audio_gen: TTS start skipped — only ${_free_mb:-0} MiB free beside the local LLM"
+            fi
+            ;;
+        *)
+            ensure_agent_llm
+            ;;
+    esac
+
+    # Optional VRAM pre-check
+    if [[ -f "$VRAM_MONITOR" ]]; then
+        vram_check_now >> "$RUN_DIR/pipeline.log" 2>&1 || true
+    fi
+
+    _run_dsh_agent_internal "$preset" "$@"
+    local rc=$?
+
+    # Post-agent VRAM report
+    if [[ -f "$VRAM_MONITOR" ]]; then
+        vram_report >> "$RUN_DIR/pipeline.log" 2>&1 || true
+    fi
+
+    return $rc
+}
+
+restart_comfyui_clean() {
+    systemctl restart comfyui.service 2>/dev/null || true
+}
+
+# ── Public Agent Launcher ─────────────────────────────────────
+# This is the function called throughout run.sh by every pipeline step.
+# It delegates to _run_dsh_agent_with_phase for VRAM-safe transitions,
+# which then calls _run_dsh_agent_internal for the actual dsh execution.
+ run_dsh_agent() {
+    local preset="$1"
+    shift
+    # Retry up to 3 times on transient dsh transport errors (the local ninfer
+    # occasionally drops long sessions with "TRANSPORT: Connection error" or
+    # "inference request expired while waiting for admission"). A clean success
+    # returns immediately; only transport/admission failures trigger a retry.
+    local attempt=1
+    while [[ $attempt -le 3 ]]; do
+        _run_dsh_agent_with_phase "$preset" "$@"
+        local rc=$?
+        if [[ $rc -eq 0 ]]; then
+            return 0
+        fi
+        # Detect a transient transport/admission failure from the stderr log
+        local errfile="${RUN_DIR}/${preset}_stderr.log"
+        if grep -qE 'TRANSPORT: Connection error|expired while waiting for admission|PI_AI_ERROR' "$errfile" 2>/dev/null; then
+            log "[$preset] transient transport error (attempt $attempt/3) — backing off and retrying"
+            sleep 5
+            attempt=$((attempt+1))
+            continue
+        fi
+        # Non-transient failure — don't retry
+        return $rc
+    done
+    return $rc
 }
 
 write_prompt() {
@@ -661,11 +971,22 @@ log "GPU:    $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>
 # Helper: skip a step if its output already exists (for resume)
 skip_if_done() {
     local output_file="$1" step_name="$2"
-    if [ "$RESUME" = "true" ] && [ -f "$output_file" ] && [ -s "$output_file" ]; then
-        log "SKIP (resume): $step_name — output exists: $output_file"
-        return 0
-    fi
-    return 1
+    [ "$RESUME" = "true" ] || return 1
+    [ -f "$output_file" ] && [ -s "$output_file" ] || return 1
+    # A crashed agent leaves its raw stdout as the artifact (47-byte
+    # "[ELIFECYCLE] Command failed with exit code 1."). Skipping on -s alone
+    # would carry that forward forever — validate JSON before trusting it.
+    case "$output_file" in
+        *.json)
+            if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+                    "$output_file" > /dev/null 2>&1; then
+                log "RESUME: $step_name — $output_file is not valid JSON, regenerating"
+                return 1
+            fi
+            ;;
+    esac
+    log "SKIP (resume): $step_name — output exists: $output_file"
+    return 0
 }
 
 # Helper: should we process this clip?
@@ -693,17 +1014,56 @@ should_process_clip() {
 step "PHASE 1: PRE-PRODUCTION"
 notify "Phase 1: Pre-production starting (DeepSeek V4 Pro via OpenCode Go)" "Pre-Production"
 
+# ── Agent handoff from the idle-monitor ─────────────────────
+# If a TTS service went stuck and the monitor reclaimed VRAM to NInfer, it left
+# a handoff note. Surface it so this run's agents continue the debugging.
+HANDOFF="$OUTPUT_DIR/agent_handoff.json"
+if [ -s "$HANDOFF" ]; then
+    log "Agent handoff detected — continuing prior debugging:"
+    python3 -c "import json,sys; d=json.load(open('$HANDOFF')); print('  ', d.get('instruction',''))" 2>/dev/null
+    # Append the instruction to the story prompt context so the first agent sees it
+    HANDOFF_NOTE=$(python3 -c "import json; print(json.load(open('$HANDOFF')).get('instruction',''))" 2>/dev/null)
+    if [ -n "$HANDOFF_NOTE" ]; then
+        echo "" >> "$RUN_DIR/input_story.md" 2>/dev/null || true
+        echo "" >> "$RUN_DIR/input_story.md" 2>/dev/null || true
+        echo "[DEBUG HANDOFF FROM IDLE-MONITOR] $HANDOFF_NOTE" >> "$RUN_DIR/input_story.md" 2>/dev/null || true
+        log "Handoff instruction appended to input context."
+    fi
+fi
+
 # 1a. Story Creator
 if ! skip_if_done "$RUN_DIR/story.json" "Story Creator"; then
     step "1a. Story Creator — structuring story"
     write_prompt "$RUN_DIR/prompt_story.txt" \
-        "Read the story below and structure it into the production JSON format (see story-schema skill). Include: characters with full visual descriptions and identity anchors, locations with color palettes, scenes with dialogue and narration separated, emotional beats, visual mood. Output valid JSON.
+        "Read the story below and structure it into the production JSON format (see story-schema skill).
+
+OUTPUT: a single valid JSON object with EXACTLY these top-level keys (all required):
+  title, logline, theme, characters, locations, acts, scenes
+- characters: array of {name, description, identity_anchors}
+- locations: array of {name, description, color_palette}
+- acts: array of act objects
+- scenes: array of {scene_id, title, dialogue[], narration[], emotional_beat, visual_mood}
+Do NOT omit any of the top-level keys above. Do not wrap the JSON in prose or code fences — output raw JSON only.
 
 --- STORY ---
 $(cat "$RUN_DIR/input_story.md")"
-    run_dsh_agent "story-creator" "$RUN_DIR/prompt_story.txt" "$RUN_DIR/story.json" \
-        || die "story-creator failed — no story.json (check $RUN_DIR/pipeline.log)"
-    [ -s "$RUN_DIR/story.json" ] || die "story.json is empty — aborting"
+    # Retry up to 3 times: local ninfer can drop long requests with
+    # "inference request expired while waiting for admission" under load.
+    attempt=1
+    while [[ $attempt -le 3 ]]; do
+        if run_dsh_agent "story-creator" "$RUN_DIR/prompt_story.txt" "$RUN_DIR/story.json"; then
+            [ -s "$RUN_DIR/story.json" ] && break
+            log "story.json empty after attempt $attempt — retrying"
+        else
+            log "story-creator attempt $attempt failed — checking for transient admission timeout"
+        fi
+        if grep -qE 'expired while waiting for admission|PI_AI_ERROR' "$RUN_DIR/story-creator_stderr.log" 2>/dev/null; then
+            log "Transient LLM admission timeout on attempt $attempt — backing off and retrying"
+            sleep 5
+        fi
+        attempt=$((attempt+1))
+    done
+    [ -s "$RUN_DIR/story.json" ] || die "story-creator failed after 3 attempts — no story.json (check $RUN_DIR/pipeline.log)"
 fi
 
 # Post story summary to Discord before continuing
@@ -794,23 +1154,30 @@ PYEOF
 fi
 
 # 1c. Character Designer
+# Reference sheets are GPU work, not agent work: generate_character_sheets.py
+# parks the local LLM itself (with a restart trap), renders every sheet in one
+# blocking pass, then brings the LLM back. Doing this through an agent stopped
+# the very LLM the agent was served by -> "dsh: TRANSPORT: Connection error"
+# -> 47-byte [ELIFECYCLE] character_manifest.json that skip_if_done liked.
 if ! skip_if_done "$RUN_DIR/character_manifest.json" "Character Designer"; then
     step "1c. Character Designer — generating reference sheets"
     ensure_comfyui
-    write_prompt "$RUN_DIR/prompt_characters.txt" \
-        "Read $RUN_DIR/story.json. For each character, generate multi-angle reference sheets using Qwen Image 2.1 via ComfyUI API at $COMFYUI_URL. Model: qwen_image_2.1_bf16.safetensors. Create front, 3/4, side, back views at 2048x2048. Save to $RUN_DIR/characters/{name}/. Output a manifest JSON listing all generated files."
-    run_dsh_agent "character-designer" "$RUN_DIR/prompt_characters.txt" "$RUN_DIR/character_manifest.json" \
-        || die "character-designer failed — no character_manifest.json (check $RUN_DIR/pipeline.log)"
+    bash "$PACK_DIR/pipeline/run_character_sheets.sh" "$RUN_DIR" \
+        >> "$RUN_DIR/pipeline.log" 2>&1 \
+        || die "character sheet generation failed (exit $?) — see $RUN_DIR/pipeline.log"
+    [ -s "$RUN_DIR/character_manifest.json" ] \
+        || die "character sheet generation wrote no character_manifest.json"
     notify "Character reference sheets generated" "Character Designer"
 fi
 
 # 1d. Location Designer
 if ! skip_if_done "$RUN_DIR/location_manifest.json" "Location Designer"; then
     step "1d. Location Designer — generating environments"
-    write_prompt "$RUN_DIR/prompt_locations.txt" \
-        "Read $RUN_DIR/story.json. For each location, generate reference images using Qwen Image 2.1 via ComfyUI at $COMFYUI_URL. Create establishing and medium shots with mood-appropriate lighting. Save to $RUN_DIR/locations/{name}/. Output a manifest JSON."
-    run_dsh_agent "location-designer" "$RUN_DIR/prompt_locations.txt" "$RUN_DIR/location_manifest.json" \
-        || die "location-designer failed — no location_manifest.json (check $RUN_DIR/pipeline.log)"
+    bash "$PACK_DIR/pipeline/run_location_refs.sh" "$RUN_DIR" \
+        >> "$RUN_DIR/pipeline.log" 2>&1 \
+        || die "location reference generation failed (exit $?) — see $RUN_DIR/pipeline.log"
+    [ -s "$RUN_DIR/location_manifest.json" ] \
+        || die "location reference generation wrote no location_manifest.json"
     notify "Location references generated" "Location Designer"
 fi
 
@@ -1011,16 +1378,7 @@ try:
         sys.exit(0)
 except Exception:
     pass
-# 3) raw text (prose reviewed_prompt or prompt files)
-for path in ('$CLIP_DIR/reviewed_prompt.json',):
-    try:
-        raw = open(path, encoding='utf-8', errors='replace').read()
-    except Exception:
-        continue
-    if '<d>' in raw or '<Audio' in raw:
-        print('yes')
-        sys.exit(0)
-# 4) companion H3 prompt under prompts/
+# 3) companion H3 prompt under prompts/
 import os, glob
 for path in glob.glob(os.path.join('$RUN_DIR', 'prompts', shot_id + '*')):
     try:
@@ -1065,6 +1423,24 @@ sys.exit(1 if (d.get('failed') or str(d.get('status','')).lower() in ('failed','
 
         if [ "$NEED_DIALOGUE" = "true" ]; then
             log "[$SHOT_ID] Generating dialogue audio (before video for lip sync)..."
+            # Local mode: use direct Orpheus script (handles VRAM dance internally —
+            # stops NInfer, starts Orpheus, generates audio, stops Orpheus).
+            # Avoids the VRAM conflict where NInfer-US (28GB) + Orpheus (5GB) > 32GB.
+            if [[ "${CLOUD_ROUTING:-1}" == "0" ]]; then
+                log "[$SHOT_ID] Direct Orpheus audio generation (local VRAM dance)..."
+                # Signal the idle-monitor that TTS services are expected up now,
+                # so it reclaims VRAM to NInfer if one goes stuck mid-generation.
+                touch "$OUTPUT_DIR/.audio_phase_active"
+                python3 "$PACK_DIR/pipeline/generate_dialogue_audio.py" \
+                    "$RUN_DIR/shot_list.json" "$SHOT_ID" "$CLIP_DIR" 2>&1 | \
+                    while IFS= read -r line; do log "  $line"; done
+                rm -f "$OUTPUT_DIR/.audio_phase_active"
+                if [ -s "$CLIP_DIR/dialogue.wav" ]; then
+                    log "[$SHOT_ID] Dialogue audio ready"
+                else
+                    log "[$SHOT_ID] WARNING: Direct audio generation failed"
+                fi
+            else
             swap_to_27b
             # Start Orpheus TTS if not running (primary dialogue engine)
             if ! curl -sf http://127.0.0.1:9883/v1/models > /dev/null 2>&1; then
@@ -1146,6 +1522,7 @@ breath patterns, rhythm variation, and emotional coloring matching the scene.
 
 Save to $CLIP_DIR/dialogue.wav and $CLIP_DIR/dialogue_meta.json (include engine_used, voice, character_id)."
             run_dsh_agent "audio-producer" "$CLIP_DIR/prompt_dialogue.txt" "$CLIP_DIR/dialogue_meta.json"
+            fi
         fi
 
         # ── 2c. Image Generation — skip if frame_meta exists or mode needs no frames ──
@@ -1154,8 +1531,12 @@ import json
 try:
     d = json.load(open('$CLIP_DIR/reviewed_prompt.json'))
     mode = (d.get('h3_mode') or d.get('mode') or '').lower()
-    # 'reference' / pure t2v-style modes do not generate a first frame
-    print('no' if mode in ('reference', 'ref', 't2v', 'text_to_video') else 'yes')
+    # generate_video_direct.py only reads frame_meta['first_frame'/'last_frame']
+    # for fl2va/i2va. ref2va builds its inputs from reference_assignments
+    # (location/character refs), so a generated first frame would be dead work
+    # — and the image-generator step is the one that needs ~10 GB of ComfyUI
+    # VRAM beside the local LLM.
+    print('no' if mode in ('reference', 'ref', 't2v', 'text_to_video', 'ref2va') else 'yes')
 except Exception:
     print('yes')
 " 2>/dev/null || echo yes)
@@ -1164,9 +1545,13 @@ except Exception:
         else
             log "[$SHOT_ID] Generating frames..."
             ensure_local_llm_running
+            # Signal the idle-monitor that ComfyUI is expected up for image gen,
+            # so it reclaims VRAM to NInfer + writes a handoff if ComfyUI goes stuck.
+            touch "$OUTPUT_DIR/.gen_phase_active"
             write_prompt "$CLIP_DIR/prompt_image.txt" \
                 "Generate frames for $SHOT_ID. Read $CLIP_DIR/reviewed_prompt.json for mode. If composited_i2v: load location ref, use Qwen Image 2.1 edit to composite characters. If reference: skip frame gen. If fl2va: use prev_clip_lastframe.png as first frame input. CONTINUITY REFERENCES (use as visual guides for spatial layout, lighting, character positions): prev_clip_lastframe.png = end of previous clip (match this for start of current), scene_establishing_frame.png = room layout anchor (doors, windows, furniture positions), next_clip_firstframe.png = start of next clip (match this for end of current, if available). ComfyUI: $COMFYUI_URL. Save to $CLIP_DIR/"
             run_dsh_agent "image-generator" "$CLIP_DIR/prompt_image.txt" "$CLIP_DIR/frame_meta.json"
+            rm -f "$OUTPUT_DIR/.gen_phase_active"
         fi
 
         # ── 2d. Video Generation — skip if clip.mp4 exists and generation completed ──
@@ -1187,13 +1572,16 @@ except Exception:
             # generate_clip.py: route agent → queue H3 → wait → download 
             # (cloud routing: no local LLM to start/stop around generation)
             log "[$SHOT_ID] Video generation (direct ComfyUI, no LLM during generation)..."
+            # Signal the idle-monitor that ComfyUI is expected up for video gen.
+            touch "$OUTPUT_DIR/.gen_phase_active"
+            GEN_EXIT=0
             python3 "$PACK_DIR/pipeline/generate_clip.py" \
                 --shot-dir "$CLIP_DIR" \
                 --run-dir "$RUN_DIR" \
                 --comfyui-url "$COMFYUI_URL" \
                 --shot-id "$SHOT_ID" \
-                2>> "$RUN_DIR/pipeline.log"
-            GEN_EXIT=$?
+                2>> "$RUN_DIR/pipeline.log" || GEN_EXIT=$?
+            rm -f "$OUTPUT_DIR/.gen_phase_active"
 
             if [ $GEN_EXIT -ne 0 ]; then
                 log "[$SHOT_ID] WARNING: generate_clip.py exited $GEN_EXIT"
@@ -1204,8 +1592,26 @@ except Exception:
         # Monitoring: LLM must be up for QA whether we generated or resumed mid-clip
         ensure_local_llm_running
 
+        # BUGFIX: never run QA against a clip that was not actually produced.
+        # If the video step failed to write clip.mp4, running the QA inspector
+        # only produces a bogus "no clip to review" FAIL — which the gate below
+        # would consume as a real clip retry (burnt cycles on an unjudged clip,
+        # exactly the S01_001 race). Treat a missing clip as a GENERATION failure:
+        # re-attempt the video render (bounded by MAX_RETRY), never a QA verdict.
         if [ ! -f "$CLIP_DIR/clip.mp4" ]; then
-            log "[$SHOT_ID] WARNING: clip.mp4 not produced — QA will handle this"
+            log "[$SHOT_ID] WARNING: clip.mp4 not produced after video step — retrying generation, not QA"
+            # Guard against corrupt/stale qa_verdict that could short-circuit
+            rm -f "$CLIP_DIR/qa_verdict.json" "$CLIP_DIR/qa_report.json" 2>/dev/null || true
+            RETRY=$((RETRY + 1))
+            if [ $RETRY -ge $MAX_RETRY ]; then
+                log "[$SHOT_ID] MAX_RETRY reached with no clip produced — escalating, not a QA verdict"
+                notify "Clip $SHOT_ID generated no clip after $RETRY attempts" "ESCALATION"
+                PASSED=false
+                RETRY=$MAX_RETRY
+                break
+            fi
+            log "[$SHOT_ID] Re-attempting video generation (attempt $RETRY/$MAX_RETRY)..."
+            continue  # back to top of the per-clip while loop → re-run video step
         fi
 
         # ── 2e. QA Review ──

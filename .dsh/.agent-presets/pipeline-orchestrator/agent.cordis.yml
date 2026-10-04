@@ -148,6 +148,7 @@
     complete: false
     includeRuntimeContext: true
 
-- insert:
-    - id: tools
-      name: '@deepseek-ai/dsh-tools'
+- id: tools
+  name: '@deepseek-ai/dsh-tools'
+  config:
+    enabled: true

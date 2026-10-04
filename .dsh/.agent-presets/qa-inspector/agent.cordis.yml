@@ -94,6 +94,16 @@
       6. Compare against pass threshold (0.85 from config)
 
       ## Verdict Format
+      Output the JSON object below as a fenced ```json block in your final answer.
+
+      **File outputs (REQUIRED — absolute paths only):**
+      1. Write the full report to `{run_dir}/qa/{shot_id}/qa_report.json`
+         (run_dir = parent of `clips/`, e.g. `.../output/run_YYYYMMDD_HHMMSS`).
+         Also write the same JSON to `{clip_dir}/qa_report.json`.
+      2. Do NOT use relative paths like `output/qa/...` — CWD is the dsh harness
+         sandbox and the pipeline gate will never find the file.
+      3. Include a top-level `"verdict": "PASS" | "FAIL"` field.
+
       ```json
       {
         "shot_id": "S01_003",
@@ -133,6 +143,7 @@
     complete: false
     includeRuntimeContext: true
 
-- insert:
-    - id: tools
-      name: '@deepseek-ai/dsh-tools'
+- id: tools
+  name: '@deepseek-ai/dsh-tools'
+  config:
+    enabled: true

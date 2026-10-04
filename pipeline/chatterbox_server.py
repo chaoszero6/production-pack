@@ -39,7 +39,7 @@ def get_model():
         log.info("Loading Chatterbox model (requires GPU)...")
         import torch
         from chatterbox import ChatterboxTTS
-        model = ChatterboxTTS.from_pretrained(device="cuda")
+        model = ChatterboxTTS.from_pretrained(device=os.environ.get("CHATTERBOX_DEVICE", "cuda"))
         log.info("Chatterbox ready.")
     return model
 

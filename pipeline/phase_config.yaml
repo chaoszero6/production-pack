@@ -1,0 +1,276 @@
+# ════════════════════════════════════════════════════════════════
+# Production Pack — Phase Configuration
+# ════════════════════════════════════════════════════════════════
+#
+# Defines four mutually-exclusive operating phases.
+# The service manager (services.sh) reads this file to decide
+# which systemd/Docker services to start/stop/restart for each phase.
+#
+# Hardware: NVIDIA RTX 5090 32 GB VRAM
+#
+#   PHASE          | Max GPU Load    | Who uses it
+#   ───────────────|─────────────────|────────────────────────────
+#   thinking       | LLM only        | Agent reasoning (text-only)
+#   video-gen      | ComfyUI only    | Image & video model inference
+#   audio-gen      | TTS cluster     | All parallel TTS engines
+#   monitoring     | Minimal         | Health-check probe only
+#
+# ⚠ Only ONE phase may be active at a time. Transitions are atomic:
+#   stop-all → start-phase-services → wait-for-health
+#
+# Cloud routing note: when CLOUD_ROUTING=1 (default), NO local LLM
+# runs during agent calls — all reasoning goes through OpenRouter.
+# In that mode, "thinking" and "monitoring" phases do nothing local,
+# leaving the GPU free for ComfyUI.
+
+# ────────────────────────────────────────────────────────────
+# SERVICES INDEX
+# ────────────────────────────────────────────────────────────
+# Each service is declared once with its metadata, then referenced
+# by phase definitions below.
+#
+# Fields:
+#   name       : unique identifier (also matches systemctl service name prefix)
+#   type       : systemd | docker | none (none = cloud API, no local process)
+#   port       : health-check port (-1 if N/A)
+#   vram_mb    : estimated VRAM consumption in megabytes
+#   critical   : true if stopping this breaks the pipeline entirely
+#   can_parallel : true if multiple instances of this service can coexist
+
+services:
+  # Local LLM providers (mutually exclusive via systemd Conflicts=)
+  ninfer:
+    unit: ninfer.service
+    type: systemd
+    port: 8080
+    vram_mb: 28672        # ~28 GB
+    critical: false
+    can_parallel: false
+    conflicts_with: [ninfer-us]
+
+  ninfer_us:
+    unit: ninfer-us.service
+    type: systemd
+    port: 8081
+    vram_mb: 31744        # ~31 GB
+    critical: false
+    can_parallel: false
+    conflicts_with: [ninfer]
+
+  qwen_local:
+    unit: qwen3.8-27b-q6k-cuda.service
+    type: systemd
+    port: 8085
+    vram_mb: 27648        # ~27 GB (q6k quantization)
+    critical: false
+    can_parallel: false
+    conflicts_with: [ninfer, ninfer-us]
+
+  # Local Qwen 3.6 35B-A3B (execution & vision tier)
+  ninfer_qwen36_35b:
+    unit: ninfer-qwen36-35b.service
+    type: systemd
+    port: 8083
+    vram_mb: 24576        # ~24 GB (Q4_K_M quantization)
+    critical: false
+    can_parallel: false
+    conflicts_with: [ninfer, ninfer-us]
+
+  # Legacy / retired — kept here for documentation, NEVER started
+  llama_122b:
+    unit: llama-qwen35-122b.service
+    type: systemd
+    port: 11434
+    vram_mb: 76800        # ~75 GB (would need multi-GPU anyway)
+    critical: false
+    retired: true          # ★ RETIRED 2026-09-21 — cloud instead
+
+  # Generation engine
+  comfyui:
+    unit: comfyui.service
+    type: systemd
+    port: 8188
+    vram_mb: 0              # varies; models loaded at runtime
+    critical: true
+    sub_models:             # VRAM added when these are active in ComfyUI
+      qwen_image_2_1: 10240  # ~10 GB
+      minimax_h3: 12288     # ~12 GB
+      h3_upscale: 14336     # ~14 GB
+
+  # TTS engines (all can run together within VRAM budget)
+  chatterbox_tts:
+    unit: chatterbox.service
+    type: systemd
+    port: 9882
+    vram_mb: 0              # CPU-based (no GPU VRAM)
+    critical: false
+    cpu_only: true
+
+  cosyvoice_tts:
+    unit: cosyvoice.service
+    type: systemd
+    port: 9880
+    vram_mb: 0              # CPU-based (no GPU VRAM)
+    critical: false
+    cpu_only: true
+
+  orpheus_tts:
+    unit: orpheus-tts.service
+    type: systemd
+    port: 9883
+    vram_mb: 8192           # ~8 GB (llama.cpp GPU inference backend)
+    critical: false
+    requires_backend: true  # must start orpheus-backend.service first
+
+  kokoro_tts:
+    unit: kokoro.service
+    type: systemd
+    port: 9881
+    vram_mb: 0              # CPU-based (lightweight)
+    critical: false
+    cpu_only: true
+
+  # Docker-based legacy
+  qwen_docker:
+    unit: qwen38-27b-q6k
+    type: docker
+    port: 8085
+    vram_mb: 27648
+    critical: false
+
+  hermes_gateway:
+    unit: hermes-stack.service
+    type: systemd
+    port: -1
+    vram_mb: 0
+    critical: false
+
+
+# ────────────────────────────────────────────────────────────
+# PHASE DEFINITIONS
+# ────────────────────────────────────────────────────────────
+# Each phase specifies:
+#   description  : one-line purpose
+#   action       : what the phase does
+#   keep         : services to ensure RUNNING (in addition to ComfyUI's needs)
+#   stop         : services to ensure STOPPED
+#   restart      : services to RESTART (after stopping)
+#   priority     : numeric ordering (lower = higher priority transition)
+#   min_vram_free: minimum VRAM needed after starting services (MB)
+
+phases:
+
+  # ────────────────────────────────────────────────────────────
+  # THINKING — agent reasoning, planning, analysis
+  # Use this when calling dsh agents for text-heavy work.
+  # Under CLOUD_ROUTING=1: no local services needed (agents go
+  # through OpenRouter). Under CLOUD_ROUTING=0: load one LLM.
+  # ────────────────────────────────────────────────────────────
+  thinking:
+    description: "Agent reasoning — text generation via LLM"
+    priority: 10
+    coud_mode_active: true        # active regardless of CLOUD_ROUTING value
+    keep: []                       # cloud mode: nothing local
+    local_mode_keep: [ninfer_or_ninfer_us]   # exactly one LLM
+    stop: []                        # don't stop anything extra under cloud
+    local_mode_stop: [comfyui]     # stop ComfyUI to free VRAM under local mode
+    restart: []
+
+  # ────────────────────────────────────────────────────────────
+  # VIDEO_GEN — image/video generation via ComfyUI + models
+  # Stop ALL LLMs and ALL TTS to dedicate full GPU to ComfyUI.
+  # This is the most VRAM-intensive phase.
+  # ────────────────────────────────────────────────────────────
+  video_gen:
+    description: "ComfyUI generation — images and video"
+    priority: 20
+    keep: [comfyui]               # ComfyUI must be running
+    stop:                         # everything else
+      - ninfer
+      - ninfer_us
+      - qwen_local
+      - qwen_docker
+      - ninfer_qwen36_35b         # ★ New: stop Qwen 3.6 35B-A3B
+      - orpheus_tts
+      - chatterbox_tts
+      - cosyvoice_tts
+      - kokoro_tts
+      - hermes_gateway
+    restart: [comfyui]            # restart ComfyUI after clearing VRAM cache
+
+  # ────────────────────────────────────────────────────────────
+  # AUDIO_GEN — all TTS engines simultaneously
+  # ComfyUI and LLMs must stop so VRAM isn't contested.
+  # Orpheus needs ~8 GB; Chatterbox/CosyVoice/Kokoro are CPU-only.
+  # Combined peak under local mode: 8 GB (Orpheus) + staging overhead.
+  # ────────────────────────────────────────────────────────────
+  audio_gen:
+    description: "TTS synthesis — dialogue/narration audio"
+    priority: 30
+    keep:                           # all TTS engines can run together
+      - chatterbox_tts
+      - cosyvoice_tts
+      - orpheus_tts
+      - kokoro_tts
+    stop:
+      - ninfer
+      - ninfer_us
+      - qwen_local
+      - qwen_docker
+      - ninfer_qwen36_35b           # ★ New: stop Qwen 3.6 35B-A3B
+      - hermes_gateway
+    restart: []                     # don't restart anything mid-audio
+    warn_vram_overlap:              # Orpheus uses ~8 GB VRAM; other TTS are CPU
+      orpheus_tts: 8192             # ~8 GB on GPU via llama.cpp
+
+  # ────────────────────────────────────────────────────────────
+  # MONITORING — lightweight health checks and status queries
+  # Run one LLM as minimal background service for agent fallback.
+  # Prefer ninfer (smaller VRAM footprint) over ninfer-us.
+  # ────────────────────────────────────────────────────────────
+  monitoring:
+    description: "Lightweight health checks and status probes"
+    priority: 40
+    keep: [ninfer_or_ninfer_us]     # exactly one lightweight LLM
+    stop:
+      - qwen_local
+      - qwen_docker
+      - ninfer_qwen36_35b           # ★ New: stop Qwen 3.6 35B-A3B
+      - hermes_gateway
+      - orpheus_tts
+    restart: []
+    preferred_service: ninfer       # choose ninfer unless unavailable
+
+
+# ────────────────────────────────────────────────────────────
+# ALIAS RESOLUTION
+# ────────────────────────────────────────────────────────────
+# These aliases map to specific services. The manager picks the
+# best available member based on health checks.
+aliases:
+  ninfer_or_ninfer_us:
+    candidates: [ninfer, ninfer_us]
+    selection_policy: prefer_first_healthy   # try in order, pick first healthy
+
+  # For video generation, sub-model VRAM is dynamic:
+  # - ref2va (H3): ~12 GB peak
+  # - Qwen Image 2.1: ~10 GB peak  
+  # - upscale: ~14 GB peak
+  # Total ComfyUI VRAM when running H3 ≈ 12–14 GB (including context)
+  # When running both Qwen + H3 in same workflow ≈ 22–24 GB
+
+
+# ────────────────────────────────────────────────────────────
+# HEALTH CHECK ENDPOINTS
+# ────────────────────────────────────────────────────────────
+health_checks:
+  ninfer:         "http://127.0.0.1:8080/health"
+  ninfer_us:      "http://127.0.0.1:8081/health"
+  qwen_local:     "http://127.0.0.1:8085/health"
+  ninfer_qwen36_35b: "http://127.0.0.1:8083/health"   # ★ New: Qwen 3.6 35B-A3B
+  comfyui:        "http://127.0.0.1:8188/api/system_stats"
+  chatterbox_tts: "http://127.0.0.1:9882/health"
+  cosyvoice_tts:  "http://127.0.0.1:9880/health"
+  orpheus_tts:    "http://127.0.0.1:9883/v1/models"
+  kokoro_tts:     "http://127.0.0.1:9881/health"
+  hermes_gateway: "http://127.0.0.1:9888/health"   # placeholder
