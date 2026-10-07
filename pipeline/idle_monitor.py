@@ -38,7 +38,9 @@ import time
 import urllib.request
 
 NINFER_URL = "http://127.0.0.1:8080"
-PACK_DIR = "/root/production_pack"
+PACK_DIR = os.environ.get("PACK_DIR") or os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))
+)
 
 
 def log(msg, log_path):

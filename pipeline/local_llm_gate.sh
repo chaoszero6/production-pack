@@ -11,7 +11,7 @@
 # Source it; it only defines functions.
 set -uo pipefail
 
-LLM_GATE_DIR="${LLM_GATE_DIR:-/root/production_pack/output}"
+LLM_GATE_DIR="${LLM_GATE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/output}"
 LLM_GATE_STATE="${LLM_GATE_DIR}/.llm_gate.last_unit"
 
 LLM_GATE_UNITS=(ninfer.service ninfer-us.service ninfer-qwen36-35b.service qwen3.8-27b-q6k-cuda.service)

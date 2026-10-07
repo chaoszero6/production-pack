@@ -207,7 +207,12 @@ LOCAL_ALTS = (
 )
 
 # State file to track fallback mode across calls
-FALLBACK_STATE = "/root/production_pack/output/.cloud_fallback_state"
+FALLBACK_STATE = os.path.join(
+    os.environ.get("PACK_DIR")
+    or os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "output",
+    ".cloud_fallback_state",
+)
 
 
 def _is_cloud_exhausted():

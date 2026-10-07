@@ -142,7 +142,15 @@ def llm_analyse(samples, log_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=int, default=60)
-    ap.add_argument("--log", default="/root/production_pack/output/vram_watchdog.log")
+    ap.add_argument(
+        "--log",
+        default=os.path.join(
+            os.environ.get("PACK_DIR")
+            or os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "output",
+            "vram_watchdog.log",
+        ),
+    )
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(args.log), exist_ok=True)

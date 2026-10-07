@@ -4,13 +4,13 @@
 # ComfyUI needs ~14 GB (qwen_image_2.1_bf16) + T5-XXL at 2048x1152 while the
 # local LLM holds ~28 GB on the RTX 5090, so the LLM is parked for the pass.
 # pipeline/local_llm_gate.sh stops whichever provider is ACTIVE and restores
-# that same one on exit — the old code hard-coded ninfer-us, which either left
+# that same one on exit â€” the old code hard-coded ninfer-us, which either left
 # ninfer holding 28 GB (render OOM) or restarted the wrong unit and killed the
 # provider set_agent_model.py routes to (ninfer/ninfer-us are systemd
 # Conflicts=), so the pipeline's next agent turn died with
 # "dsh: TRANSPORT: Connection error".
 set -uo pipefail
-PACK=/root/production_pack
+PACK="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="${1:-$PACK/output/run_20260925_095353}"
 
 source "$PACK/pipeline/local_llm_gate.sh"
@@ -24,7 +24,7 @@ restore_llm() {
 trap restore_llm EXIT
 
 if ! curl -sf --max-time 5 http://127.0.0.1:8188/api/system_stats > /dev/null 2>&1; then
-    log "ComfyUI down — starting comfyui.service..."
+    log "ComfyUI down â€” starting comfyui.service..."
     systemctl start comfyui.service 2>/dev/null || true
     for _i in $(seq 1 120); do
         curl -sf --max-time 5 http://127.0.0.1:8188/api/system_stats > /dev/null 2>&1 && break
@@ -40,7 +40,7 @@ for _i in $(seq 1 60); do
     [ "${FREE:-0}" -gt 25000 ] && break
     sleep 2
 done
-log "VRAM free: ${FREE:-?} MiB — starting generation"
+log "VRAM free: ${FREE:-?} MiB â€” starting generation"
 
 python3 "$PACK/pipeline/generate_location_refs.py" --run-dir "$RUN_DIR"
 rc=$?

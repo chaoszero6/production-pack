@@ -3,10 +3,11 @@
 # Detaches the pipeline from the Hermes gateway (setsid) so a gateway restart
 # cannot kill a multi-hour render.
 set -uo pipefail
-cd /root/production_pack
-STORY="/root/desktop/films/the-clockwork-moth/story-v2.md"
-LOG="/root/production_pack/output/run_latest_console.log"
-PIDFILE="/root/production_pack/output/run_latest.pid"
+PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$PACK_DIR" || { echo "pack dir missing: $PACK_DIR"; exit 1; }
+STORY="${STORY_FILE:-/root/desktop/films/the-clockwork-moth/story-v2.md}"
+LOG="$PACK_DIR/output/run_latest_console.log"
+PIDFILE="$PACK_DIR/output/run_latest.pid"
 
 [ -f "$STORY" ] || { echo "story file missing: $STORY"; exit 1; }
 

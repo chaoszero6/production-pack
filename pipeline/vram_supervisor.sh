@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# ────────────────────────────────────────────────────────────────
-# VRAM Supervisor — background monitor agent
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# VRAM Supervisor â€” background monitor agent
 #
 # Watches for VRAM conflicts (two+ VRAM-heavy services overlapping).
 # On conflict:
@@ -17,10 +17,10 @@
 #   --max-interventions N stop intervening after N fixes (default 5; 0 = unlimited)
 #
 # Logs to: output/vram_supervisor.log
-# ────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 set -uo pipefail
 
-PACK_DIR="/root/production_pack"
+PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="$PACK_DIR/output/vram_supervisor.log"
 WATCHDOG_LOG="$PACK_DIR/output/vram_watchdog.log"
 # Conflict-checking LLM: a small fast model (default = local DeepSeek-R1 1.5B on :8099).
@@ -47,18 +47,18 @@ log() {
     echo "[$ts] [supervisor] $*" | tee -a "$LOG"
 }
 
-# Reuse the phase-transition machinery (stop-all → start-needed → verify)
+# Reuse the phase-transition machinery (stop-all â†’ start-needed â†’ verify)
 source "$PACK_DIR/pipeline/services.sh" 2>/dev/null || true
 
 # Which service is the "intruder" when two overlap? The LLM is the baseline we
 # want to keep (agents depend on it); ComfyUI/TTS are the ones that must yield
 # during thinking, and vice-versa. We resolve the target phase from what's up.
 resolve_target_phase() {
-    # If ComfyUI is up → we're mid-generation → the LLM is the intruder → go video_gen
+    # If ComfyUI is up â†’ we're mid-generation â†’ the LLM is the intruder â†’ go video_gen
     if curl -sf --max-time 2 http://127.0.0.1:8188/api/system_stats >/dev/null 2>&1; then
         echo "video_gen"; return
     fi
-    # If any TTS backend is up → audio_gen
+    # If any TTS backend is up â†’ audio_gen
     if curl -sf --max-time 2 http://127.0.0.1:9883/v1/models >/dev/null 2>&1; then
         echo "audio_gen"; return
     fi
@@ -90,7 +90,7 @@ EOF
 
 intervene() {
     local phase; phase=$(resolve_target_phase)
-    log "Conflict detected → resolving to phase '$phase'"
+    log "Conflict detected â†’ resolving to phase '$phase'"
 
     # 1. Stop the offending work atomically (transition clears conflicting svcs)
     if command -v svc_transition >/dev/null 2>&1; then
@@ -126,7 +126,7 @@ print(m.group(0).strip() if m else (content.strip() or "(no JSON found in LLM re
 
     # 3. Verify the LLM is back up (work can resume against it)
     for _w in $(seq 1 60); do
-        curl -sf --max-time 3 "$NINFER_URL/health" >/dev/null 2>&1 && { log "NInfer healthy again — work may resume."; return 0; }
+        curl -sf --max-time 3 "$NINFER_URL/health" >/dev/null 2>&1 && { log "NInfer healthy again â€” work may resume."; return 0; }
         sleep 1
     done
     log "ERROR: NInfer did not recover within 60s."
@@ -146,7 +146,7 @@ main() {
             log "Intervention #$interventions triggered."
             intervene
             if [[ $MAX_INTV -gt 0 && $interventions -ge $MAX_INTV ]]; then
-                log "Reached max interventions ($MAX_INTV) — stopping supervision."
+                log "Reached max interventions ($MAX_INTV) â€” stopping supervision."
                 break
             fi
             [[ "$LOOP" == "true" ]] || break

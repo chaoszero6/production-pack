@@ -19,7 +19,13 @@ import urllib.request
 from datetime import datetime
 
 RUN_DIR = os.environ.get(
-    "RUN_DIR", "/root/production_pack/output/run_20260921_231424"
+    "RUN_DIR",
+    os.path.join(
+        os.environ.get("PACK_DIR")
+        or os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "output",
+        "run_20260921_231424",
+    ),
 )
 WORK = os.path.join(RUN_DIR, "audio", "voices", "_work")
 TTS_URL = os.environ.get("COSYVOICE_URL", "http://127.0.0.1:50000/tts")

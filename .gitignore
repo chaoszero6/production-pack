@@ -2,3 +2,15 @@ output/
 __pycache__/
 *.pyc
 .claude/
+
+# Patent drafts — never ship or commit these (public disclosure risk)
+patent/
+
+# Private ops tooling — exposes server paths and systemd unit names
+hermes/
+
+# Local publish drafts
+REDDIT_POSTS.md
+patreon_collection.txt
+reddit_posts/
+*.zip

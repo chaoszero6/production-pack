@@ -12,8 +12,9 @@
 
 set -euo pipefail
 
-PACK_DIR="/root/production_pack"
-DSH_DIR="/root/desktop/deepseek-harness"
+# Resolve from this script's location (this file lives in pipeline/, pack root is one up).
+PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DSH_DIR="${DSH_DIR:-/root/desktop/deepseek-harness}"
 COMFYUI_DIR="/opt/comfyui"
 OUTPUT_DIR="$PACK_DIR/output"
 LLM_PORT=8085

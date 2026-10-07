@@ -17,8 +17,8 @@
 
 set -uo pipefail
 
-PACK_DIR="/root/production_pack"
-DSH_DIR="/root/desktop/deepseek-harness"
+PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DSH_DIR="${DSH_DIR:-/root/desktop/deepseek-harness}"
 NOTIFY="$PACK_DIR/pipeline/notify.sh"
 COMFYUI_URL="http://127.0.0.1:8188"
 CHECK_INTERVAL=30          # seconds between monitor checks

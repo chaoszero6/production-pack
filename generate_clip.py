@@ -26,8 +26,8 @@ import threading
 import requests
 
 COMFYUI = "http://127.0.0.1:8188"
-PACK_DIR = "/root/production_pack"
-DSH_DIR = "/root/desktop/deepseek-harness"
+PACK_DIR = os.environ.get("PACK_DIR") or os.path.dirname(os.path.abspath(__file__))
+DSH_DIR = os.environ.get("DSH_DIR") or "/root/desktop/deepseek-harness"
 
 def log(msg):
     print(f"[gen-clip {time.strftime('%H:%M:%S')}] {msg}", flush=True)

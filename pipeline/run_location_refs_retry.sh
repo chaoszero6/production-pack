@@ -14,7 +14,7 @@
 # zero location images. This retry runs the same blocking pass to
 # completion: stop ninfer-us, generate all 10 location refs, restart it.
 set -uo pipefail
-PACK=/root/production_pack
+PACK="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="${1:-$PACK/output/run_20260925_095353}"
 NINFER_SVC="ninfer-us.service"
 GRACE=45
@@ -51,7 +51,7 @@ done
 log "VRAM free: ${FREE:-?} MiB"
 
 if ! curl -sf http://127.0.0.1:8188/api/system_stats >/dev/null 2>&1; then
-  log "ComfyUI down — starting comfyui.service..."
+  log "ComfyUI down â€” starting comfyui.service..."
   systemctl start comfyui.service
   for i in $(seq 1 120); do
     curl -sf http://127.0.0.1:8188/api/system_stats >/dev/null 2>&1 && break

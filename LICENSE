@@ -1,28 +1,31 @@
-Copyright (c) 2026 Vinoth Kannah MP. All Rights Reserved.
+MIT License
 
-PROPRIETARY SOFTWARE LICENSE
+Copyright (c) 2026 Vinoth Kannah MP
 
-This software and associated documentation files (the "Software") are the
-exclusive property of Vinoth Kannah MP (the "Owner").
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-1. RESTRICTIONS
-   You may NOT, without prior written permission from the Owner:
-   - Use, copy, modify, merge, publish, distribute, sublicense, or sell
-     copies of the Software.
-   - Use the Software for any commercial or non-commercial purpose.
-   - Create derivative works based on the Software.
-   - Reverse engineer, decompile, or disassemble the Software.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-2. VIEWING ONLY
-   This repository is public for portfolio and demonstration purposes only.
-   Viewing the source code does not grant any license to use it.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
-3. PERMISSION
-   To obtain a license to use this Software, contact the Owner directly.
+---
 
-4. NO WARRANTY
-   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-   OR IMPLIED. IN NO EVENT SHALL THE OWNER BE LIABLE FOR ANY CLAIM, DAMAGES
-   OR OTHER LIABILITY ARISING FROM THE USE OF THE SOFTWARE.
+Attribution request (not a licence condition beyond the notice above):
+if you build on or publish work made with Production Pack, please credit
+"Vinoth Kannah MP — Production Pack (https://github.com/chaoszero6/production-pack)".
 
-For licensing inquiries, contact the Owner.
+Third-party models and weights used by this pipeline (MiniMax H3, Qwen Image 2.1,
+Orpheus 3B, Chatterbox, CosyVoice 3, Kokoro, RIFE, RTX VSR and others) are NOT
+covered by this licence; each is subject to its own licence terms.

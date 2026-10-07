@@ -10,7 +10,7 @@
 # Exit codes: 0 = upscaled, 2 = no source clip, 3 = ComfyUI unreachable, 4 = fell back
 set -uo pipefail
 
-PACK_DIR="/root/production_pack"
+PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMFYUI_URL="http://127.0.0.1:8188"
 SVC_27B="ninfer-us.service"
 SVC_NINFER_TEXTONLY="ninfer.service"

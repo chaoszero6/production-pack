@@ -1,0 +1,13 @@
+# Shell scripts must be LF in every checkout — a CRLF shebang line makes
+# the kernel report "bad interpreter" and the script fails to run at all.
+# global core.autocrlf=true would otherwise convert these on Windows/checkout.
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# Data/asset files must stay byte-exact.
+*.json  -text
+*.yml   -text
+*.yaml  -text
+*.png   -text
+*.pth   -text
+*.safetensors -text

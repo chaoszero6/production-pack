@@ -6,13 +6,14 @@
 # - Exits when the final movie exists.
 set -uo pipefail
 
-cd /root/production_pack
+PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$PACK_DIR" || { echo "pack dir missing: $PACK_DIR"; exit 1; }
 
-RUN_DIR="${RUN_DIR:-/root/production_pack/output/run_20260921_231424}"
-PIDFILE="/root/production_pack/output/run_latest.pid"
-MONITOR_PIDFILE="/root/production_pack/output/run_monitor.pid"
-LOG="/root/production_pack/output/run_latest_console.log"
-MONITOR_LOG="/root/production_pack/output/run_monitor.log"
+RUN_DIR="${RUN_DIR:-$PACK_DIR/output/run_20260921_231424}"
+PIDFILE="$PACK_DIR/output/run_latest.pid"
+MONITOR_PIDFILE="$PACK_DIR/output/run_monitor.pid"
+LOG="$PACK_DIR/output/run_latest_console.log"
+MONITOR_LOG="$PACK_DIR/output/run_monitor.log"
 MOVIE="$RUN_DIR/final/movie_4k60.mp4"
 COMFY="http://127.0.0.1:8188"
 ORPHAN_GRACE_SECS=900   # if orphan agent up + queue busy, wait up to this long per check
