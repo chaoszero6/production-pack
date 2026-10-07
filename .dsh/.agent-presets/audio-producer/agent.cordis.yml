@@ -138,23 +138,38 @@
 
       ## Your Process
 
-      ### 1. Voice Design (pre-production, before any clips)
-      For each character, based on the Director's audio brief:
-      - Design a voice profile (age, tone, accent, energy level)
-      - Decide which TTS engine to use per character (see decision tree above)
-      - Generate a clean 5-second voice reference clip for each character
-        (record or synthesize a sample that captures the character's voice)
-      - For Kokoro narration: select the best matching built-in voice for the narrator
-      - Save voice profiles with engine assignment:
-        `output/audio/voices/{character_name}_ref.wav`
-        `output/audio/voices/{character_name}_voice_config.json`
+      ### 1. Voice CASTING (pre-production, before any clips) — voice-casting skill
+      *The Clockwork Moth* was reviewed as "narrator, child, and old woman all had the
+      same voice … until the man comes in": four of five roles were Orpheus adult-female
+      voices (tara/jess/leah/zoe) within ~3 semitones of each other. The decision tree
+      above picks an ENGINE; it does not cast. Casting rules (all mandatory):
+      - **Voice class first.** Every role incl. the narrator gets a class: child, teen,
+        adult-female, adult-male, elderly-female, elderly-male, creature. No two
+        principal roles share a class unless the story demands it, and then they must
+        be ≥ 4 semitones apart in median pitch AND differ in rate or engine.
+      - **Orpheus has 8 ADULT voices only.** A child = Chatterbox clone from a child
+        reference (or CosyVoice 3 instruction "a cheerful eleven-year-old boy"); an
+        elderly character = CosyVoice 3 instruction / Chatterbox clone from an elderly
+        reference, or Orpheus with tempo 0.92 and pitch −2 st applied in post. Adult
+        voice + "affectation" is not a child and not a grandmother.
+      - **The narrator is a different person from everyone on screen** — a voice class
+        no character uses, or a dedicated Chatterbox narrator reference ≥ 5 semitones
+        from every character. Never an Orpheus voice from the same sex group as a lead.
+        Kokoro only as last resort (measured flat, identical prosody across blocks).
+      - **Voice line-up, measured.** Render the same two test sentences in every cast
+        voice → `output/audio/voices/lineup/<role>.wav`, compute f0_median / rate /
+        dynamics, write the pairwise matrix to `lineup/separation.json` with verdict
+        `CAST_OK` / `CAST_FAIL`. `CAST_FAIL` blocks Phase 2 — recast.
+      - Save the fixed cast to `output/audio/voices/voice_config.json` and never
+        regenerate a reference per line:
         ```json
         {
-          "character": "Maya",
-          "engine": "chatterbox",
-          "reference_audio": "maya_ref.wav",
-          "notes": "warm, youthful, curious tone",
-          "fallback_engine": "cosyvoice3"
+          "narrator": {"voice_class": "adult-male", "engine": "chatterbox",
+                       "reference": "refs/narrator_warm_baritone.wav", "lineup_f0_median_hz": 118},
+          "maya":     {"voice_class": "child", "engine": "chatterbox",
+                       "reference": "refs/child_girl_12.wav", "lineup_f0_median_hz": 275},
+          "grandma":  {"voice_class": "elderly-female", "engine": "cosyvoice3",
+                       "instruction": "an elderly woman in her seventies, warm, slightly breathy, slower"}
         }
         ```
 
@@ -167,7 +182,10 @@
            - **Chatterbox** (default): pass text + reference audio + paralinguistic tags
            - **CosyVoice 3**: pass text + reference audio + emotion instruction
            - **Orpheus 3B**: pass text + emotion tags (load model first if not loaded)
-        c. Time the dialogue to fit within the clip duration (3-15s)
+        c. Time the dialogue to fit within the clip duration (3-15s). The stem starts
+           at `edit.handle_head_s + 0.4 s` of the clip, NOT at 0.4 s — the clip has
+           ≥ 1 s of listening/landing action on each side so the editor can cut on it.
+           Report `stem_offset_s` in the metadata.
         d. For multi-speaker: generate each speaker separately, then combine
         e. Save dialogue audio to `output/audio/{shot_id}/`
         f. Signal Screenplay Reviewer to include `<Audio N>` ref and `<d>` tags
@@ -256,6 +274,12 @@
       - `output/audio/voices/narrator_ref.wav`
     complete: false
     includeRuntimeContext: true
+
+- id: skills
+  name: '@deepseek-ai/dsh-skills'
+  config:
+    skills:
+      - "voice-casting"
 
 - insert:
     - id: tools

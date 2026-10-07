@@ -120,6 +120,28 @@ If the prompt includes a "CROSS-CLIP CONTINUITY CONTEXT" section, use it.
    i. EMOTION ARC: The character's expression should follow the story's emotional
       progression. Don't smile during a tense moment. Don't look calm after alarming
       news. Check the emotional_beat in the shot list.
+
+   j. READABLE PROPS (The Clockwork Moth: "she looks at a clock … then the time is
+      different in the next cut"): any clock face, calendar, count of objects, candle
+      height or window weather must match the `readable_props` ledger for the scene AND
+      the previous clip. A contradiction scores continuity ≤ 0.5 — it is a FAIL, not a nit.
+
+   k. DOES IT CUT (editing-grammar skill): judge the boundary as an edit.
+      Same characters + same shot size (≤ 1 ladder step) + same angle as the previous
+      clip, with no deliberate `edit.relation_to_prev: time-jump` → JUMP CUT → FAIL.
+      Both sides static holds of the same subject → dead boundary. The first ≥ 1 s and
+      last ≥ 1 s of the clip must be in-character handles (`edit.cut_in` / `edit.cut_out`
+      visible); a dialogue stem starting < 0.5 s from frame 0 = no handle → FAIL.
+      Any hard cut INSIDE the clip → FAIL (re-render).
+      Measured part:
+      ```bash
+      python3 pipeline/edit_check.py --clips {prev_clip_dir}/clip.mp4 {clip_path} \
+        --shots {run_dir}/shot_list.json --out {run_dir}/qa/{shot_id}/edit_pair.json
+      ```
+      Put its `cut_score`, `flags` and your verdict under `"edit_pair"` in the report.
+      jump_cut / internal_cut / readable_props → `re_render_recommended: true`;
+      dead_boundary / small light_mismatch → `recommended_action: "ASSEMBLY_FIX_ONLY"`
+      with the trim to apply.
 ```
 
 ### Step 4: Voice quality check (dialogue clips only)
@@ -143,6 +165,12 @@ If the prompt includes a "CROSS-CLIP CONTINUITY CONTEXT" section, use it.
       Compare against the emotional_beat field in the shot list.
    f. PACING: Dialogue pacing must match the character and moment.
       An elderly grandmother speaks differently from an excited child.
+   g. CAST SEPARATION (voice-casting skill — The Clockwork Moth: "narrator, child, and
+      old woman all had the same voice"): compare this line's f0_median and rate with
+      the other roles in `audio/voices/lineup/separation.json`. Nearest other role
+      < 4 semitones away in the same voice class, a child/elderly role in an adult-class
+      voice, or the narrator in a class a character uses → score ≤ 0.6,
+      `corrections: ["RECAST <role>"]`. Within-line prosody passing does NOT clear this.
 
    Use ffmpeg to extract audio analysis:
    ```bash
@@ -242,6 +270,8 @@ The qa_report.json MUST include all 11 category scores:
     "voice_quality": {"score": 0.88, "pass": true, "detail": "Orpheus 3B, natural prosody, emotion matches scene beat"},
     "film_quality": {"score": 0.85, "pass": true, "detail": "..."}
   },
+  "edit_pair": {"previous_shot": "S04_001", "cut_score": 0.86, "flags": [],
+                "readable_props_ok": true, "note": "cut on the head turn, handles 1.1s/1.0s"},
   "issues": [],
   "corrections": []
 }

@@ -106,7 +106,14 @@
       5. Decode with VAE
       6. Save clip
 
-      - Duration: As specified by Director (3-15s, default 6s)
+      - Duration: As specified by Director (3-15s, default 6s). `duration_seconds`
+        already INCLUDES the editorial handles (≥ 1 s head and tail) — never shorten a
+        clip to the voice stem. Render the next valid H3 length (frames = 5 + 17k) and
+        let the editor trim; never trim here.
+      - Dialogue stem anchored at `edit.handle_head_s + 0.4 s` into the clip (pad the
+        stem with leading silence to full clip length), not at 0.4 s.
+      - One continuous shot per clip. If a take contains an internal cut (frame-diff
+        spike, new angle), it is a failed take — do not hand it to QA as a candidate.
       - ComfyUI version: 0.30.0+ required for H3 nodes
 
       ## Error Handling

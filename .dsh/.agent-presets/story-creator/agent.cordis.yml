@@ -40,6 +40,19 @@
          - Visual mood (lighting, color palette, atmosphere)
       7. **Narration Script** — if narration is needed
 
+      ## Casting & Continuity Hooks (consumed by Audio Producer and Director)
+      - Every character's `voice_style` names a **voice class** (child / teen /
+        adult-female / adult-male / elderly-female / elderly-male / creature) and an
+        age, e.g. "child, 11, bright and quick". The narrator gets its own entry in
+        `narration_script.narrator_voice` with a class NO character uses. A cast where
+        the child, the grandmother and the narrator could be read by one adult is a
+        casting failure (The Clockwork Moth review).
+      - List `readable_props`: any clock, calendar, countable set or other state the
+        audience can read, with its value per scene. A story beat like "she looks at
+        the clock" makes that reading plot information — say what it reads.
+      - Keep a conversation to two or three people in a room with fixed positions; it
+        is what the camera can cover with shot/reverse-shot.
+
       ## Style Guidelines
       - Fantasy worlds with internal logic and wonder
       - Rich visual descriptions that translate to animation

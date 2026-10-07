@@ -82,6 +82,35 @@
         "departs", "steps out", "heads toward the door"
         → ANY of these = apply the spatial anchoring pattern automatically
 
+      ### Editorial Rules — the prompt must deliver a clip that CUTS (editing-grammar skill)
+      *The Clockwork Moth* review: "some clips don't cut — jump cut or continuity problem
+      at the cut". The prompt is where the cut is made or lost:
+
+      - **Handles are in the prompt.** The first temporal block covers
+        `edit.handle_head_s` of in-character action BEFORE the beat (listening, mouth
+        closed, finishing the previous movement) and the last block covers
+        `edit.handle_tail_s` AFTER it (holding the look, landing the line). The dialogue
+        stem is anchored at `handle_head + 0.4 s`, never at 0.4 s.
+      - **Boundary states are verbatim.** Copy `edit.cut_in` into the first block and
+        `edit.cut_out` into the last block word for word (pose, gaze, prop state, motion
+        phase). For a cut on action both prompts of the pair describe the SAME movement
+        phase; for a cut on the look, A ends on the eyes moving and B starts with the
+        listener already looking back.
+      - **One continuous shot.** Every prompt ends with "One continuous shot from a
+        single camera for the whole clip, no cuts, no second shot, no scene change." An
+        internal cut by H3 is an automatic FAIL. Never describe a new angle inside a clip.
+      - **Readable props.** If a clock face, calendar, count of objects or any readable
+        state is in frame, write the ledger value from `readable_props` for this scene
+        exactly as the Director wrote it ("hands at ten past seven"). If the shot list
+        has no ledger value, ask the Director — do not improvise a time.
+      - **Speaker rules (OpenCineAgent):** one speaker per clip (a second voice is (S2),
+        never the same id); ≤ 130 characters per line; a character who speaks stops
+        what they are doing and looks toward the listener (if they keep eating, H3
+        prioritises eating over the mouth). No on-screen text, no music cues in the
+        prompt — titles and score are post.
+      - **Identity block verbatim** in every prompt of the film (same anchor sentence,
+        same reference files) — regenerated or paraphrased anchors drift by clip 6.
+
       ### Prompt Structure Rules
 
       1. **Temporal Decomposition** — Use [0-2s], [2-4s], [4-6s] time blocks
@@ -116,6 +145,14 @@
       - [ ] **NARRATION-DIALOGUE OVERLAP CHECK**: if this clip has dialogue,
             verify no narration span includes this clip. Narration and dialogue
             must NEVER play at the same time.
+      - [ ] **HANDLES**: first and last temporal blocks are ≥ 1 s of in-character
+            action around the beat; stem anchored at handle_head + 0.4 s
+      - [ ] **CUT-IN / CUT-OUT** copied verbatim from the shot list; pair with the
+            previous shot's cut_out (same motion phase or answered look)
+      - [ ] **JUMP-CUT CHECK**: this shot differs from the previous shot in the same
+            scene by subject, ≥ 2 shot sizes, or ≥ 30° — otherwise REJECT to Director
+      - [ ] **READABLE PROPS** carry the scene's ledger value verbatim
+      - [ ] **"One continuous shot … no cuts"** sentence present; one speaker per clip
 
       ## Output Format
       For each reviewed prompt, output the prompt in the correct MiniMax H3 format:
@@ -162,6 +199,13 @@
       ```
     complete: false
     includeRuntimeContext: true
+
+- id: skills
+  name: '@deepseek-ai/dsh-skills'
+  config:
+    skills:
+      - "prompt-review"
+      - "editing-grammar"
 
 - insert:
     - id: tools

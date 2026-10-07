@@ -35,8 +35,9 @@ set -euo pipefail
 # prose-instead-of-JSON skew.
 export DSH_PERMISSION_MODE="${DSH_PERMISSION_MODE:-danger-full-access}"
 
-PACK_DIR="/root/production_pack"
-DSH_DIR="/root/desktop/deepseek-harness"
+# Resolve from this script's location so the pack runs from any checkout.
+PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DSH_DIR="${DSH_DIR:-/root/desktop/deepseek-harness}"
 COMFYUI_DIR="/opt/comfyui"
 OUTPUT_DIR="$PACK_DIR/output"
 LLM_PORT=8085
@@ -1107,6 +1108,7 @@ if ! skip_if_done "$RUN_DIR/shot_list.json" "Director"; then
 - Mode: ref2va (default), composited_i2v (new scenes with characters), fl2va (continuity only)
 - Mark which shots have DIALOGUE (needs lip sync) vs NARRATION (no lip sync)
 - Specify camera, characters, hand positions, identity anchors
+- EDITING (editing-grammar skill, mandatory): consecutive shots in a scene differ by subject, >= 2 shot sizes or >= 30 degrees (no jump cuts); never three shots of the same size in a row; every shot has edit.handle_head_s / edit.handle_tail_s >= 1.0 INCLUDED in duration_seconds, edit.cut_in and edit.cut_out (pose, gaze, prop state, motion phase); every dialogue scene has a reaction single and an insert; readable_props (clock faces, counts) pinned per scene; transition_to_next.type = cut unless a story reason
 - Output valid JSON to be processed shot-by-shot."
     run_dsh_agent "director" "$RUN_DIR/prompt_director.txt" "$RUN_DIR/shot_list.json" \
         || die "director failed — no shot_list.json (check $RUN_DIR/pipeline.log)"
@@ -1118,6 +1120,25 @@ if ! skip_if_done "$RUN_DIR/shot_list.json" "Director"; then
     if echo "$TIMING_ISSUES" | grep -q "timing issue"; then
         notify "$TIMING_ISSUES" "Audio Timing Fix"
     fi
+
+    # Validate the shot list as an EDIT — jump cuts, handles, cut points, coverage
+    # (The Clockwork Moth postmortem: 9 same-subject/same-size consecutive pairs shipped)
+    step "1b-edit. Shot List Edit Validation"
+    EDIT_ROUNDS=0
+    while ! EDIT_ISSUES=$(python3 "$PACK_DIR/pipeline/edit_check.py" --shot-list \
+            --shots "$RUN_DIR/shot_list.json" --out "$RUN_DIR/shot_list_edit_report.json" 2>&1); do
+        log "$EDIT_ISSUES"
+        EDIT_ROUNDS=$((EDIT_ROUNDS + 1))
+        if [ "$EDIT_ROUNDS" -gt 2 ]; then
+            notify "Shot list still has blocking edit issues after $EDIT_ROUNDS fixes — continuing, see shot_list_edit_report.json" "Edit Validation"
+            break
+        fi
+        write_prompt "$RUN_DIR/prompt_director_edit_fix.txt" \
+            "Your shot list $RUN_DIR/shot_list.json fails the editing-grammar validation. Read $RUN_DIR/shot_list_edit_report.json and fix EVERY 'jump_cut', 'handles' and 'cut_points' issue (and the rhythm/coverage ones): change shot size by >= 2 steps or angle by >= 30 degrees, insert a reaction single or an insert between same-subject shots, add edit.handle_head_s/handle_tail_s >= 1.0 (included in duration_seconds) and edit.cut_in/cut_out to every shot. Rewrite $RUN_DIR/shot_list.json in place, same schema, valid JSON only."
+        run_dsh_agent "director" "$RUN_DIR/prompt_director_edit_fix.txt" "$RUN_DIR/shot_list.json" \
+            || die "director edit-fix failed (check $RUN_DIR/pipeline.log)"
+    done
+    log "$EDIT_ISSUES"
 fi
 
 # Post shot plan summary to Discord
@@ -1186,7 +1207,7 @@ if ! skip_if_done "$RUN_DIR/audio/voices/voice_config.json" "Voice Design"; then
     step "1e. Audio Producer — voice design"
     swap_to_27b
     write_prompt "$RUN_DIR/prompt_voices.txt" \
-        "Read $RUN_DIR/story.json. For each character, design a voice profile and assign an Orpheus 3B voice (port 9883, voices: tara/leah/jess/leo/dan/mia/zac/zoe). Fallback: Chatterbox (port 9882) for cloning. Select narrator voice from Kokoro (port 9881). Save voice refs to $RUN_DIR/audio/voices/. Output voice config JSON with engine and voice per character."
+        "Read $RUN_DIR/story.json and CAST the voices per the voice-casting skill. Every role incl. the narrator gets a voice class (child/teen/adult-female/adult-male/elderly-female/elderly-male/creature); the narrator uses a class NO character uses. Orpheus (port 9883: tara/leah/jess/leo/dan/mia/zac/zoe) has ADULT voices only — children and elderly roles use Chatterbox cloning (port 9882) from an age-matched reference or CosyVoice 3 (port 9880) instructions; never an adult voice with affectation. Then render the SAME two test sentences in every cast voice to $RUN_DIR/audio/voices/lineup/<role>.wav, measure median pitch / rate / dynamics, and write the pairwise matrix to $RUN_DIR/audio/voices/lineup/separation.json with verdict CAST_OK (every pair >= 4 semitones apart or different class + >= 2 st, rate differs >= 10% or engine differs) or CAST_FAIL — recast until CAST_OK. Save references to $RUN_DIR/audio/voices/ and the fixed cast to $RUN_DIR/audio/voices/voice_config.json (voice_class, engine, voice|reference|instruction, lineup_f0_median_hz per role)."
     run_dsh_agent "audio-producer" "$RUN_DIR/prompt_voices.txt" "$RUN_DIR/audio/voices/voice_config.json"
     notify "Voice profiles created" "Audio Producer"
 fi
@@ -1860,17 +1881,32 @@ if ! skip_if_done "$RUN_DIR/final/sub_meta.json" "Subtitles"; then
     notify "Subtitles generated" "Subtitle Generator"
 fi
 
+# 3d-pre. Boundary check — does every clip-to-clip cut CUT? (editing-grammar skill)
+step "3d-pre. Edit Check (clip boundaries)"
+mkdir -p "$RUN_DIR/final"
+if python3 "$PACK_DIR/pipeline/edit_check.py" --run-dir "$RUN_DIR" \
+        --out "$RUN_DIR/final/edit_report.json" >> "$RUN_DIR/pipeline.log" 2>&1; then
+    log "edit check: every boundary >= 0.80"
+else
+    EDIT_FAILS=$(python3 -c "import json; r=json.load(open('$RUN_DIR/final/edit_report.json')); print(r.get('failed',0), 'of', r.get('boundaries',0))" 2>/dev/null || echo "?")
+    log "edit check: $EDIT_FAILS boundaries below 0.80 — editor must trim/insert (see final/edit_report.json + edit_boundaries.jpg)"
+    notify "Edit check: $EDIT_FAILS boundaries below 0.80 — see final/edit_boundaries.jpg" "Edit Check" "$RUN_DIR/final/edit_boundaries.jpg"
+fi
+
 # 3d. Assembly (always re-run on resume — it's the final step)
 step "3d. Final Assembly"
 write_prompt "$RUN_DIR/prompt_assembly.txt" \
-    "Assemble final movie with ffmpeg:
-- Video: concatenate $RUN_DIR/clips/*/clip_4k60.mp4 in shot order
-- Audio: dialogue is BAKED in clips (lip-synced, do NOT replace)
-- Overlay: narration from $RUN_DIR/audio/narration/ (no lip sync)
-- Layer: music from $RUN_DIR/music/
-- Subtitles: burn ASS from $RUN_DIR/final/*.ass
+    "Assemble the final movie with ffmpeg as the EDITOR (final-assembly + editing-grammar skills):
+- FIRST apply every entry of $RUN_DIR/assembly_fixes.json (blocking checklist)
+- Read $RUN_DIR/final/edit_report.json and look at $RUN_DIR/final/edit_boundaries.jpg: for every boundary choose the cut inside the handles (a_out_s / b_in_s) so it lands on action or on a look; boundaries below 0.80 get a trim, an approved reaction/insert clip between them, or a re-render request — never a dissolve. Record each decision in $RUN_DIR/final/edit_decisions.json
+- Video: trim each $RUN_DIR/clips/<SID>/clip_4k60.mp4 frame-accurately (-frames:v) to the chosen in/out, then concat with the demuxer and -c:v copy in shot order. STRAIGHT CUTS ONLY — no xfade unless transition_to_next.type says dissolve/fade. Write $RUN_DIR/final/concat.txt (it is the cut list for any later full-film pass). Never run RIFE/minterpolate on the assembled film
+- Dialogue: strip the native H3 track; mux the APPROVED stem clips/<SID>/dialogue.wav at the QA-recorded offset, trimmed with the same in/out as the picture
+- Overlay: narration from $RUN_DIR/audio/narration/ (no lip sync, sidechain-ducked under any line)
+- Layer: music + SFX from $RUN_DIR/music/ (music and ambience may cross-fade over cuts; picture never does)
+- Subtitles: burn ASS from $RUN_DIR/final/*.ass; loudnorm two-pass
 - Output: $RUN_DIR/final/movie_4k60.mp4 (H.264, AAC 256k)
-- Also: $RUN_DIR/final/movie_4k60_master.mov (ProRes, PCM)"
+- Also: $RUN_DIR/final/movie_4k60_master.mov (ProRes, PCM)
+- Re-run python3 $PACK_DIR/pipeline/edit_check.py --concat-list $RUN_DIR/final/concat.txt and include its result in $RUN_DIR/final/assembly_log.json"
 run_dsh_agent "post-production-editor" "$RUN_DIR/prompt_assembly.txt" "$RUN_DIR/final/assembly_log.json"
 
 # ═══════════════════════════════════════════════════════════

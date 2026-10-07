@@ -115,11 +115,58 @@
       - ALWAYS verify: dialogue word count fits clip duration (~2.5 words/sec)
       - ALWAYS verify: narration does not overlap with dialogue in any clip
 
+      ## Editorial Planning — the shot list is an EDIT, not a list of pictures
+      Read the `editing-grammar` skill before writing any shot list. *The Clockwork Moth*
+      was reviewed as "some clips don't cut — jump cut or continuity problem at the cut,
+      signs of an inexperienced filmmaker". Every rule below is mandatory:
+
+      1. **No jump cuts.** Two consecutive shots in a scene must differ by subject, OR by
+         ≥ 2 steps of shot size (extreme-wide / wide / medium-wide / medium /
+         medium-close-up / close-up / extreme-close-up), OR by ≥ 30° of camera angle.
+         NEVER two consecutive shots with the same characters, same size and same angle
+         (the Moth had 9 of these, e.g. two identical Nana close-ups in a row).
+         Same person keeps talking? → one longer clip, or cut to the listener's reaction,
+         or an insert, then come back at a different size.
+      2. **Coverage per dialogue scene:** one establishing two-shot, one single per
+         speaker at a different size/angle than the two-shot, at least one REACTION
+         single (listener, lips closed) and one insert/cutaway. Reactions and inserts are
+         the editor's escape hatches — plan them even if the script has no line there.
+      3. **Rhythm:** never three consecutive shots of the same size. Alternate
+         single → reaction → two-shot → insert.
+      4. **Handles:** every shot's `duration_seconds` INCLUDES ≥ 1.0 s of in-character
+         action before the first beat and after the last beat (`edit.handle_head_s`,
+         `edit.handle_tail_s`). A dialogue clip is NOT the length of its voice stem: it is
+         handle + 0.4 s + stem + 0.6 s + handle. The character listens / lands the line
+         during the handles. The editor trims into them to find the cut.
+      5. **Cut points:** write `edit.cut_in` and `edit.cut_out` for every shot — one
+         sentence each: pose, gaze direction, prop state and motion phase at the boundary.
+         Prefer cutting ON ACTION (leave A mid-movement, enter B finishing it) or ON THE
+         LOOK (speaker's eyes move → cut to listener). Never static-pose → static-pose on
+         the same subject. Preserve screen direction and the 180° axis.
+      6. **Readable props ledger:** any prop whose state the audience can read (clock
+         face, calendar, number of cups, candle height, weather in a window) gets a
+         `readable_props` entry with its value per scene. If a character "looks at the
+         clock", the clock's reading is plot information and every later shot of it must
+         match (the Moth showed a different time one cut later). If a value cannot be
+         rendered reliably, frame it unreadable or make the cue audible (a chime).
+      7. **Transitions:** `transition_to_next.type` is `cut` unless the story needs a
+         fade/dissolve for a time skip or dream; mark time skips with
+         `edit.relation_to_prev: "time-jump"`. Dissolves never mask a bad cut.
+      8. **One shot per clip.** Never ask H3 for an internal cut; a new angle is a new
+         shot ID.
+
       ## Output Format
       Output a structured JSON shot list that the pipeline can process sequentially.
       Include all metadata needed by downstream agents (Image Gen, Video Gen, Audio, QA).
     complete: false
     includeRuntimeContext: true
+
+- id: skills
+  name: '@deepseek-ai/dsh-skills'
+  config:
+    skills:
+      - "shot-list-schema"
+      - "editing-grammar"
 
 - id: tools
   name: '@deepseek-ai/dsh-tools'

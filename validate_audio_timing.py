@@ -16,6 +16,16 @@ import math
 
 WORDS_PER_SEC = 2.5  # conversational speech pace
 BUFFER_SEC = 1.0     # safety buffer
+MIN_HANDLE_SEC = 1.0  # editorial handles at head AND tail (editing-grammar skill) - the
+                      # Clockwork Moth sized dialogue clips to the stem and every cut jumped
+
+
+def handles(shot):
+    """(head, tail) handle seconds, defaulting to the minimum when the Director omitted them."""
+    edit = shot.get("edit") or {}
+    head = float(edit.get("handle_head_s") or 0.0)
+    tail = float(edit.get("handle_tail_s") or 0.0)
+    return max(head, MIN_HANDLE_SEC), max(tail, MIN_HANDLE_SEC)
 
 
 def estimate_duration(text):
@@ -49,34 +59,55 @@ def validate(shot_list_path, fix=False):
         sid = shot["shot_id"]
         dur = shot.get("duration_seconds", 6)
         audio = shot.get("audio", {})
+        head, tail = handles(shot)
 
-        # --- Check 1: Dialogue fits in clip ---
+        # --- Check 0: handles recorded on the shot (duration INCLUDES them) ---
+        edit = shot.setdefault("edit", {}) if fix else (shot.get("edit") or {})
+        if (edit.get("handle_head_s") or 0) < MIN_HANDLE_SEC or (edit.get("handle_tail_s") or 0) < MIN_HANDLE_SEC:
+            issues.append(f"{sid}: editorial handles missing/short (need >= {MIN_HANDLE_SEC}s head and tail)")
+            if fix:
+                edit["handle_head_s"] = head
+                edit["handle_tail_s"] = tail
+                fixes_applied += 1
+                issues[-1] += f" -> FIXED: set to {head:.1f}s / {tail:.1f}s"
+
+        # --- Check 1: Dialogue fits in clip INSIDE the handles ---
         for dlg in audio.get("dialogue", []):
             line = dlg.get("line", "")
             words = len(line.split())
             est = estimate_duration(line)
-            max_dur = dur - BUFFER_SEC
+            max_dur = dur - BUFFER_SEC - head - tail
 
             if est > max_dur:
-                msg = (f"{sid}: Dialogue too long — {words} words (~{est:.1f}s) "
-                       f"exceeds clip duration {dur}s (max {max_dur:.1f}s)")
+                msg = (f"{sid}: Dialogue too long - {words} words (~{est:.1f}s) "
+                       f"exceeds clip duration {dur}s minus handles {head:.1f}+{tail:.1f}s "
+                       f"(max {max_dur:.1f}s)")
                 issues.append(msg)
 
                 if fix:
-                    new_dur = math.ceil(est + BUFFER_SEC + 1)
+                    new_dur = math.ceil(est + BUFFER_SEC + head + tail)
                     new_dur = min(new_dur, 15)  # H3 max
                     shot["duration_seconds"] = new_dur
                     dlg["word_count"] = words
                     dlg["estimated_duration"] = round(est, 1)
+                    dlg["start_time"] = round(head + 0.4, 2)
+                    dlg["end_time"] = round(head + 0.4 + est, 2)
                     fixes_applied += 1
-                    issues[-1] += f" → FIXED: clip extended to {new_dur}s"
+                    issues[-1] += f" -> FIXED: clip extended to {new_dur}s (stem at {head + 0.4:.1f}s)"
+                    if new_dur == 15 and est + BUFFER_SEC + head + tail > 15:
+                        issues[-1] += " - STILL too long at 15s: split the line across shots"
+            elif fix and dlg.get("start_time", 0) < head:
+                dlg["start_time"] = round(head + 0.4, 2)
+                dlg["end_time"] = round(head + 0.4 + est, 2)
+                fixes_applied += 1
+                issues.append(f"{sid}: dialogue start moved inside the head handle ({head + 0.4:.1f}s)")
 
         # --- Check 2: Narration doesn't overlap dialogue ---
         has_dialogue = bool(audio.get("dialogue"))
         has_narration = sid in narration_spans
 
         if has_dialogue and has_narration:
-            msg = (f"{sid}: Narration overlaps dialogue — "
+            msg = (f"{sid}: Narration overlaps dialogue - "
                    f"narration span includes this clip but it has dialogue. "
                    f"Narration: \"{narration_spans[sid][:60]}...\"")
             issues.append(msg)
@@ -92,7 +123,7 @@ def validate(shot_list_path, fix=False):
                     audio["narration"] = None
                 del narration_spans[sid]
                 fixes_applied += 1
-                issues[-1] += " → FIXED: removed from narration span"
+                issues[-1] += " -> FIXED: removed from narration span"
 
     # --- Check 3: Narration duration fits span ---
     seen_narrations = set()
@@ -120,7 +151,7 @@ def validate(shot_list_path, fix=False):
             s.get("duration_seconds", 6) for s in shots if s["shot_id"] in span
         )
         if est > span_dur:
-            msg = (f"{shot['shot_id']}: Narration too long for span — "
+            msg = (f"{shot['shot_id']}: Narration too long for span - "
                    f"{len(text.split())} words (~{est:.1f}s) "
                    f"exceeds span duration {span_dur}s ({len(span)} clips)")
             issues.append(msg)

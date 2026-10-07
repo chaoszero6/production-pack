@@ -10,16 +10,36 @@ Used by the Post-Production Editor to assemble all assets into the final movie.
 
 ## Assembly Order
 
-### Phase 1: Video Assembly
-1. Collect all QA-passed clips from `output/clips/` in sequence order
-2. Verify continuity at clip boundaries (last frame of N ≈ first frame of N+1)
-3. Apply transitions as specified by Director (cut / dissolve / match-cut)
-4. Concatenate into a single video track
+### Phase 0: Blocking checklist
+Apply every entry of `<run_dir>/assembly_fixes.json` (QA FAILs downgraded to PASS on the
+promise that assembly fixes them: trims, stem offsets, grades). Nothing ships with an
+unapplied entry.
+
+### Phase 1: Picture edit (editing-grammar skill)
+*The Clockwork Moth* shipped with a jump cut or a blended frame at nearly every boundary.
+The picture edit is therefore a review of BOUNDARIES, not a concatenation:
+1. Collect all QA-passed clips in sequence order — use the per-clip 4K60 masters
+   (`clips/<SID>/clip_4k60.mp4`); RIFE already ran INSIDE each clip.
+2. `python3 pipeline/edit_check.py --run-dir <run_dir>` → `final/edit_report.json` and
+   `final/edit_boundaries.jpg`. Open the sheet and look at every flagged pair.
+3. For every boundary choose the cut inside the handles (`a_out_s`, `b_in_s`): land it on
+   action or on a look; never static → static on the same subject; J-cut dialogue (B's
+   stem leads the picture by 2–6 frames) when A's tail is a hold. Record each decision in
+   `final/edit_decisions.json`.
+4. A boundary still < 0.80: insert an approved reaction/insert clip, or request B at a new
+   size/angle. Do not ship it; do not dissolve over it.
+5. Trim each master frame-accurately and trim its dialogue stem with the same in/out.
+6. Concatenate with the concat demuxer, `-c:v copy`. Straight cuts only; `xfade` only
+   where `transition_to_next.type` is a dissolve/fade. Write `final/concat.txt` — it is
+   the cut list every later full-film pass (`upscale_film.py --concat-list`) must use.
+7. Re-run `edit_check.py --concat-list final/concat.txt` on the trimmed segments.
 
 ### Phase 2: Audio Layering
 Layer in this order (highest priority first):
-1. **Dialogue track** — from `output/audio/{shot_id}/` (CosyVoice 3)
-2. **Narration track** — from `output/audio/{shot_id}/` (Kokoro)
+1. **Dialogue stems** — `clips/{shot_id}/dialogue.wav` (approved TTS stem, trimmed with the
+   picture, placed at the QA-recorded offset). The clip's native H3 track is stripped —
+   it is H3's own take, not the stem.
+2. **Narration track** — from `audio/narration/` (post only, ducked under any line)
 3. **SFX track** — from `output/music/{scene_id}/`
 4. **Music score** — from `output/music/{scene_id}/`
 5. **Ambient track** — from `output/music/{scene_id}/`
@@ -64,13 +84,34 @@ ffmpeg -i assembled.mp4 \
 
 ## FFmpeg Commands Reference
 
-### Concatenate clips:
+### Frame-exact trim of one clip and its stem (same in/out — lips stay in sync):
 ```bash
-# Create concat list
-for f in output/clips/*/S*_clip.mp4; do echo "file '$f'" >> concat_list.txt; done
+# a_in / frames come from final/edit_decisions.json; fps is the master's fps (60)
+ffmpeg -y -ss "$A_IN" -i clips/S01_005/clip_4k60.mp4 -frames:v "$N" -an \
+  -c:v libx264 -crf 16 -preset slow -pix_fmt yuv420p final/segments/S01_005.mp4
+ffmpeg -y -i clips/S01_005/dialogue.wav \
+  -af "atrim=start=$(python3 -c "print(max(0,$A_IN-$STEM_OFFSET))"):duration=$(python3 -c "print($N/60)"),asetpts=N/SR/TB" \
+  final/segments/S01_005_dialogue.wav
+```
 
-# Concatenate
-ffmpeg -f concat -safe 0 -i concat_list.txt -c copy assembled_video.mp4
+### Concatenate clips (straight cuts, no re-encode):
+```bash
+# Create concat list in play order — this file is ALSO the cut list for any later
+# full-film interpolation pass (upscale_film.py --concat-list final/concat.txt)
+: > final/concat.txt
+for sid in $(python3 -c "import json;print(' '.join(s['shot_id'] for s in json.load(open('shot_list.json'))['shots']))"); do
+  echo "file 'segments/$sid.mp4'" >> final/concat.txt
+done
+ffmpeg -f concat -safe 0 -i final/concat.txt -c copy assembled_video.mp4
+```
+
+### NEVER interpolate the assembled film without the cut list:
+```bash
+# wrong — blends the last frame of every shot into the first frame of the next
+python3 pipeline/upscale_film.py --source final/movie.mp4 --out final/movie_4k60.mp4 --no-cuts
+# right — interpolation stops at every cut
+python3 pipeline/upscale_film.py --source final/movie.mp4 --out final/movie_4k60.mp4 \
+  --concat-list final/concat.txt
 ```
 
 ### Mix audio tracks:

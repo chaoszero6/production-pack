@@ -85,6 +85,37 @@
       - Multi-speaker timbre crosstalk
       - Dialogue-to-lip sync timing mismatch
 
+      ### 10. Does it CUT? — adjacent-pair check (editing-grammar skill, CRITICAL)
+      A clip can be flawless on its own and still wreck the film at the cut.
+      *The Clockwork Moth* passed every per-clip gate and was reviewed as "some clips
+      don't cut — jump cut or continuity problem at the cut". Check the PAIR
+      (previous approved clip in the scene | this clip):
+      - **Jump cut:** same characters + same shot size (≤ 1 ladder step) + same angle →
+        FAIL unless `edit.relation_to_prev` is a deliberate time-jump.
+      - **Dead boundary:** last 0.5 s of A and first 0.5 s of B are both static holds
+        of the same subject → FAIL (a cut needs motion or a look on one side).
+      - **Cut-in / cut-out honoured:** the clip's first frames show `edit.cut_in`
+        (pose, gaze, prop state, motion phase) and its last frames show `edit.cut_out`;
+        the handles (≥ 1 s each side) are in-character, not frozen. A dialogue stem
+        that starts within 0.5 s of frame 0 = no handle → FAIL.
+      - **Internal cut:** any hard cut / new angle inside the clip → FAIL (re-render).
+      - **Readable props:** compare clock faces, counts, calendars against
+        `readable_props` ledger AND the previous clip. A clock that reads a different
+        time one cut later is a continuity FAIL, not a nit.
+      - **Screen direction / eyeline / 180° axis** as in the continuity category.
+      Run `python3 pipeline/edit_check.py --clips <prev clip.mp4> <this clip.mp4>
+      --shots {run_dir}/shot_list.json --out {run_dir}/qa/{shot_id}/edit_pair.json`
+      for the measured part (frame similarity, static holds, luma/warmth jump,
+      internal cuts) and report its `cut_score` under `"edit_pair"` in qa_report.json.
+
+      ### 11. Voice cast separation (dialogue clips — voice-casting skill)
+      Besides within-line prosody, compare this line's median pitch and rate with the
+      other roles' line-up values in `audio/voices/lineup/separation.json`. Nearest
+      other role < 4 semitones away in the same voice class, or a child/elderly role
+      spoken by an adult-class voice → `voice_quality` ≤ 0.6 and
+      `corrections: ["RECAST <role>"]`. Narration must be a different voice class from
+      every character.
+
       ## Inspection Process
       1. Receive clip from Video Generator
       2. Extract frames at 2 FPS for analysis
@@ -127,11 +158,22 @@
             "suggested_fix": "Add 'smooth arm movement' to temporal block [2-4s]"
           }
         ],
+        "edit_pair": {
+          "previous_shot": "S01_002",
+          "cut_score": 0.86,
+          "flags": [],
+          "readable_props_ok": true,
+          "note": "cut on Maya's head turn; handles present (1.1 s / 1.0 s)"
+        },
         "retry_count": 0,
         "max_retries": 3,
         "prompt_corrections": ["specific corrections for Screenplay Reviewer if FAIL"]
       }
       ```
+      `edit_pair.cut_score` < 0.80 with a `jump_cut`, `internal_cut` or
+      `readable_props` flag is a FAIL with `re_render_recommended: true`; a
+      `dead_boundary` or small `light_mismatch` is assembly-fixable (trim/grade) —
+      say so with `recommended_action: "ASSEMBLY_FIX_ONLY"` and list the trim.
 
       ## FAIL → Retry Flow
       On FAIL:
@@ -142,6 +184,15 @@
       5. On revised prompt: trigger regeneration through Pipeline Orchestrator
     complete: false
     includeRuntimeContext: true
+
+- id: skills
+  name: '@deepseek-ai/dsh-skills'
+  config:
+    skills:
+      - "qa-inspection"
+      - "continuity-check"
+      - "editing-grammar"
+      - "voice-casting"
 
 - id: tools
   name: '@deepseek-ai/dsh-tools'

@@ -39,14 +39,26 @@
       - Focus on staging and blocking, not final art quality
       - Include character reference images so identities are recognizable
 
-      ### 3. Sequence Review
-      After generating all panels for a scene:
+      ### 3. Sequence Review — "does it cut?" (editing-grammar skill)
+      After generating all panels for a scene, review every PAIR of consecutive panels
+      as an edit, not as two pictures. This is the cheapest place to catch the jump cuts
+      that made *The Clockwork Moth* feel amateur:
       - Arrange them in sequence
-      - Verify visual continuity between consecutive shots
-      - Check that camera angles create visual variety
-      - Confirm the 180-degree rule is maintained in dialogue scenes
-      - Verify eyeline matches across cuts
+      - For each boundary A|B check: different subject, OR shot size differs by ≥ 2
+        steps, OR angle differs by ≥ 30°. Same subject + same size + same angle = JUMP
+        CUT → send back to the Director (reaction single, insert, or re-size B).
+      - No three consecutive panels of the same shot size
+      - The `edit.cut_out` of A and `edit.cut_in` of B describe the same motion phase
+        (cut on action) or a look that B answers (cut on the look); never two static
+        poses of the same character
+      - Screen direction and the 180-degree axis are maintained in dialogue scenes
+      - Eyeline matches across cuts (speaker looks screen-right, listener screen-left)
+      - Readable props (clock faces, counts) carry the ledger value for this scene
+      - Every dialogue scene has a reaction single and an insert available as cutaways
       - Flag any shots that may cause MiniMax H3 issues (see knowledge base)
+      Write the boundary verdicts to `{scene_id}_notes.json` under `"cut_review"`:
+      `[{"boundary": "S01_05|S01_06", "ok": false, "issue": "jump cut", "fix": "..."}]`.
+      A scene with any `ok: false` boundary goes back to the Director before generation.
 
       ### 4. Annotations
       Each panel includes:

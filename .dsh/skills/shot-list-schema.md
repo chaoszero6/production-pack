@@ -89,6 +89,21 @@ consumes this schema.
         "description": "cut on Maya's upward gaze"
       },
 
+      "edit": {
+        "relation_to_prev": "continuous | reaction | insert | reverse | time-jump | scene-change",
+        "handle_head_s": 1.0,
+        "handle_tail_s": 1.0,
+        "cut_in": "Maya already walking, mid-stride on her left foot, eyes up toward the canopy, satchel strap in right hand",
+        "cut_out": "she stops and her head begins to turn screen-left toward the sound; mouth closed",
+        "cut_type": "on-action | on-look | static | match",
+        "size_steps_from_prev": 2,
+        "angle_change_deg_from_prev": 45
+      },
+
+      "readable_props": {
+        "workshop_clock": "hands at ten past seven"
+      },
+
       "emotional_beat": "wonder — audience should feel the magic of the forest through Maya's eyes",
 
       "production_notes": {
@@ -143,3 +158,31 @@ Pattern: narration over visual-only clips → pause → dialogue clip → pause 
 ### audio.use_native_h3_audio
 Almost always `false`. Native H3 audio quality is unreliable.
 Only set `true` for ambient-only clips with no dialogue.
+
+### edit — REQUIRED on every shot (editing-grammar skill)
+- `handle_head_s` / `handle_tail_s` ≥ 1.0. `duration_seconds` INCLUDES them. A dialogue
+  clip is `handle_head + 0.4 + stem + 0.6 + handle_tail`, rounded up to a valid H3 length;
+  the stem is anchored at `handle_head + 0.4`. The handles are in-character action
+  (listening, landing the line, continuing a motion) that the editor trims into.
+- `cut_in` / `cut_out`: one sentence each — pose, gaze direction, prop state, motion phase at
+  the boundary. The Screenplay Reviewer copies them verbatim into the first/last temporal
+  block. Consecutive shots describe the SAME motion phase (cut on action) or a look that the
+  next shot answers (cut on the look). Never two static poses of the same subject.
+- `size_steps_from_prev` and `angle_change_deg_from_prev` are computed from the previous shot
+  in the scene. Validation: `relation_to_prev` not in (time-jump, scene-change) AND same
+  character set AND `size_steps_from_prev` ≤ 1 AND `angle_change_deg_from_prev` < 30 →
+  **INVALID shot list (jump cut)** — the Director must change size/angle, insert a reaction
+  or merge the two shots.
+- `relation_to_prev: "reaction"` / `"insert"` shots are the cutaways the editor needs; every
+  dialogue scene must contain at least one of each.
+
+### readable_props — the ledger
+Any clock face, calendar, countable set, candle height or window weather visible in the
+shot carries the scene value from the story's `readable_props`. The same phrase is written
+into every keyframe and H3 prompt where the prop is visible, and QA compares it against the
+previous clip. No value in the ledger → the prop must be framed unreadable.
+
+### transition_to_next.type
+`cut` by default. Anything else needs a story reason (time skip, dream) and is paired with
+`edit.relation_to_prev: "time-jump"` on the next shot. Dissolves are never used to hide a
+weak cut.

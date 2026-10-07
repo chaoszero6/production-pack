@@ -267,6 +267,27 @@ the agent builds a correct 4K master and then cannot copy it into the run dir �
 the script's fallback silently ships a LOW-RES master. The script now also salvages the master from
 `$DSH_DIR/.work/<SHOT_ID>/` if that happens.
 
+## Editorial Rules — *The Clockwork Moth* postmortem (2026-10-07)
+
+The first public cut was reviewed as the work of "an inexperienced filmmaker": same voice for
+narrator, child and grandmother; a clock that changed time across a cut; a small dissolve on every
+cut; shots that "don't cut" (jump cuts). All 102 clips had passed per-clip QA — the defects were
+**between** clips and **between** voices, which nothing measured. Fixes live in
+`.dsh/skills/editing-grammar.md`, `.dsh/skills/voice-casting.md`, `knowledge/minimax_h3_rules.md §7`
+and two tools; the rules that must never regress:
+
+| Complaint | Root cause | Rule / tool |
+|-----------|-----------|-------------|
+| Dissolve on every cut | `upscale_film.py` ran RIFE over the ASSEMBLED film, blending shot A's last frame into shot B's first | Interpolate per clip only. `upscale_film.py` now **refuses to run without a cut list** (`--concat-list final/concat.txt`); it holds each shot's last frame and decimates with a global parity so there is no drift |
+| Jump cuts | Shot list had 9 consecutive pairs with same character + same size + same angle; dialogue clips were sized to the stem (0.4 s / 0.6 s) so there were no handles to cut into | Director: consecutive shots differ by subject, ≥ 2 shot sizes or ≥ 30°; every clip carries ≥ 1 s handles with `edit.cut_in` / `edit.cut_out`; reaction + insert per dialogue scene. `pipeline/edit_check.py` scores every boundary (threshold 0.80) before assembly and inside QA (`edit_pair`) |
+| Clock time changes across the cut | No ledger for readable props | `readable_props` per scene in the story/shot list, phrase copied verbatim into every prompt, QA continuity category 9j fails on contradiction |
+| Same voice for everyone | Narrator, boy, grandmother and moth were all Orpheus adult-female voices (`tara/jess/leah/zoe`) within ~3 semitones | Cast by **voice class**; narrator in a class no character uses; measured line-up with ≥ 4 semitone separation (`audio/voices/lineup/separation.json`, `CAST_FAIL` blocks Phase 2); child/elderly via Chatterbox clone or CosyVoice 3 instruction, never adult + affectation |
+
+Pipeline hooks: `run.sh` 1b validates the shot list for jump cuts and handles
+(`edit_check.py --shot-list`), 1e builds the voice line-up, 3d runs `edit_check.py --run-dir` and
+hands `final/edit_report.json` to the Post-Production Editor, who records every boundary decision in
+`final/edit_decisions.json` and cuts straight (no `xfade` unless the Director scripted it).
+
 ## Service Dependencies
 
 > **Model routing is per-run and currently ALL CLOUD via OpenRouter** (`run.sh`'s `set_agent_model`

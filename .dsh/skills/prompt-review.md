@@ -81,12 +81,31 @@ non_diegetic_music:
 [3s-6s] ...
 ```
 
+### Step 4b: Write the handles and the boundary states (editing-grammar skill)
+The first and last temporal blocks are the editor's material — without them the clip
+can only be butt-joined at frame 0 and its last frame, which is why the Moth cuts jumped.
+```
+[0s-1.0s]   {edit.cut_in verbatim — the character already in the state the previous shot
+             left them in; listening, mouth closed, or mid-movement}
+[1.0s-1.4s] {beat prepares; for dialogue the stem starts at 1.4 s}
+[1.4s-5.6s] {action / (S1) says <d>…</d>}
+[5.6s-6.2s] {line lands}
+[6.2s-7.2s] {edit.cut_out verbatim — holds the look / begins the turn that the next shot
+             finishes; mouth closed}
+```
+Then: readable props carry the ledger phrase; "One continuous shot from a single camera
+for the whole clip, no cuts, no second shot, no scene change." closes the prompt.
+
 ### Step 5: Run the pre-generation checklist
-Go through every item in `knowledge/minimax_h3_rules.md` Section 5.
+Go through every item in `knowledge/minimax_h3_rules.md` Section 5 and Section 7.
 **ADDITIONAL CHECK:** Verify dialogue/narration handling is correct:
 - [ ] Dialogue clips have `<Audio>` ref + `<d>` tags (lip sync intended)
 - [ ] Narration clips have NO `<Audio>` ref, NO `<d>` tags (no lip sync)
 - [ ] Characters visible during narration are described doing silent actions
+- [ ] Handles ≥ 1 s at head and tail, stem anchored at handle_head + 0.4 s
+- [ ] `cut_in` / `cut_out` copied verbatim; pair matches the previous shot's cut_out
+- [ ] This shot differs from the previous one by subject, ≥ 2 sizes or ≥ 30° (else REJECT)
+- [ ] Readable props pinned to the ledger; one speaker per clip; no internal cut
 
 ### Step 6: Assign reference roles
 For each reference in the prompt:

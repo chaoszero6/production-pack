@@ -301,3 +301,90 @@ When reviewing generated clips, check for:
 1. **Clarity** — no distortion or noise
 2. **Speaker identity** — no crosstalk
 3. **Sync** — audio matches lip movement (if visible)
+
+---
+
+## 7. EDITORIAL RULES — learned from *The Clockwork Moth* (2026-10) and OpenCineAgent
+
+Public review of the Moth: "narrator, child, and old woman all had the same voice … until
+the man comes in"; "she looks at a clock, then the time is different in the next cut";
+"each cut had a small dissolve in it, likely frame interpolation on the finished cut";
+"some clips don't cut — jump cut or continuity problem at the cut. Not all shots can cut
+together." Every clip had passed per-clip QA. The defects were between clips.
+
+### 7.1 Jump cuts come from the shot list, not from H3
+Nine consecutive shot pairs in the Moth were the same character, same shot size, same
+angle (e.g. two "Nana close-up, three-quarter, static" in a row). H3 rendered both
+perfectly; the cut between them is a jump by definition.
+- Consecutive shots differ by subject, OR ≥ 2 shot-size steps, OR ≥ 30° of angle.
+- Never three consecutive shots of the same size. Alternate single / reaction / two-shot / insert.
+- Plan reaction singles and inserts in every dialogue scene — they are the editor's cutaways.
+- One shot per clip. H3 is never asked for an internal cut ("[Shot 2] at 00:04 cuts to…"
+  is forbidden in this pipeline; a new angle is a new shot ID). Internal cuts were the
+  top ref2va failure (~1 in 3 takes) until i2v with the keyframe as literal first frame.
+
+### 7.2 Handles: render more than you will use (OpenCineAgent: "render the next valid
+length and trim at assembly; trimming per clip keeps cuts from drifting")
+Moth dialogue clips were sized to the voice stem (0.4 s lead, 0.6 s tail) — nothing to
+trim into, so every cut was a butt-join on a static pose with speech starting on the cut.
+- Every clip: ≥ 1.0 s of in-character action before the first beat and after the last
+  (`edit.handle_head_s` / `edit.handle_tail_s`), included in `duration_seconds`.
+- Dialogue stem anchored at `handle_head + 0.4 s`; pad the stem with leading silence to
+  the full clip length so H3's lip sync lines up.
+- Prompt the handles explicitly: `[0s-1s] listening, mouth closed, …` and
+  `[6.2s-7.2s] holds the look, begins to turn …`. Copy `edit.cut_in` / `edit.cut_out`
+  verbatim from the shot list into the first and last temporal blocks.
+- H3 valid lengths are 5 + 17k frames at 24 fps (122…362). Round UP to the next valid
+  length; the editor trims.
+
+### 7.3 Cut on action / on the look
+- Leave shot A mid-movement; enter shot B with the same movement finishing.
+- Dialogue: cut from speaker to listener as the speaker's eyes move, or J-cut (next line
+  starts 2–6 frames before the picture cut). Never static pose → static pose of the same
+  subject.
+- Preserve screen direction and the 180° axis; eyelines cross the cut (speaker looks
+  screen-right, listener screen-left).
+- Exits: cut before the character clears frame; H3 melts an empty room (§2.4).
+
+### 7.4 Readable props are plot information
+If the story makes a character look at a clock, the clock's reading must be the same in
+every shot of that scene (and advance the right amount after a time skip). H3 draws clock
+hands at random unless the prompt pins them ("hands at ten past seven") — and the keyframe
+must pin them too. If a value cannot be rendered reliably, frame it unreadable or make the
+cue audible (a chime). Keep a `readable_props` ledger per scene; QA compares every visible
+readable state to it and to the previous clip.
+
+### 7.5 Interpolation never crosses a cut
+RIFE/minterpolate on the ASSEMBLED film blends the last frame of shot A into the first
+frame of shot B — a 2–4 frame dissolve at every edit, exactly what viewers saw. Interpolate
+per clip (`upscale_clip.py`) and concatenate the masters; a full-film pass
+(`upscale_film.py`) takes `--concat-list final/concat.txt` and holds each shot's last
+frame instead of blending across. Straight cuts are the default transition; `xfade` only
+when the Director scripted a dissolve/fade.
+
+### 7.6 Voice casting is between voices, not within a line
+Four of five Moth roles were Orpheus adult-female voices within ~3 semitones; per-line
+prosody metrics passed. Cast by voice class (child / teen / adult-f / adult-m / elderly-f /
+elderly-m / creature), narrator in a class no character uses, ≥ 4 semitones median-pitch
+separation measured on a shared line-up, child and elderly roles from Chatterbox clones or
+CosyVoice 3 instructions — never an adult voice with affectation (`.dsh/skills/voice-casting.md`).
+
+### 7.7 OpenCineAgent production notes worth copying
+(docs/PRODUCTION_NOTES.md, github.com/ProgramaGrueso/OpenCineAgent)
+- One master portrait per character, approved by eye once; every keyframe derives from it.
+  "Identity anchors are the same files in every clip. Regenerating anchors per clip
+  degrades identity by clip 6." Identity block repeated VERBATIM in every prompt.
+- Name colours precisely ("navy blue wool trench coat", not "champagne").
+- One speaker per clip; a second voice is (S2), never the same id. ~130 characters per
+  line, ~200 per clip — longer lines are rushed or cut.
+- "To make someone talk, have them stop what they are doing and look at the camera /
+  listener: if they eat while talking, H3 prioritizes eating."
+- No text in renders (models invent letters) — titles and subtitles go in post.
+- Music is post only: H3 "re-sings" or restarts music per clip.
+- Keep every take; corrections are new takes (`_t2`, `_t3`), approved files never overwritten.
+- Frame-exact cutting: `frames = round(duration * fps)`, trim video with `-frames:v` and
+  audio with `atrim` to the same seconds; concat demuxer with `-c copy`; no transitions.
+- Upscaler writes video only; mux the original audio back. Blend filters (glow, screen)
+  run in RGB (`format=gbrp`); in YUV they tint magenta.
+- "'Verified' means measured. A bad number is a reason to look at the frames, not to
+  discard a take blindly." QC reports separate passed / failed / not verified.
