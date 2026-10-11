@@ -25,7 +25,7 @@ LOG="$PACK_DIR/output/vram_supervisor.log"
 WATCHDOG_LOG="$PACK_DIR/output/vram_watchdog.log"
 # Conflict-checking LLM: a small fast model (default = local DeepSeek-R1 1.5B on :8099).
 # Override with CHECKER_URL / CHECKER_MODEL if your 1.5B lives elsewhere.
-NINFER_URL="${NINFER_URL:-http://127.0.0.1:8080}"          # full LLM used to RESTART work
+NINFER_URL="${NINFER_URL:-http://127.0.0.1:8321}"          # local LLM (Strata Swift) used to RESTART work
 CHECKER_URL="${CHECKER_URL:-http://127.0.0.1:8099}"        # small 1.5B used to DETECT/diagnose
 CHECKER_MODEL="${CHECKER_MODEL:-/models/llm/unsloth_DeepSeek-R1-Distill-Qwen-1.5B-GGUF/DeepSeek-R1-Distill-Qwen-1.5B-Q8_0.gguf}"
 mkdir -p "$PACK_DIR/output"
@@ -59,7 +59,7 @@ resolve_target_phase() {
         echo "video_gen"; return
     fi
     # If any TTS backend is up â†’ audio_gen
-    if curl -sf --max-time 2 http://127.0.0.1:9883/v1/models >/dev/null 2>&1; then
+    if curl -sf --max-time 2 http://127.0.0.1:9883/v1/audio/voices >/dev/null 2>&1; then
         echo "audio_gen"; return
     fi
     # Default: thinking (keep the LLM, drop generation engines)
@@ -126,7 +126,7 @@ print(m.group(0).strip() if m else (content.strip() or "(no JSON found in LLM re
 
     # 3. Verify the LLM is back up (work can resume against it)
     for _w in $(seq 1 60); do
-        curl -sf --max-time 3 "$NINFER_URL/health" >/dev/null 2>&1 && { log "NInfer healthy again â€” work may resume."; return 0; }
+        curl -sf --max-time 3 "$NINFER_URL/v1/models" >/dev/null 2>&1 && { log "Local LLM healthy again â€” work may resume."; return 0; }
         sleep 1
     done
     log "ERROR: NInfer did not recover within 60s."

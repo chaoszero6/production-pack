@@ -28,6 +28,7 @@ VRAM_LOG="${VRAM_LOG:-/tmp/vram_monitor_$$}.log"
 
 # Known service VRAM table (from phase_config.yaml)
 declare -A SERVICE_VRAM=(
+    [strata]       "31800"    # Qwen 3.8 Flash Next via Strata Swift — the current LLM
     [ninfer]       "28672"
     [ninfer_us]    "31744"
     [qwen_local]   "27648"
@@ -40,6 +41,7 @@ declare -A SERVICE_VRAM=(
 
 # Port → service name mapping
 declare -A PORT_TO_SVC=(
+    [8321]="strata"
     [8080]="ninfer"
     [8081]="ninfer_us"
     [8085]="qwen_local"
@@ -132,14 +134,14 @@ detect_conflicts() {
     # Any LLM + ComfyUI together (under local mode only)
     if [[ "${CLOUD_ROUTING:-1}" != "1" ]]; then
         local has_llm=false has_comfyui=false
-        for llm_port in 8080 8081 8085; do
+        for llm_port in 8321 8080 8081 8085; do
             ss -tlnp 2>/dev/null | grep -q ":${llm_port} " && has_llm=true
         done
         ss -tlnp 2>/dev/null | grep -q ':8188 ' && has_comfyui=true
 
         if $has_llm && $has_comfyui; then
             local llm_count=0
-            for llm_port in 8080 8081 8085; do
+            for llm_port in 8321 8080 8081 8085; do
                 ss -tlnp 2>/dev/null | grep -q ":${llm_port} " && llm_count=$((llm_count + 1))
             done
             if [[ $llm_count -gt 0 ]]; then
@@ -150,7 +152,7 @@ detect_conflicts() {
 
     # Orpheus + any LLM (VRAM dance should prevent this)
     if ss -tlnp 2>/dev/null | grep -q ':9883 '; then
-        for llm_port in 8080 8081 8085; do
+        for llm_port in 8321 8080 8081 8085; do
             if ss -tlnp 2>/dev/null | grep -q ":${llm_port} "; then
                 conflicts+=("⚠ Orpheus(:9883) + LLM(:$llm_port) — VRAM dance violation!")
                 break
@@ -213,7 +215,7 @@ vram_report() {
     # Active ports
     echo "║  Active Ports:                                            ║"
     local active_ports=""
-    for port in 8080 8081 8085 8188 9880 9881 9882 9883; do
+    for port in 8321 8080 8081 8085 8188 9880 9881 9882 9883; do
         if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
             active_ports="${active_ports} :${port}"
         fi

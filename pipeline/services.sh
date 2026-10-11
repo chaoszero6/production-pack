@@ -21,9 +21,14 @@
 
 set -euo pipefail
 
-PACK_DIR="${PACK_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+PACK_DIR="${PACK_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 PHASE_CONFIG="${PACK_DIR}/pipeline/phase_config.yaml"
 DSH_DIR="${DSH_DIR:-/root/desktop/deepseek-harness}"
+
+# The local LLM (Strata Swift, Qwen 3.8 Flash Next — unit, port, 2-minute start
+# timeout) is defined once in local_llm.sh; every start/stop below goes through it.
+# shellcheck source=/dev/null
+source "${PACK_DIR}/pipeline/local_llm.sh"
 
 # Log file — falls back to stderr if RUN_DIR not set yet
 SVC_LOG="${SVC_LOG:-/tmp/production_svc_$$}"
@@ -169,15 +174,17 @@ _stop_orpheus_full() {
 _resolve_alias() {
     local alias_name="$1"
     case "$alias_name" in
-        ninfer_or_ninfer_us)
-            # Prefer ninfer first; fall back to ninfer-us
-            if svc_is_healthy "ninfer"; then
+        ninfer_or_ninfer_us|local_llm)
+            # The Strata unit is the only local LLM in service; the ninfer
+            # units are masked on 207 and only matter as stragglers to stop.
+            if svc_is_healthy "strata"; then
+                echo "strata"
+            elif svc_is_healthy "ninfer"; then
                 echo "ninfer"
             elif svc_is_healthy "ninfer_us"; then
                 echo "ninfer_us"
             else
-                # Neither is running — suggest starting one
-                echo "ninfer"  # default recommendation
+                echo "strata"  # default recommendation
             fi
             ;;
         *)
@@ -261,27 +268,23 @@ _transition_stop_all() {
 
 # Stop all three possible LLM variants
 _transition_stop_llm_services() {
-    _stop_systemd "ninfer.service"
-    _stop_systemd "ninfer-us.service"
-    _stop_systemd "qwen3.8-27b-q6k-cuda.service"
-    _stop_docker "qwen38-27b-q6k"
-    sleep 2
+    # Park the Strata LLM (31.8 GB) and any legacy unit; mark it parked so
+    # llm_monitor.py does not bring it straight back while ComfyUI/TTS own the GPU.
+    mkdir -p "${PACK_DIR}/output" 2>/dev/null || true
+    touch "${PACK_DIR}/output/.llm_parked" 2>/dev/null || true
+    llm_stop
 }
 
-# Stop all LLMs except ninfer/ninfer-us (for monitoring phase)
+# Stop every LLM except the current local one (for monitoring/thinking phases)
 _transition_stop_llm_services_except_ninfer() {
-    _stop_systemd "qwen3.8-27b-q6k-cuda.service"
-    _stop_docker "qwen38-27b-q6k"
+    llm_stop_legacy
     sleep 1
 }
 
 # Stop all TTS engines
 _transition_stop_tts_services() {
-    _stop_orpheus_full
-    _stop_systemd "chatterbox.service" 2>/dev/null || true
-    _stop_systemd "cosyvoice.service" 2>/dev/null || true
-    _stop_systemd "kokoro.service" 2>/dev/null || true
-    sleep 1
+    systemctl stop tts-cluster.service 2>/dev/null || true
+    bash "${PACK_DIR}/pipeline/tts_cluster.sh" stop
 }
 
 # Helper: stop a named service using the alias resolution
@@ -302,13 +305,14 @@ _transition_stop_service_by_name() {
         # Direct service name → convert to common unit names
         case "$svc_ref" in
             comfyui)    _stop_systemd "comfyui.service" ;;
+            strata)     _stop_systemd "$LLM_UNIT" ;;
             ninfer)     _stop_systemd "ninfer.service" ;;
             ninfer_us)  _stop_systemd "ninfer-us.service" ;;
             qwen_local) _stop_systemd "qwen3.8-27b-q6k-cuda.service" ;;
             qwen_docker)_stop_docker "qwen38-27b-q6k" ;;
-            chatterbox_tts) _stop_systemd "chatterbox.service" ;;
+            chatterbox_tts) _stop_systemd "chatterbox-tts.service" ;;
             cosyvoice_tts)  _stop_systemd "cosyvoice.service" ;;
-            kokoro_tts)     _stop_systemd "kokoro.service" ;;
+            kokoro_tts)     _stop_systemd "kokoro-tts.service" ;;
             orpheus_tts)    _stop_orpheus_full ;;
             hermes_gateway) _stop_systemd "hermes-stack.service" ;;
         esac
@@ -322,11 +326,11 @@ _transition_start_needed() {
     case "$target_phase" in
         thinking)
             if [[ "${CLOUD_ROUTING:-1}" != "1" ]]; then
-                # Local mode: start one LLM if none is running
+                # Local mode: the Strata LLM must be serving (≈2 min to start)
+                rm -f "${PACK_DIR}/output/.llm_parked" 2>/dev/null || true
                 if ! svc_is_healthy_any_llm; then
-                    log "Starting NInfer for local agent reasoning..."
-                    _start_systemd "ninfer.service"
-                    svc_wait_for_ready "ninfer" 60 || true
+                    log "Starting $LLM_UNIT for local agent reasoning (≈2 min)..."
+                    llm_start "$LLM_START_TIMEOUT" || true
                 fi
             fi
             ;;
@@ -350,13 +354,14 @@ _transition_start_needed() {
 # ────────────────────────────────────────────────────────────
 
 _ensure_comfyui_running() {
-    if svc_is_healthy "comfyui"; then
+    # ComfyUI conflicts with the LLM and the TTS cluster; gpu_owner parks the
+    # LLM (marker + stop), starts comfyui.service and waits for :8188.
+    if svc_is_healthy "comfyui" && ! llm_active; then
+        log "ComfyUI already running"
         return 0
     fi
-    log "Starting/Restarting ComfyUI..."
-    _restart_systemd "comfyui.service"
-    svc_wait_for_ready "comfyui" 120 || {
-        log_error "ComfyUI failed to start!"
+    bash "${PACK_DIR}/pipeline/gpu_owner.sh" comfyui || {
+        log_error "ComfyUI failed to become healthy"
         return 1
     }
 }
@@ -366,16 +371,10 @@ _ensure_comfyui_running() {
 # ────────────────────────────────────────────────────────────
 
 _start_all_tts() {
-    # Start Orpheus first (it's the most critical VRAM consumer)
-    _start_orpheus_full
-    svc_wait_for_ready "orpheus_tts" 30 || log_warn "Orpheus TTS didn't start"
-
-    # Other TTS are typically CPU-based; start them in parallel
-    _start_systemd "chatterbox.service" 2>/dev/null &
-    _start_systemd "cosyvoice.service" 2>/dev/null &
-    _start_systemd "kokoro.service" 2>/dev/null &
-    wait  # wait for background jobs
-    log "All TTS engines started"
+    # One unit for the whole set; its Conflicts= park the LLM and ComfyUI.
+    mkdir -p "${PACK_DIR}/output" 2>/dev/null || true
+    touch "${PACK_DIR}/output/.llm_parked" 2>/dev/null || true
+    bash "${PACK_DIR}/pipeline/tts_cluster.sh" start 240 || log_warn "TTS cluster not fully healthy"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -383,13 +382,13 @@ _start_all_tts() {
 # ────────────────────────────────────────────────────────────
 
 _ensure_monitoring_llm() {
+    rm -f "${PACK_DIR}/output/.llm_parked" 2>/dev/null || true
     if svc_is_healthy_any_llm; then
         return 0
     fi
-    log "Starting monitoring LLM (ninfer)..."
-    _start_systemd "ninfer.service"
-    svc_wait_for_ready "ninfer" 60 || {
-        log_warn "NInfer not available for monitoring"
+    log "Starting monitoring LLM ($LLM_UNIT, ≈2 min)..."
+    llm_start "$LLM_START_TIMEOUT" || {
+        log_warn "$LLM_UNIT not available for monitoring"
         return 1
     }
 }
@@ -437,6 +436,7 @@ svc_is_healthy() {
         # Fallback: check port directly
         local port
         port=$(case "$svc_name" in
+            strata) echo "$LLM_PORT" ;;
             ninfer) echo 8080 ;;
             ninfer_us) echo 8081 ;;
             qwen_local) echo 8085 ;;
@@ -458,7 +458,7 @@ svc_is_healthy() {
 }
 
 svc_is_healthy_any_llm() {
-    svc_is_healthy "ninfer" || svc_is_healthy "ninfer_us" || svc_is_healthy "qwen_local"
+    llm_healthy || svc_is_healthy "ninfer" || svc_is_healthy "ninfer_us" || svc_is_healthy "qwen_local"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -467,7 +467,7 @@ svc_is_healthy_any_llm() {
 
 svc_list_running() {
     log "--- Running Services ---"
-    local ports=(8080 8081 8085 8188 9880 9881 9882 9883)
+    local ports=("$LLM_PORT" 8080 8081 8085 8188 9880 9881 9882 9883)
     for port in "${ports[@]}"; do
         if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
             echo "  ✓ :${port} (LISTENING)"
@@ -492,7 +492,7 @@ svc_status() {
 
     # Service health table
     echo "║ ── Services ───────────────────────────────────────── ║"
-    local services=("ninfer:8080" "ninfer-us:8081" "qwen-local:8085" "comfyui:8188"
+    local services=("strata:$LLM_PORT" "ninfer:8080" "ninfer-us:8081" "qwen-local:8085" "comfyui:8188"
                     "orpheus:9883" "chatterbox:9882" "cosyvoice:9880" "kokoro:9881")
     for entry in "${services[@]}"; do
         local name="${entry%%:*}"
@@ -530,16 +530,12 @@ cmd_transition() {
 
 cmd_stop_all() {
     log "Stopping ALL services..."
-    systemctl stop ninfer.service 2>/dev/null || true
-    systemctl stop ninfer-us.service 2>/dev/null || true
-    systemctl stop qwen3.8-27b-q6k-cuda.service 2>/dev/null || true
+    touch "${PACK_DIR}/output/.llm_parked" 2>/dev/null || true
+    llm_stop
     systemctl stop comfyui.service 2>/dev/null || true
     systemctl stop hermes-stack.service 2>/dev/null || true
     _stop_orpheus_full
-    systemctl stop chatterbox.service 2>/dev/null || true
-    systemctl stop cosyvoice.service 2>/dev/null || true
-    systemctl stop kokoro.service 2>/dev/null || true
-    docker stop qwen38-27b-q6k 2>/dev/null || true
+    systemctl stop tts-cluster.service chatterbox-tts.service cosyvoice.service kokoro-tts.service 2>/dev/null || true
     sleep 2
     log "All services stopped."
 }
@@ -558,7 +554,8 @@ cmd_safe_start_orpheus() {
     # Stop any running LLM
     if svc_is_healthy_any_llm; then
         log "Stopping LLM to free VRAM for Orpheus..."
-        cmd_stop_one_of "ninfer" "ninfer-us" "qwen3.8-27b-q6k-cuda"
+        touch "${PACK_DIR}/output/.llm_parked" 2>/dev/null || true
+        llm_stop
     fi
     _start_orpheus_full
     svc_wait_for_ready "orpheus_tts" 30 || {
@@ -572,7 +569,9 @@ cmd_safe_start_orpheus() {
 cmd_safe_stop_orpheus() {
     log "Stopping Orpheus TTS..."
     _stop_orpheus_full
-    log "Orpheus stopped. LLM can be restarted now."
+    rm -f "${PACK_DIR}/output/.llm_parked" 2>/dev/null || true
+    log "Orpheus stopped. Restarting the local LLM (≈2 min)..."
+    llm_start "$LLM_START_TIMEOUT" || log_warn "$LLM_UNIT did not come back"
 }
 
 cmd_stop_one_of() {

@@ -70,19 +70,51 @@ Each agent is a dsh preset in `.dsh/.agent-presets/` with skills in `.dsh/skills
 
 There is **no `dsh-engine-switch` plugin** (it 404s on npm) and the `engine:` field in a preset is
 a no-op. The model is resolved from the **`agent-default-model` section of `/root/.dsh/settings.yaml`
-at dsh launch**, so the route is rewritten before every agent call. All agents run on the
-**OpenRouter cloud** — no local LLM server is involved.
+at dsh launch**, so the route is rewritten before every agent call.
+
+**Since 2026-10-11 every text agent runs on the LOCAL Qwen 3.8 Flash Next 125B** served by Strata
+Swift on 207 (`strata-swift-iq3-xxs.service`, OpenAI API `http://127.0.0.1:8321/v1`, dsh provider
+`strata-swift`, model `swift-1.5-iq3_xxs`, 262k context, maxTokens 131072, effort **xhigh** for both
+reasoning and execution). It is text-only, so the one vision agent stays on OpenRouter. The unit, port
+and model are defined once in `pipeline/local_llm.sh` / `pipeline/local_llm.py`; everything else
+imports them. `CLOUD_ROUTING=0` in `run.sh` is the active mode.
 
 The per-agent table lives in **`pipeline/set_agent_model.py`** (single source of truth; `run.sh`'s
 `set_agent_model` and `pipeline/generate_clip.py` both call it, so a subprocess can never inherit
-the previous agent call's route). `CLOUD_ROUTING=1` in `run.sh` is the active mode; set it to `0`
-to fall back to the retired local layout.
+the previous agent call's route). If the Strata unit is not serving when a route is written,
+`set_agent_model.py` starts it and waits (≈2 min, cap 300 s) before the agent launches.
 
-| Agent | Model (OpenRouter) | Effort |
-|-------|--------------------|--------|
-| Story Creator, Director, Screenplay Reviewer, Character Designer, Location Designer | `qwen3.8-27b` (ninfer:8080) | xhigh |
-| QA Inspector — the ONLY vision agent | `google/gemini-3-flash-preview` | high |
-| All other agents | `qwen3.8-27b` (ninfer:8080) | xhigh |
+| Agent | Provider / model | Effort |
+|-------|------------------|--------|
+| Story Creator, Director, Screenplay Reviewer, Character Designer, Location Designer | `strata-swift` / `swift-1.5-iq3_xxs` (local :8321) | xhigh |
+| QA Inspector — the ONLY vision agent | `openrouter` / `google/gemini-3-flash-preview` | high |
+| All other agents | `strata-swift` / `swift-1.5-iq3_xxs` (local :8321) | xhigh |
+
+### The GPU has exactly ONE owner: Strata LLM | ComfyUI | TTS cluster
+
+The LLM holds ~31.8 GB of the 32.6 GB card and pins ~40 GB of RAM, so nothing can share the GPU
+with it. The exclusion is enforced in **systemd**, not in scripts: `pipeline/systemd/` installs
+`tts-cluster.service` (starts Orpheus backend+API, Chatterbox, CosyVoice and Kokoro as one set) and
+`Conflicts=` drop-ins on `comfyui.service`, `strata-swift-iq3-xxs.service` and every TTS unit, so
+`systemctl start <owner>` stops the other two automatically (`pipeline/systemd/install_units.sh`).
+
+- `pipeline/gpu_owner.sh llm|comfyui|tts|none|status` switches owner and **waits for the new owner's
+  API** (Strata ≈ 2 min; ComfyUI ≤ 180 s; TTS ≤ 240 s) and maintains `output/.llm_parked`, the marker
+  that tells the monitor the LLM is down on purpose.
+- **An agent turn never calls ComfyUI or a TTS port** — those are down while its LLM runs. Agents write
+  job files (`frame_spec.json`, `tts_jobs.json`, `reviewed_prompt.json`) and the pipeline renders them
+  with the GPU handed over: `generate_frames.py`, `tts_render.py` + `voice_lineup.py`,
+  `generate_dialogue_audio.py`, `generate_clip.py`, `upscale_clip.sh`. Each hands the GPU back to the
+  LLM when done (`--keep-gpu` chains render steps without the 2-minute reload).
+- **Crash / hang recovery:** `tts-idle-monitor.service` runs `pipeline/llm_monitor.py` every 30 s. If the
+  Strata unit is failed/inactive while nothing else owns the GPU, it restarts it (≤ 4 restarts per hour,
+  then a handoff note); if the unit is active but `/v1/models` or a real chat round-trip fails for
+  ≥ 120 s, it restarts it; it never touches a unit younger than 330 s (still loading) or while
+  ComfyUI/TTS are active. The Strata unit's own `ExecStartPost` (`llm_ready_notify.sh`) writes
+  `output/.llm_ready` and posts "LLM back" so a failed agent turn re-issues itself.
+- A stale Qwen/ninfer unit can never hold VRAM: `local_llm.sh` stops the retired units
+  (`ninfer`, `ninfer-us`, `ninfer-qwen36-35b`, `qwen3.8-27b-q6k-cuda`, `qfn-iq3m-cuda`) before every
+  start. They are masked on 207.
 
 **Only `qa-inspector` needs vision** (it extracts frames at 2 FPS and scores hands/face/identity
 per frame). Capability labels lie — probe before trusting a declared `input:` list.
@@ -290,25 +322,25 @@ hands `final/edit_report.json` to the Post-Production Editor, who records every 
 
 ## Service Dependencies
 
-> **Model routing is per-run and currently ALL CLOUD via OpenRouter** (`run.sh`'s `set_agent_model`
-> → `pipeline/set_agent_model.py` rewrites the `agent-default-model` section of
-> `/root/.dsh/settings.yaml` before each agent call — see "Model Switching"). A cloud-routed run
-> needs **no local LLM services at all** — only ComfyUI and the TTS servers. The two Qwen rows below
-> are the **retired local layout**, kept only for `CLOUD_ROUTING=0` rollback. Check the run log for
-> `Model route: <agent> -> openrouter/<model>` to see which layout is in effect; `openrouter/` means
-> cloud and the Qwen rows are unused.
+> **Model routing is per-call and LOCAL-first** (`run.sh`'s `set_agent_model` →
+> `pipeline/set_agent_model.py` rewrites the `agent-default-model` section of `/root/.dsh/settings.yaml`
+> before each agent call — see "Model Switching"). Check the run log for
+> `Model route: <agent> -> strata-swift/swift-1.5-iq3_xxs` (text agents) and
+> `qa-inspector -> openrouter/google/gemini-3-flash-preview` (vision).
 >
-> ⚠ Under cloud routing the pack deliberately **never starts the local LLM**, so a Qwen server left
-> running from a previous local-mode run will sit on ~27 GB of VRAM and starve H3. Stop it by hand:
-> `systemctl stop qwen3.8-27b-q6k-cuda.service` (+ `docker stop qwen38-27b-q6k` if it lingers).
+> ⚠ Only one of {Strata LLM, ComfyUI, TTS cluster} can hold the GPU. `pipeline/gpu_owner.sh status`
+> shows who does. `ninfer`/`ninfer-us` are masked; `qfn-iq3m-cuda` (docker llama.cpp) conflicts with
+> Strata and is stopped by `local_llm.sh` before every LLM start.
 
 | Service          | Used By                        | Port  | VRAM     | Notes                              |
 |-----------------|--------------------------------|-------|----------|------------------------------------|
-| ~~Qwen 3.5 122B~~ | ~~Story, Director, Reviewer~~ | 11434 | ~75 GB Q4| RETIRED 2026-09-21 — cloud instead  |
-| ~~Qwen 3.8 27B~~  | ~~All execution + QA agents~~ | 11435 | ~16 GB Q4| RETIRED 2026-09-21 — cloud instead  |
-| ninfer          | dsh local route (`ninfer`)     | 8080  | ~28 GB   | Swift Qwen3.8 27B, int8 KV 262k     |
-| ninfer-us       | dsh local route (`ninfer-us`)  | 8081  | ~31 GB   | Huihui-Abliterated, int8 KV 262k    |
-| ComfyUI         | Image Gen, Video Gen           | 8188  | varies   | Workflow execution engine           |
+| **Strata Swift (Qwen 3.8 Flash Next 125B)** | ALL text agents (`strata-swift`) | 8321 | ~31.8 GB | `strata-swift-iq3-xxs.service`; ~2 min start; exclusive GPU owner |
+| tts-cluster     | Audio Producer renders         | —     | ~8 GB    | starts all 4 TTS engines; exclusive GPU owner |
+| ~~Qwen 3.5 122B~~ | ~~Story, Director, Reviewer~~ | 11434 | ~75 GB Q4| RETIRED 2026-09-21                 |
+| ~~Qwen 3.8 27B~~  | ~~All execution + QA agents~~ | 11435 | ~16 GB Q4| RETIRED 2026-09-21                 |
+| ~~ninfer~~      | ~~dsh local route~~            | 8080  | ~28 GB   | RETIRED 2026-10-11 — unit masked   |
+| ~~ninfer-us~~   | ~~dsh local route~~            | 8081  | ~31 GB   | RETIRED 2026-10-11 — unit masked   |
+| ComfyUI         | Image Gen, Video Gen           | 8188  | varies   | Workflow execution engine; exclusive GPU owner |
 | Qwen Image 2.1  | Image Generator                | -     | ~8-10 GB | Via ComfyUI node                    |
 | MiniMax H3      | Video Generator                | -     | ~8-12 GB | Via ComfyUI node                    |
 | Chatterbox      | Audio Producer                 | 9882  | ~4-6 GB  | Primary dialogue (best naturalness) |

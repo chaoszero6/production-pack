@@ -31,66 +31,48 @@ def systemctl(action, service):
 
 CLOUD_ROUTING = os.environ.get("CLOUD_ROUTING", "0") == "1"
 
-ALL_LLM_SERVICES = [
-    "qwen3.8-27b-q6k-cuda.service",
-    "llama-qwen35-122b.service",
-    "ninfer.service",
-    "ninfer-us.service",
-    "orpheus-backend.service",
-    "orpheus-tts.service",
-]
-LOCAL_HEALTH_ENDPOINTS = [
-    ("ninfer.service",    "http://127.0.0.1:8080/health"),
-    ("ninfer-us.service", "http://127.0.0.1:8081/health"),
-    ("qwen3.8-27b-q6k-cuda.service", "http://127.0.0.1:8085/health"),
-]
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import local_llm  # noqa: E402  (Strata Swift unit/port/model — single source of truth)
+
+# While the LLM is parked for a render this marker tells llm_monitor.py not to
+# restart it (its ExecStartPre would kill ComfyUI mid-job).
+PARKED_MARKER = os.path.join(PACK_DIR, "output", ".llm_parked")
 
 
 def stop_llm():
     if CLOUD_ROUTING:
         return
-    log("Stopping ALL LLM services to free VRAM for H3...")
-    for svc in ALL_LLM_SERVICES:
+    log(f"Parking the local LLM ({local_llm.UNIT}, ~{local_llm.VRAM_MB} MB) to free VRAM for H3...")
+    os.makedirs(os.path.dirname(PARKED_MARKER), exist_ok=True)
+    with open(PARKED_MARKER, "w") as fh:
+        fh.write(f"{time.time()} generate_clip\n")
+    local_llm.stop()
+    for svc in ("orpheus-tts.service", "orpheus-backend.service"):
         systemctl("stop", svc)
-    subprocess.run(["docker", "stop", "qwen38-27b-q6k"], capture_output=True)
-    time.sleep(2)
     log("LLM services stopped")
 
 
 def start_llm():
     if CLOUD_ROUTING:
         return True
-    for svc, url in LOCAL_HEALTH_ENDPOINTS:
-        try:
-            r = requests.get(url, timeout=3)
-            if r.status_code == 200:
-                log(f"LLM already running: {svc}")
-                return True
-        except:
-            pass
+    try:
+        os.remove(PARKED_MARKER)
+    except OSError:
+        pass
+    if local_llm.healthy():
+        log(f"LLM already running: {local_llm.UNIT}")
+        return True
     # Free ComfyUI's VRAM (H3 models can hold 20-26GB after generation)
     log("Freeing ComfyUI VRAM before starting LLM...")
     try:
         requests.post(f"{COMFYUI}/free", json={"unload_models": True, "free_memory": True}, timeout=10)
         time.sleep(2)
-    except:
-        systemctl("restart", "comfyui.service")
-        time.sleep(5)
-    log("Starting local LLM...")
-    for svc, url in LOCAL_HEALTH_ENDPOINTS:
-        systemctl("start", svc)
-        for i in range(120):
-            try:
-                r = requests.get(url, timeout=3)
-                if r.status_code == 200:
-                    log(f"LLM ready ({i+1}s): {svc}")
-                    return True
-            except:
-                pass
-            time.sleep(1)
-        log(f"{svc} didn't start, trying next...")
-        systemctl("stop", svc)
-    log("WARNING: No local LLM started in time")
+    except Exception:
+        pass
+    log(f"Starting local LLM {local_llm.UNIT} (about 2 min)...")
+    if local_llm.start():
+        return True
+    log("WARNING: local LLM did not start in time")
     return False
 
 

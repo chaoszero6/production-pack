@@ -1,5 +1,7 @@
 # Phase-Based Service Management
 
+> **2026-10-11:** the local LLM is now Qwen 3.8 Flash Next via Strata (`strata-swift-iq3-xxs`, :8321, ~31.8 GB, ~2 min start) and the GPU has exactly one owner — LLM | ComfyUI | TTS cluster — enforced by systemd `Conflicts=` (`pipeline/systemd/`). Use `pipeline/gpu_owner.sh` to switch; the ninfer rows below are retired (units masked). Agent turns never call ComfyUI or TTS ports; they write job files that the pipeline renders with the GPU handed over.
+
 VRAM-safe orchestration for the RTX 5090 (32 GB) in the Production Pack.
 
 ## Problem Statement

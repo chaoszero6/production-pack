@@ -89,7 +89,7 @@ verify_phase_compliance() {
             if ! ss -tlnp 2>/dev/null | grep -q ':8188 '; then
                 errors+="⚠ ComfyUI not running during video_gen phase\n"
             fi
-            for llm_port in 8080 8081 8085; do
+            for llm_port in 8321 8080 8081 8085; do
                 if ss -tlnp 2>/dev/null | grep -q ":${llm_port} "; then
                     errors+="⚠ Local LLM on :${llm_port} running during video_gen!\n"
                 fi
@@ -100,7 +100,7 @@ verify_phase_compliance() {
             if ss -tlnp 2>/dev/null | grep -q ':8188 '; then
                 errors+="⚠ ComfyUI still running during audio_gen!\n"
             fi
-            for llm_port in 8080 8081 8085; do
+            for llm_port in 8321 8080 8081 8085; do
                 if ss -tlnp 2>/dev/null | grep -q ":${llm_port} "; then
                     errors+="⚠ LLM on :${llm_port} running during audio_gen!\n"
                 fi

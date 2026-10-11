@@ -65,34 +65,32 @@ def log(msg):
     print(f"[audio] {msg}", flush=True)
 
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import local_llm  # noqa: E402  (Strata Swift unit/port/model — single source of truth)
+
+PARKED_MARKER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "output", ".llm_parked")
+
+
 def stop_ninfer():
-    log("Stopping NInfer to free VRAM...")
-    subprocess.run(["systemctl", "stop", "ninfer-us.service"],
-                    capture_output=True, timeout=30)
-    subprocess.run(["systemctl", "stop", "ninfer.service"],
-                    capture_output=True, timeout=30)
-    time.sleep(2)
+    """Park the local LLM (31.8 GB) so Orpheus (~8 GB) can load."""
+    log(f"Parking the local LLM ({local_llm.UNIT}) to free VRAM for Orpheus...")
+    os.makedirs(os.path.dirname(PARKED_MARKER), exist_ok=True)
+    with open(PARKED_MARKER, "w") as fh:
+        fh.write(f"{time.time()} generate_dialogue_audio\n")
+    local_llm.stop()
 
 
 def start_ninfer():
-    """Restart NInfer so the next agent (QA, etc.) has its LLM available."""
-    log("Starting NInfer...")
-    # Try ninfer first (preferred), then ninfer-us as fallback
-    for svc, port in [("ninfer.service", 8080), ("ninfer-us.service", 8081)]:
-        subprocess.run(["systemctl", "start", svc],
-                       capture_output=True, timeout=60)
-        for _ in range(120):
-            try:
-                r = requests.get(f"http://127.0.0.1:{port}/health", timeout=3)
-                if r.status_code == 200:
-                    log(f"NInfer ready on :{port} ({svc})")
-                    return True
-            except Exception:
-                pass
-            time.sleep(1)
-        # Didn't come up — stop it and try the next one
-        subprocess.run(["systemctl", "stop", svc], capture_output=True, timeout=30)
-    log("WARNING: No NInfer service started in time")
+    """Bring the local LLM back so the next agent (QA, etc.) has its model (about 2 min)."""
+    try:
+        os.remove(PARKED_MARKER)
+    except OSError:
+        pass
+    log(f"Starting {local_llm.UNIT}...")
+    if local_llm.start():
+        return True
+    log("WARNING: local LLM did not start in time")
     return False
 
 

@@ -21,11 +21,15 @@ import subprocess
 import sys
 import time
 
-NINFER_URL = "http://127.0.0.1:8080"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import local_llm  # noqa: E402
+
+NINFER_URL = local_llm.BASE_URL   # the local LLM that analyses the readings
 
 # Services that hold significant GPU VRAM when active.
 VRAM_HEAVY_SERVICES = [
     "comfyui.service",
+    local_llm.UNIT,                # Strata Swift (~31.8 GB)
     "ninfer.service",
     "ninfer-us.service",
     "orpheus-backend.service",   # llama.cpp GPU backend (~8GB)
@@ -125,7 +129,7 @@ def llm_analyse(samples, log_path):
         + "\n\nGive a one-paragraph verdict: was there a real VRAM conflict? Which "
           "services overlapped? Is the system at risk of OOM? Be concise."
     )
-    body = json.dumps({"model": "qwen3.8-27b", "messages": [
+    body = json.dumps({"model": local_llm.MODEL, "messages": [
         {"role": "user", "content": prompt}], "max_tokens": 600}).encode()
     req = urllib.request.Request(
         f"{NINFER_URL}/v1/chat/completions", data=body,

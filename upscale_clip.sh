@@ -12,10 +12,11 @@ set -uo pipefail
 
 PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMFYUI_URL="http://127.0.0.1:8188"
-SVC_27B="ninfer-us.service"
-SVC_NINFER_TEXTONLY="ninfer.service"
-SVC_122B="llama-qwen35-122b.service"
 SVC_COMFYUI="comfyui.service"
+# The GPU is owned by exactly one of {Strata LLM | ComfyUI | TTS cluster}
+# (systemd Conflicts=); gpu_owner.sh switches owner and waits for health.
+# shellcheck source=/dev/null
+source "$PACK_DIR/pipeline/gpu_owner.sh"
 
 RUN_DIR="${1:?usage: upscale_clip.sh <run_dir> <SHOT_ID> [--force]}"
 SHOT_ID="${2:?usage: upscale_clip.sh <run_dir> <SHOT_ID> [--force]}"
@@ -26,15 +27,10 @@ log() { echo "[$(date +%H:%M:%S)] UPSCALE-ONLY $SHOT_ID: $*" | tee -a "$RUN_DIR/
 
 [ -f "$CLIP_DIR/clip.mp4" ] || { log "ERROR no clip.mp4 in $CLIP_DIR"; exit 2; }
 
-# Free VRAM for RTX VSR + RIFE (ComfyUI stays up)
-log "Stopping LLM for VRAM..."
-systemctl stop "$SVC_122B" 2>/dev/null || true
-systemctl stop "$SVC_27B" 2>/dev/null || true
-systemctl stop "$SVC_NINFER_TEXTONLY" 2>/dev/null || true
-if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^qwen38'; then
-    docker stop qwen38-27b-q6k > /dev/null 2>&1 || true
-fi
-sleep 2
+# Hand the GPU to ComfyUI (parks the 31.8 GB LLM; restored on exit, ≈2 min)
+log "Handing the GPU to ComfyUI for RTX VSR + RIFE..."
+gpu_owner comfyui || log "WARNING: ComfyUI did not report healthy"
+trap 'log "Restoring the local LLM..."; gpu_owner llm >/dev/null 2>&1 || true' EXIT
 
 if ! curl -sf "$COMFYUI_URL/system_stats" >/dev/null; then
     log "ComfyUI down — starting"

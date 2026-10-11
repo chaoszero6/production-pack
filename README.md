@@ -103,15 +103,23 @@ The single source of truth is `pipeline/set_agent_model.py` — both `run.sh` an
 `pipeline/generate_clip.py` call it, so a subprocess can never inherit the
 previous call's route.
 
-| Tier | Default (cloud) | Override |
-|------|-----------------|----------|
-| Reasoning | `deepseek-v4-pro` | `DSH_REASONING_PROVIDER` / `DSH_REASONING_MODEL` |
-| Execution | `deepseek-v4.1-flash` | `DSH_EXECUTION_PROVIDER` / `DSH_EXECUTION_MODEL` |
-| Vision (QA) | `google/gemini-3-flash-preview` | `DSH_VISION_PROVIDER` / `DSH_VISION_MODEL` |
+| Tier | Default | Override |
+|------|---------|----------|
+| Reasoning | **local** `strata-swift` / `swift-1.5-iq3_xxs` (Qwen 3.8 Flash Next 125B, xhigh) | `DSH_REASONING_PROVIDER` / `DSH_REASONING_MODEL` |
+| Execution | **local** `strata-swift` / `swift-1.5-iq3_xxs` (xhigh) | `DSH_EXECUTION_PROVIDER` / `DSH_EXECUTION_MODEL` |
+| Vision (QA) | `openrouter` / `google/gemini-3-flash-preview` | `DSH_VISION_PROVIDER` / `DSH_VISION_MODEL` |
 
-Cloud routing is the default (`CLOUD_ROUTING=1`), so **no local LLM is required
-to run the pack** — the GPU stays free for ComfyUI. Set `CLOUD_ROUTING=0` to
-serve agents from a local `ninfer` unit instead.
+Text agents run on the local Strata LLM (`strata-swift-iq3-xxs.service`, port
+8321, ~31.8 GB VRAM, ~2 minutes to load). Because nothing else fits on the card
+beside it, **the GPU has exactly one owner at a time — the LLM, ComfyUI, or the
+four-engine TTS cluster** — enforced by systemd `Conflicts=` installed from
+`pipeline/systemd/`. `pipeline/gpu_owner.sh` switches owner and waits for its
+API; `pipeline/llm_monitor.py` (run by `tts-idle-monitor.service`) restarts the
+LLM after a crash or hang whenever nothing else holds the GPU. Agents never call
+ComfyUI or a TTS port during a turn: they write job files, and the pipeline
+renders them with the GPU handed over (`generate_frames.py`, `tts_render.py`,
+`generate_clip.py`). Set the `DSH_*` overrides to route a tier to a cloud
+provider instead.
 
 > Capability labels are not evidence. `deepseek-v4-pro` advertises image input
 > and then rejects it with `404 No endpoints found that support image input`.

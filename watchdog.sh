@@ -108,8 +108,8 @@ ai_diagnose() {
         tail -50 "$run_dir/pipeline.log" 2>/dev/null
         echo "=== SERVICES ==="
         echo "comfyui: $(systemctl is-active comfyui.service 2>/dev/null)"
-        echo "ninfer-us: $(systemctl is-active ninfer-us.service 2>/dev/null)"
-        echo "ninfer: $(systemctl is-active ninfer.service 2>/dev/null)"
+        echo "strata-swift-iq3-xxs (LLM): $(systemctl is-active strata-swift-iq3-xxs.service 2>/dev/null)"
+        echo "tts-cluster: $(systemctl is-active tts-cluster.service 2>/dev/null)"
         echo "=== GPU ==="
         nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader 2>/dev/null
         echo "=== DISK ==="

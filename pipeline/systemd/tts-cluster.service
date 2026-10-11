@@ -1,0 +1,29 @@
+# /etc/systemd/system/tts-cluster.service — installed by pipeline/systemd/install_units.sh
+#
+# ONE unit that brings up all four TTS engines (Orpheus backend+API, Chatterbox,
+# CosyVoice, Kokoro) and, through Conflicts=, STOPS the two other GPU owners —
+# comfyui.service and the Strata LLM — automatically. The reverse holds too:
+# starting comfyui or strata stops this cluster (Conflicts= is bidirectional).
+#
+#   systemctl start tts-cluster     # TTS up, ComfyUI + LLM down
+#   systemctl start comfyui         # ComfyUI up, TTS + LLM down
+#   systemctl start strata-swift-iq3-xxs   # LLM up, ComfyUI + TTS down
+#   systemctl stop  tts-cluster     # PartOf= stops every engine
+[Unit]
+Description=Production Pack TTS cluster (Orpheus 3B + Chatterbox + CosyVoice 3 + Kokoro) — exclusive GPU owner
+Conflicts=comfyui.service strata-swift-iq3-xxs.service ninfer.service ninfer-us.service ninfer-qwen36-35b.service qfn-iq3m-cuda.service
+Wants=orpheus-backend.service orpheus-tts.service chatterbox-tts.service cosyvoice.service kokoro-tts.service
+After=orpheus-backend.service orpheus-tts.service chatterbox-tts.service cosyvoice.service kokoro-tts.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PACK_DIR=/root/production_pack
+# ExecStart only has to WAIT for the engines Wants= already started.
+ExecStart=/root/production_pack/pipeline/tts_cluster.sh wait 240
+ExecStop=-/root/production_pack/pipeline/tts_cluster.sh stop
+TimeoutStartSec=300
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

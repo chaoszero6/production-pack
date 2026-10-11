@@ -1,82 +1,97 @@
-# Model Configuration — Cloud routing via OpenCode Go / OpenRouter
+# Model Configuration — LOCAL Strata LLM for reasoning + execution, cloud for vision
 #
-# Default: all agents on cloud — no local LLM needed during production.
-# Local NInfer providers (ninfer :8080, ninfer-us :8081) are registered
-# in ~/.dsh/settings.yaml for cloud-fallback and manual local routing.
-# systemd Conflicts= means only one ninfer unit holds the RTX 5090.
+# Since 2026-10-11 every text agent runs on the local Qwen 3.8 Flash Next 125B
+# served by Strata Swift (unit strata-swift-iq3-xxs, OpenAI API on :8321,
+# dsh provider "strata-swift", model swift-1.5-iq3_xxs, 262k context,
+# maxTokens 131072, effort xhigh). It is TEXT ONLY, so qa-inspector (the one
+# vision agent) stays on OpenRouter gemini-3-flash-preview.
+#
+# The GPU has exactly ONE owner at a time — Strata LLM | ComfyUI | TTS cluster —
+# enforced by systemd Conflicts= (pipeline/systemd/). The LLM holds ~31.8 GB of
+# the 32.6 GB card and takes ~2 min to start; pipeline/gpu_owner.sh switches
+# owner and waits, pipeline/llm_monitor.py restarts the LLM after a crash/hang
+# whenever no other owner holds the GPU.
 #
 # dsh-engine-switch plugin is NOT installed (404s on npm), so per-preset
-# engine declarations in agent.cordis.yml are inert. Instead, run.sh
-# rewrites the agent-default-model section of ~/.dsh/settings.yaml
-# before each agent call via set_agent_model().
+# engine declarations in agent.cordis.yml are inert. run.sh rewrites the
+# agent-default-model section of ~/.dsh/settings.yaml before each agent call
+# via pipeline/set_agent_model.py (single source of truth, reads pipeline/local_llm.py).
 
-# Per-preset model routing (managed by run.sh set_agent_model)
 routing:
-  # Reasoning + vision agents → DeepSeek V4 Pro (text+image, 1M context, high effort)
   reasoning_agents:
     - story-creator
     - director
     - screenplay-reviewer
     - character-designer
     - location-designer
-    - qa-inspector
-  reasoning_provider: "opencode-go-deepseek-pro"
-  reasoning_model: "deepseek-v4-pro"
-  reasoning_effort: "high"
+  reasoning_provider: "strata-swift"
+  reasoning_model: "swift-1.5-iq3_xxs"
+  reasoning_effort: "xhigh"
 
-  # Execution agents → DeepSeek V4.1 Flash (text+image, 1M context, low effort)
   execution_agents:
     - storyboard-artist
     - image-generator
     - audio-producer
     - music-composer
     - video-generator
-    - qa-inspector
     - pipeline-orchestrator
     - subtitle-generator
     - post-production-editor
-  execution_provider: "opencode-go-deepseek"
-  execution_model: "deepseek-v4.1-flash"
-  execution_effort: "low"
+  execution_provider: "strata-swift"
+  execution_model: "swift-1.5-iq3_xxs"
+  execution_effort: "xhigh"
 
-# Local NInfer providers (in ~/.dsh/settings.yaml) — both configured;
-# only one service runs at a time (systemd Conflicts= between ninfer and ninfer-us).
+  vision_agents:
+    - qa-inspector
+  vision_provider: "openrouter"
+  vision_model: "google/gemini-3-flash-preview"
+  vision_effort: "high"
+
 providers:
+  strata-swift:
+    base_url: "http://127.0.0.1:8321/v1"
+    model: "swift-1.5-iq3_xxs"
+    service: "strata-swift-iq3-xxs.service"
+    health: "http://127.0.0.1:8321/v1/models"
+    input: [text]
+    context_window: 262144
+    max_tokens: 131072
+    vram_gb: 31.8
+    ram_gb: 40
+    start_seconds: 120            # unit TimeoutStartSec=300
+    thinking_format: "qwen"
+    exclusive_with: [comfyui.service, tts-cluster.service]
+
+  openrouter:
+    base_url: "https://openrouter.ai/api/v1"
+    key_env: "OPENROUTER_API_KEY"
+    model: "google/gemini-3-flash-preview"
+    input: [text, image]
+    role: "QA vision only"
+
+  # Retired local providers — units are MASKED on 207, kept for reference only
   ninfer:
     base_url: "http://127.0.0.1:8080/v1"
     model: "qwen3.8-27b"
     service: "ninfer.service"
-    input: [text, image]
-    context_window: 262144
-    thinking_format: "qwen"
-
+    retired: true
   ninfer-us:
     base_url: "http://127.0.0.1:8081/v1"
     model: "qwen38-huihui-abliterated-ninfer-nvfp4"
     service: "ninfer-us.service"
-    input: [text, image]
-    context_window: 262144
-    thinking_format: "qwen"
+    retired: true
 
   opencode-go-deepseek-pro:
     base_url: "https://opencode.ai/zen/go/v1"
     key_env: "OPENCODE_GO_API_KEY"
-    session_header: "x-opencode-session: production-pack"
-    stream_idle_timeout_ms: 1800000  # 30 min — long reasoning blocks
     model: "deepseek-v4-pro"
-    input: [text, image]  # Supports vision for QA
+    input: [text, image]
     context_window: 1000000
-    thinking_format: "deepseek"
-
+    role: "cloud fallback (reasoning)"
   opencode-go-deepseek:
     base_url: "https://opencode.ai/zen/go/v1"
     key_env: "OPENCODE_GO_API_KEY"
-    session_header: "x-opencode-session: production-pack"
-    stream_idle_timeout_ms: 1800000
     model: "deepseek-v4.1-flash"
-    input: [text, image]  # Accepts images — for QA
+    input: [text, image]
     context_window: 1000000
-    thinking_format: "deepseek"
-
-# Cloud: default agent routing. Local ninfer/ninfer-us available as fallback.
-# When an ninfer unit is active it holds ~28–31 GB of the RTX 5090.
+    role: "cloud fallback (execution)"

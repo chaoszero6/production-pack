@@ -38,7 +38,26 @@
 #   can_parallel : true if multiple instances of this service can coexist
 
 services:
-  # Local LLM providers (mutually exclusive via systemd Conflicts=)
+  # ★ CURRENT local LLM (2026-10-11): Qwen 3.8 Flash Next 125B via Strata Swift.
+  #   Reasoning AND execution agents run on it (dsh provider strata-swift,
+  #   model swift-1.5-iq3_xxs, effort xhigh). TEXT ONLY — QA vision stays on cloud.
+  #   Takes ~2 min to start (40 GB experts → RAM, GPU expert cache); its unit's
+  #   ExecStartPre stops comfyui.service, so start it BEFORE bringing ComfyUI back.
+  #   Holds ~31.8 GB of the 32.6 GB card: nothing else can share the GPU with it.
+  #   Lifecycle helpers: pipeline/local_llm.sh / local_llm.py; crash+hang recovery:
+  #   pipeline/llm_monitor.py (tts-idle-monitor.service).
+  strata:
+    unit: strata-swift-iq3-xxs.service
+    type: systemd
+    port: 8321
+    vram_mb: 31800
+    ram_mb: 40960
+    start_timeout_sec: 300   # typical 120 s
+    critical: false
+    can_parallel: false
+    conflicts_with: [ninfer, ninfer-us, ninfer_qwen36_35b, qfn_iq3m]
+
+  # Retired local LLM providers (units are MASKED on 207; listed so a straggler is stopped)
   ninfer:
     unit: ninfer.service
     type: systemd
@@ -99,7 +118,7 @@ services:
 
   # TTS engines (all can run together within VRAM budget)
   chatterbox_tts:
-    unit: chatterbox.service
+    unit: chatterbox-tts.service
     type: systemd
     port: 9882
     vram_mb: 0              # CPU-based (no GPU VRAM)
@@ -109,11 +128,13 @@ services:
   cosyvoice_tts:
     unit: cosyvoice.service
     type: systemd
-    port: 9880
+    port: 50000           # Gradio webui only (no REST wrapper deployed)
     vram_mb: 0              # CPU-based (no GPU VRAM)
     critical: false
     cpu_only: true
 
+  # ★ The four engines start/stop as ONE set via tts-cluster.service (pipeline/systemd/);
+  #   starting it parks the LLM and ComfyUI through systemd Conflicts=.
   orpheus_tts:
     unit: orpheus-tts.service
     type: systemd
@@ -123,7 +144,7 @@ services:
     requires_backend: true  # must start orpheus-backend.service first
 
   kokoro_tts:
-    unit: kokoro.service
+    unit: kokoro-tts.service
     type: systemd
     port: 9881
     vram_mb: 0              # CPU-based (lightweight)
@@ -171,7 +192,7 @@ phases:
     priority: 10
     coud_mode_active: true        # active regardless of CLOUD_ROUTING value
     keep: []                       # cloud mode: nothing local
-    local_mode_keep: [ninfer_or_ninfer_us]   # exactly one LLM
+    local_mode_keep: [local_llm]   # the Strata unit (alias below)
     stop: []                        # don't stop anything extra under cloud
     local_mode_stop: [comfyui]     # stop ComfyUI to free VRAM under local mode
     restart: []
@@ -186,6 +207,7 @@ phases:
     priority: 20
     keep: [comfyui]               # ComfyUI must be running
     stop:                         # everything else
+      - strata                    # ★ 31.8 GB — must be parked for any render
       - ninfer
       - ninfer_us
       - qwen_local
@@ -213,6 +235,7 @@ phases:
       - orpheus_tts
       - kokoro_tts
     stop:
+      - strata                      # ★ Orpheus (8 GB) cannot share the GPU with it
       - ninfer
       - ninfer_us
       - qwen_local
@@ -231,7 +254,7 @@ phases:
   monitoring:
     description: "Lightweight health checks and status probes"
     priority: 40
-    keep: [ninfer_or_ninfer_us]     # exactly one lightweight LLM
+    keep: [local_llm]               # the Strata unit
     stop:
       - qwen_local
       - qwen_docker
@@ -239,7 +262,7 @@ phases:
       - hermes_gateway
       - orpheus_tts
     restart: []
-    preferred_service: ninfer       # choose ninfer unless unavailable
+    preferred_service: strata
 
 
 # ────────────────────────────────────────────────────────────
@@ -248,8 +271,11 @@ phases:
 # These aliases map to specific services. The manager picks the
 # best available member based on health checks.
 aliases:
-  ninfer_or_ninfer_us:
-    candidates: [ninfer, ninfer_us]
+  local_llm:
+    candidates: [strata]
+    selection_policy: prefer_first_healthy
+  ninfer_or_ninfer_us:                       # legacy alias, resolves to strata first
+    candidates: [strata, ninfer, ninfer_us]
     selection_policy: prefer_first_healthy   # try in order, pick first healthy
 
   # For video generation, sub-model VRAM is dynamic:
@@ -264,13 +290,14 @@ aliases:
 # HEALTH CHECK ENDPOINTS
 # ────────────────────────────────────────────────────────────
 health_checks:
+  strata:         "http://127.0.0.1:8321/v1/models"   # ★ current local LLM (no /health route)
   ninfer:         "http://127.0.0.1:8080/health"
   ninfer_us:      "http://127.0.0.1:8081/health"
   qwen_local:     "http://127.0.0.1:8085/health"
   ninfer_qwen36_35b: "http://127.0.0.1:8083/health"   # ★ New: Qwen 3.6 35B-A3B
   comfyui:        "http://127.0.0.1:8188/api/system_stats"
   chatterbox_tts: "http://127.0.0.1:9882/health"
-  cosyvoice_tts:  "http://127.0.0.1:9880/health"
-  orpheus_tts:    "http://127.0.0.1:9883/v1/models"
+  cosyvoice_tts:  "http://127.0.0.1:50000/"
+  orpheus_tts:    "http://127.0.0.1:9883/v1/audio/voices"   # Orpheus-FastAPI has no /v1/models (404)
   kokoro_tts:     "http://127.0.0.1:9881/health"
   hermes_gateway: "http://127.0.0.1:9888/health"   # placeholder

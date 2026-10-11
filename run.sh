@@ -40,9 +40,17 @@ PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DSH_DIR="${DSH_DIR:-/root/desktop/deepseek-harness}"
 COMFYUI_DIR="/opt/comfyui"
 OUTPUT_DIR="$PACK_DIR/output"
-LLM_PORT=8085
-LLM_URL="http://127.0.0.1:$LLM_PORT"
 COMFYUI_URL="http://127.0.0.1:8188"
+
+# ── The GPU has exactly ONE owner at a time: Strata LLM | ComfyUI | TTS cluster ──
+# systemd Conflicts= (pipeline/systemd/) enforce it; these helpers switch owner
+# and wait for the new one's API. The local LLM is Qwen 3.8 Flash Next via
+# Strata Swift (unit/port/model in pipeline/local_llm.sh — ~2 min to start).
+# shellcheck source=/dev/null
+source "$PACK_DIR/pipeline/local_llm.sh"
+# shellcheck source=/dev/null
+source "$PACK_DIR/pipeline/gpu_owner.sh"
+LLM_URL="$LLM_BASE_URL"
 
 # LLM routing: all providers are configurable at startup via environment variables.
 # Default is OpenRouter for all tiers. Override any tier independently:
@@ -137,19 +145,7 @@ _wait_url() {
 # made `wait_for_health ComfyUI` time out and kill a run. Heavy GPU work
 # (ComfyUI renders, TTS synthesis) is serialized outside agent turns by the
 # wrapper scripts in pipeline/, not by stopping the LLM the agent is using.
-LLM_HEALTH_URLS=("http://127.0.0.1:8080/health"
-                 "http://127.0.0.1:8081/health"
-                 "http://127.0.0.1:8085/health")
-
-llm_healthy() {
-    local u
-    for u in "${LLM_HEALTH_URLS[@]}"; do
-        if curl -sf --max-time 3 "$u" > /dev/null 2>&1; then
-            return 0
-        fi
-    done
-    return 1
-}
+# llm_healthy / llm_start / llm_stop come from pipeline/local_llm.sh.
 
 # Drop ComfyUI's loaded models (Qwen Image 2.1 ~10 GB / H3 ~12-14 GB) without
 # touching the server process. Safe to call when ComfyUI is down.
@@ -166,27 +162,19 @@ ensure_agent_llm() {
     if llm_healthy; then
         return 0
     fi
-    log "Local LLM not healthy — starting one for this agent turn..."
-    comfyui_release_models
-
+    # Hand the GPU to the LLM: Conflicts= stop ComfyUI / the TTS cluster, the
+    # Strata engine loads 40 GB of experts (~2 min), gpu_owner waits for /v1/models.
+    log "Local LLM not serving — handing the GPU to $LLM_UNIT (≈2 min)..."
     local attempt
     for attempt in 1 2; do
-        systemctl start ninfer.service 2>/dev/null || true
-        if _wait_url "http://127.0.0.1:8080/health" 90 "NInfer (:8080)"; then
+        if gpu_owner llm; then
             return 0
         fi
-        log "NInfer not healthy (attempt $attempt/2) — releasing VRAM and retrying..."
-        systemctl stop ninfer.service 2>/dev/null || true
-        comfyui_release_models
-        if [ "$attempt" -eq 2 ]; then
-            # Last resort: park ComfyUI so NInfer can load. ensure_comfyui
-            # will bring it back up on the next phase that needs it.
-            systemctl stop "$SVC_COMFYUI" 2>/dev/null || true
-            sleep 3
-        fi
-        sleep 2
+        log "$LLM_UNIT not healthy (attempt $attempt/2) — resetting and retrying"
+        systemctl reset-failed "$LLM_UNIT" 2>/dev/null || true
+        sleep 5
     done
-    die "No local LLM could be started for agent turn (ninfer :8080 unhealthy)"
+    die "No local LLM could be started for agent turn ($LLM_UNIT :$LLM_PORT unhealthy — journalctl -u $LLM_UNIT)"
 }
 
 # ── Phase-aware service management (wrappers for run.sh compatibility) ──
@@ -207,47 +195,23 @@ ensure_local_llm_running() {
 }
 
 _legacy_start_llm() {
-    systemctl restart "$SVC_COMFYUI" 2>/dev/null || true
-    sleep 3
-    for svc in ninfer-us.service ninfer.service "$SVC_27B"; do
-        systemctl start "$svc" 2>/dev/null || true
-        for i in $(seq 1 120); do
-            for url in "http://127.0.0.1:8080/health" "http://127.0.0.1:8081/health" "http://127.0.0.1:8085/health"; do
-                if curl -sf --max-time 3 "$url" >/dev/null 2>&1; then
-                    log "Local LLM ready (${i}s): $svc"
-                    return 0
-                fi
-            done
-            sleep 1
-        done
-        systemctl stop "$svc" 2>/dev/null || true
-    done
-    die "No local LLM started within timeout"
+    gpu_owner llm || die "No local LLM started within timeout"
 }
 
 stop_all_llms() {
     if [[ "${CLOUD_ROUTING:-1}" == "1" ]]; then
         return 0
     fi
-    if [[ -f "$PACK_DIR/pipeline/services.sh" ]]; then
-        source "$PACK_DIR/pipeline/services.sh"
-        cmd_stop_all 2>/dev/null || true
-    else
-        _legacy_stop_all_llms
-    fi
+    # Park the LLM (marks output/.llm_parked so llm_monitor leaves it down).
+    _gpu_park_llm run.sh
+    llm_stop
 }
 
 _legacy_stop_all_llms() {
-    systemctl stop "$SVC_122B" 2>/dev/null || true
-    systemctl stop "$SVC_27B" 2>/dev/null || true
-    systemctl stop ninfer.service 2>/dev/null || true
-    systemctl stop ninfer-us.service 2>/dev/null || true
+    _gpu_park_llm run.sh
+    llm_stop
     systemctl stop orpheus-tts.service 2>/dev/null || true
     systemctl stop orpheus-backend.service 2>/dev/null || true
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^qwen38'; then
-        docker stop qwen38-27b-q6k > /dev/null 2>&1 || true
-    fi
-    sleep 2
 }
 
 swap_to_122b()  { ensure_local_llm_running; }
@@ -255,40 +219,30 @@ swap_to_27b()   { ensure_local_llm_running; }
 
 stop_all_llms_for_generation() {
     if [[ "${CLOUD_ROUTING:-1}" == "1" ]]; then
-        # Nothing to free: no local LLM is loaded. Just ensure ComfyUI is healthy.
         ensure_comfyui
         return 0
     fi
-    log "Stopping LLM to free VRAM for ComfyUI generation..."
-    if [[ -f "$PACK_DIR/pipeline/services.sh" ]]; then
-        source "$PACK_DIR/pipeline/services.sh"
-        svc_transition "video_gen" 2>/dev/null || true
-    else
-        stop_all_llms
-        systemctl restart "$SVC_COMFYUI"
-        sleep 3
-    fi
+    log "Handing the GPU to ComfyUI (parks the LLM)..."
+    ensure_comfyui
 }
 
 ensure_comfyui() {
+    # ComfyUI and the LLM are exclusive GPU owners: starting ComfyUI stops the
+    # LLM (Conflicts=). Never call this inside an agent turn — the agent is
+    # served by that LLM. gpu_owner marks the LLM parked and waits for :8188.
     local attempt
-    if curl -sf --max-time 5 "$COMFYUI_URL/api/system_stats" > /dev/null 2>&1; then
+    if curl -sf --max-time 5 "$COMFYUI_URL/api/system_stats" > /dev/null 2>&1 && ! llm_active; then
         return 0
     fi
-    # ComfyUI idles at ~0.6 GB — it does NOT need the LLM parked to boot, and
-    # stopping the LLM here is exactly what raced the pipeline (idle_monitor
-    # saw a non-active ComfyUI mid-`systemctl start` and reclaimed the GPU).
     for attempt in 1 2 3; do
-        log "Starting ComfyUI (attempt $attempt/3)..."
-        systemctl start "$SVC_COMFYUI" 2>/dev/null || true
-        if _wait_url "$COMFYUI_URL/api/system_stats" 120 "ComfyUI"; then
+        log "Handing the GPU to ComfyUI (attempt $attempt/3)..."
+        if gpu_owner comfyui; then
             return 0
         fi
-        log "ComfyUI did not come up in 120s (attempt $attempt/3) — restarting it"
         systemctl restart "$SVC_COMFYUI" 2>/dev/null || true
         sleep 3
     done
-    die "ComfyUI failed to start within 360s — check: journalctl -u $SVC_COMFYUI -n 50"
+    die "ComfyUI failed to start within $((COMFYUI_START_TIMEOUT * 3))s — check: journalctl -u $SVC_COMFYUI -n 50"
 }
 
 stop_hermes() {
@@ -305,16 +259,16 @@ start_hermes() {
     systemctl start "$SVC_HERMES" 2>/dev/null || true
 }
 
-# ── Cloud routing (OpenRouter) with automatic local fallback ──
-# All agents run on local NInfer (ninfer:8080). Cloud routing is disabled.
-# VRAM management is always active (stop LLM during ComfyUI/TTS gen).
-# Per-agent model table lives in pipeline/set_agent_model.py.
+# ── Routing: reasoning + execution on the LOCAL Strata LLM, vision on cloud ──
+# All text agents run on Qwen 3.8 Flash Next (strata-swift / swift-1.5-iq3_xxs,
+# effort xhigh, maxTokens 131072). Only qa-inspector goes to OpenRouter
+# (gemini-3-flash-preview) because Strata is text-only. Per-agent table lives
+# in pipeline/set_agent_model.py; GPU ownership in pipeline/gpu_owner.sh.
 export CLOUD_ROUTING="0"
 
-# Local layout — ninfer (8080) is the primary provider.
-LOCAL_MODEL_PROVIDER="ninfer"
-LOCAL_MODEL_ID="qwen3.8-27b"
-LOCAL_MODEL_EFFORT="xhigh"
+LOCAL_MODEL_PROVIDER="$LLM_PROVIDER"
+LOCAL_MODEL_ID="$LLM_MODEL"
+LOCAL_MODEL_EFFORT="$LLM_EFFORT"
 
 set_agent_model() {
     local preset="$1"
@@ -796,34 +750,13 @@ _run_dsh_agent_with_phase() {
     # wrote 47-byte [ELIFECYCLE] artifacts. Generation work that truly needs
     # exclusive VRAM runs in pipeline/*.sh with the LLM parked, never inside
     # an agent turn.
-    case "$phase" in
-        video_gen)
-            # Agent needs the LLM to reason and ComfyUI up to call its API.
-            # ComfyUI idles at ~0.6 GB, so both coexist; models are released
-            # with POST /free when the agent is about to render.
-            ensure_agent_llm
-            ensure_comfyui
-            ;;
-        audio_gen)
-            # CPU-only TTS engines are free next to the LLM. Orpheus (~8 GB)
-            # is started by generate_dialogue_audio.py's own VRAM dance —
-            # starting it here would OOM against ninfer's ~28 GB.
-            ensure_agent_llm
-            local _tts _free_mb
-            _free_mb=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | tr -dc '0-9' || echo 0)
-            if [ "${_free_mb:-0}" -ge 5000 ]; then
-                for _tts in chatterbox-tts.service cosyvoice.service kokoro-tts.service; do
-                    systemctl start "$_tts" 2>/dev/null || true
-                done
-                log "audio_gen: TTS engines started (free VRAM ${_free_mb} MiB)"
-            else
-                log "audio_gen: TTS start skipped — only ${_free_mb:-0} MiB free beside the local LLM"
-            fi
-            ;;
-        *)
-            ensure_agent_llm
-            ;;
-    esac
+    # Every phase: the agent is served by the local LLM, which is the GPU's
+    # sole owner while the turn runs (ComfyUI and the TTS cluster are
+    # Conflicts= with it). Agents therefore never call ComfyUI or a TTS port:
+    # they write job files (frame_spec.json, tts_jobs.json, reviewed_prompt.json)
+    # and the pipeline renders them afterwards with the LLM parked
+    # (generate_frames.py, tts_render.py, generate_clip.py, …).
+    ensure_agent_llm
 
     # Optional VRAM pre-check
     if [[ -f "$VRAM_MONITOR" ]]; then
@@ -1245,9 +1178,27 @@ if ! skip_if_done "$RUN_DIR/audio/voices/voice_config.json" "Voice Design"; then
     step "1e. Audio Producer — voice design"
     swap_to_27b
     write_prompt "$RUN_DIR/prompt_voices.txt" \
-        "Read $RUN_DIR/story.json and CAST the voices per the voice-casting skill. Every role incl. the narrator gets a voice class (child/teen/adult-female/adult-male/elderly-female/elderly-male/creature); the narrator uses a class NO character uses. Orpheus (port 9883: tara/leah/jess/leo/dan/mia/zac/zoe) has ADULT voices only — children and elderly roles use Chatterbox cloning (port 9882) from an age-matched reference or CosyVoice 3 (port 9880) instructions; never an adult voice with affectation. Then render the SAME two test sentences in every cast voice to $RUN_DIR/audio/voices/lineup/<role>.wav, measure median pitch / rate / dynamics, and write the pairwise matrix to $RUN_DIR/audio/voices/lineup/separation.json with verdict CAST_OK (every pair >= 4 semitones apart or different class + >= 2 st, rate differs >= 10% or engine differs) or CAST_FAIL — recast until CAST_OK. Save references to $RUN_DIR/audio/voices/ and the fixed cast to $RUN_DIR/audio/voices/voice_config.json (voice_class, engine, voice|reference|instruction, lineup_f0_median_hz per role)."
+        "Read $RUN_DIR/story.json and CAST the voices per the voice-casting skill. Every role incl. 'narrator' gets a voice class (child/teen/adult-female/adult-male/elderly-female/elderly-male/creature); the narrator uses a class NO character uses. Orpheus (voices tara/leah/jess/leo/dan/mia/zac/zoe) has ADULT voices only — children and elderly roles use Chatterbox cloning from an age-matched reference WAV (look under $RUN_DIR/audio/voices/refs/ and /root/production_pack/output/voices/refs/; pick the closest) or Orpheus with post_fx (pitch_semitones -2..+3, tempo 0.9..1.1); never an adult voice with affectation. CosyVoice is NOT available (no REST endpoint). DO NOT call any TTS port — the TTS engines are down while you run; the pipeline renders and measures the line-up afterwards. Write ONLY $RUN_DIR/audio/voices/voice_config.json: {\"<role>\": {\"voice_class\": ..., \"engine\": \"orpheus|chatterbox|kokoro\", \"voice\": ... or \"reference_audio\": <abs path>, \"post_fx\": {...} optional, \"notes\": ...}, ...} with one entry per speaking character (ids from story.json) plus 'narrator'."
     run_dsh_agent "audio-producer" "$RUN_DIR/prompt_voices.txt" "$RUN_DIR/audio/voices/voice_config.json"
-    notify "Voice profiles created" "Audio Producer"
+
+    # The TTS engines cannot run beside the LLM, so the agent only CAST; the
+    # pipeline renders the line-up with the GPU handed to the TTS cluster and
+    # measures the separation. CAST_FAIL sends the agent back with the report.
+    CAST_ROUNDS=0
+    while ! python3 "$PACK_DIR/pipeline/voice_lineup.py" --run-dir "$RUN_DIR" >> "$RUN_DIR/pipeline.log" 2>&1; do
+        LINEUP_RC=$?
+        [ "$LINEUP_RC" -eq 2 ] && die "voice_lineup.py could not read $RUN_DIR/audio/voices/voice_config.json"
+        CAST_ROUNDS=$((CAST_ROUNDS + 1))
+        if [ "$CAST_ROUNDS" -gt 2 ]; then
+            notify "Voice cast still CAST_FAIL after $CAST_ROUNDS recasts — continuing, see audio/voices/lineup/separation.json" "Voice Casting"
+            break
+        fi
+        log "Voice line-up CAST_FAIL — asking the Audio Producer to recast (round $CAST_ROUNDS)"
+        write_prompt "$RUN_DIR/prompt_voices_recast.txt" \
+            "The measured voice line-up FAILED: read $RUN_DIR/audio/voices/lineup/separation.json ('failures' lists the pairs that are too close or share a voice class with the narrator). Recast those roles per the voice-casting skill — a different voice CLASS (child via chatterbox reference, elderly via chatterbox reference or orpheus with post_fx {\"pitch_semitones\": -2, \"tempo\": 0.92}, narrator in a class no character uses) and >= 4 semitones apart. Rewrite $RUN_DIR/audio/voices/voice_config.json in place (same schema: voice_class, engine, voice|reference_audio, optional post_fx per role incl. 'narrator'). Do NOT call any TTS port — the pipeline renders the line-up."
+        run_dsh_agent "audio-producer" "$RUN_DIR/prompt_voices_recast.txt" "$RUN_DIR/audio/voices/voice_config.json"
+    done
+    notify "Voice cast line-up: $(python3 -c "import json;print(json.load(open('$RUN_DIR/audio/voices/lineup/separation.json')).get('verdict','?'))" 2>/dev/null || echo unknown)" "Audio Producer"
 fi
 
 # ═══════════════════════════════════════════════════════════
@@ -1502,16 +1453,16 @@ sys.exit(1 if (d.get('failed') or str(d.get('status','')).lower() in ('failed','
             else
             swap_to_27b
             # Start Orpheus TTS if not running (primary dialogue engine)
-            if ! curl -sf http://127.0.0.1:9883/v1/models > /dev/null 2>&1; then
+            if ! curl -sf http://127.0.0.1:9883/v1/audio/voices > /dev/null 2>&1; then
                 log "[$SHOT_ID] Starting Orpheus TTS..."
                 systemctl start orpheus-backend.service 2>/dev/null || true
                 sleep 3
                 systemctl start orpheus-tts.service 2>/dev/null || true
                 for _w in $(seq 1 30); do
-                    curl -sf http://127.0.0.1:9883/v1/models > /dev/null 2>&1 && break
+                    curl -sf http://127.0.0.1:9883/v1/audio/voices > /dev/null 2>&1 && break
                     sleep 1
                 done
-                if curl -sf http://127.0.0.1:9883/v1/models > /dev/null 2>&1; then
+                if curl -sf http://127.0.0.1:9883/v1/audio/voices > /dev/null 2>&1; then
                     log "[$SHOT_ID] Orpheus TTS ready on :9883"
                 else
                     log "[$SHOT_ID] WARNING: Orpheus TTS not responding — agent will fall back to Chatterbox"
@@ -1602,14 +1553,21 @@ except Exception:
         if [ "$STAGE_OK" = "true" ] && { [ -s "$CLIP_DIR/frame_meta.json" ] || [ "$NEED_FRAMES" = "no" ]; }; then
             log "[$SHOT_ID] SKIP (resume): image generation — frames already done or not required"
         else
-            log "[$SHOT_ID] Generating frames..."
+            log "[$SHOT_ID] Planning frames (agent) ..."
             ensure_local_llm_running
-            # Signal the idle-monitor that ComfyUI is expected up for image gen,
-            # so it reclaims VRAM to NInfer + writes a handoff if ComfyUI goes stuck.
-            touch "$OUTPUT_DIR/.gen_phase_active"
+            # The agent only PLANS: ComfyUI cannot run beside its LLM. It writes
+            # frame_spec.json; generate_frames.py renders it with the GPU handed
+            # to ComfyUI and writes frame_meta.json for the video step.
             write_prompt "$CLIP_DIR/prompt_image.txt" \
-                "Generate frames for $SHOT_ID. Read $CLIP_DIR/reviewed_prompt.json for mode. If composited_i2v: load location ref, use Qwen Image 2.1 edit to composite characters. If reference: skip frame gen. If fl2va: use prev_clip_lastframe.png as first frame input. CONTINUITY REFERENCES (use as visual guides for spatial layout, lighting, character positions): prev_clip_lastframe.png = end of previous clip (match this for start of current), scene_establishing_frame.png = room layout anchor (doors, windows, furniture positions), next_clip_firstframe.png = start of next clip (match this for end of current, if available). ComfyUI: $COMFYUI_URL. Save to $CLIP_DIR/"
-            run_dsh_agent "image-generator" "$CLIP_DIR/prompt_image.txt" "$CLIP_DIR/frame_meta.json"
+                "Plan the keyframes for $SHOT_ID — DO NOT call ComfyUI (it is down while you run; the pipeline renders your spec). Read $CLIP_DIR/reviewed_prompt.json (h3_mode, final_prompt, reference_assignments), $RUN_DIR/shot_list.json (this shot's camera, characters_in_frame with positions/hand_position/facing, location_id, lighting, edit.cut_in/cut_out, readable_props) and the manifests $RUN_DIR/character_manifest.json / $RUN_DIR/location_manifest.json for reference image paths. Write $CLIP_DIR/frame_spec.json: {\"mode\": \"composited_i2v|first_frame_only|first_last_frame|reference\", \"frames\": [{\"role\": \"first_frame\", \"prompt\": <Qwen Image 2.1 prompt: shot size FIRST and LAST, every character exactly once with position/pose/gaze from edit.cut_in, the location's layout, lighting, readable prop values verbatim>, \"references\": [<abs paths: ONE design sheet per character in frame, the location plate, and continuity frames prev_clip_lastframe.png / scene_establishing_frame.png if present in $CLIP_DIR>], \"width\": 1344, \"height\": 768}, {\"role\": \"last_frame\", ...only for first_last_frame, pose from edit.cut_out}], \"video_references\": [{\"tag\": \"<Subject N>\", \"image\": <abs path>, \"role\": ...}]}. For mode reference write frames: [] (no keyframe needed). Never name an object you want absent (Qwen ignores negatives); describe only what IS in frame."
+            run_dsh_agent "image-generator" "$CLIP_DIR/prompt_image.txt" "$CLIP_DIR/frame_spec.json"
+            touch "$OUTPUT_DIR/.gen_phase_active"
+            if python3 "$PACK_DIR/pipeline/generate_frames.py" --shot-dir "$CLIP_DIR" --run-dir "$RUN_DIR" \
+                    --comfyui-url "$COMFYUI_URL" --keep-gpu >> "$RUN_DIR/pipeline.log" 2>&1; then
+                log "[$SHOT_ID] frames rendered"
+            else
+                log "[$SHOT_ID] WARNING: generate_frames.py failed — video step will use references only"
+            fi
             rm -f "$OUTPUT_DIR/.gen_phase_active"
         fi
 
@@ -1895,10 +1853,30 @@ swap_to_27b
 # 3a. Narration
 if ! skip_if_done "$RUN_DIR/audio/narration/narration_meta.json" "Narration"; then
     step "3a. Narration (Kokoro — no lip sync)"
+    mkdir -p "$RUN_DIR/audio/narration"
     write_prompt "$RUN_DIR/prompt_narration.txt" \
-        "Generate ALL narration audio. Read $RUN_DIR/story.json for narrator lines per scene. Use Kokoro (port 9881). Time to align with clips. This is post-production only — NO lip sync. Save to $RUN_DIR/audio/narration/"
+        "Prepare ALL narration audio jobs — DO NOT call any TTS port (the engines are down while you run; the pipeline renders). Read $RUN_DIR/story.json (narrator lines per scene), $RUN_DIR/shot_list.json (narration spans: span_clips, which clip each block starts on) and the narrator entry of $RUN_DIR/audio/voices/voice_config.json (engine/voice/reference_audio/post_fx — use EXACTLY that cast, never Kokoro unless the cast says so). Write $RUN_DIR/audio/narration/tts_jobs.json: {\"jobs\": [{\"id\": \"N1\", \"engine\": ..., \"voice\"/\"reference_audio\"/\"post_fx\" from the cast, \"text\": <one narration block, sentence-level punctuation kept, ~2.2 words/s pace>, \"out\": \"$RUN_DIR/audio/narration/N1.wav\"}, ...]} and $RUN_DIR/audio/narration/narration_meta.json: {\"blocks\": [{\"id\": \"N1\", \"scene_id\": ..., \"span_clips\": [...], \"starts_on\": <first clip id>, \"text\": ..., \"file\": \"N1.wav\"}]} (durations are filled in by the renderer). Narration is post-only — NO lip sync, never overlaps dialogue clips."
     run_dsh_agent "audio-producer" "$RUN_DIR/prompt_narration.txt" "$RUN_DIR/audio/narration/narration_meta.json"
-    notify "Narration audio generated" "Audio Producer"
+    if python3 "$PACK_DIR/pipeline/tts_render.py" --jobs "$RUN_DIR/audio/narration/tts_jobs.json" --run-dir "$RUN_DIR" >> "$RUN_DIR/pipeline.log" 2>&1; then
+        log "narration rendered"
+    else
+        log "WARNING: some narration jobs failed — see $RUN_DIR/audio/narration/tts_jobs.results.json"
+    fi
+    python3 - "$RUN_DIR/audio/narration" <<'PYEOF'
+import json, os, sys
+d = sys.argv[1]
+try:
+    meta = json.load(open(os.path.join(d, "narration_meta.json")))
+    res = {r["id"]: r for r in json.load(open(os.path.join(d, "tts_jobs.results.json")))["results"]}
+except Exception as e:
+    print(f"narration meta merge skipped: {e}"); sys.exit(0)
+for b in meta.get("blocks", []):
+    r = res.get(b.get("id"))
+    if r:
+        b["duration_s"] = r.get("duration_s"); b["status"] = r.get("status"); b["file"] = os.path.basename(r.get("out") or b.get("file", ""))
+json.dump(meta, open(os.path.join(d, "narration_meta.json"), "w"), indent=2)
+PYEOF
+    notify "Narration audio rendered ($(python3 -c "import json;r=json.load(open('$RUN_DIR/audio/narration/tts_jobs.results.json'));print(r['ok'],'/',r['jobs'])" 2>/dev/null || echo '?'))" "Audio Producer"
 fi
 
 # 3b. Music

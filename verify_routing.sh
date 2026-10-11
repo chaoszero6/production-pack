@@ -1,10 +1,12 @@
 #!/bin/bash
-# Verify every pack preset actually launches through its routed OpenRouter model.
+# Verify every pack preset actually launches through its routed model (local Strata / cloud vision).
 # Read-only apart from rewriting agent-default-model (which the pipeline does anyway).
 cd /root/desktop/deepseek-harness || exit 1
 set -a; . /root/.hermes/.env >/dev/null 2>&1; set +a
 export DSH_PERMISSION_MODE=danger-full-access
-export CLOUD_ROUTING=1
+# Reasoning + execution run on the local Strata LLM; make sure it is serving first.
+export CLOUD_ROUTING=0
+bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipeline/gpu_owner.sh" llm >/dev/null || echo "WARNING: local LLM not healthy"
 
 PACK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 printf "%-23s %-42s %-6s %s\n" "PRESET" "ROUTE" "EXIT" "OUTPUT"

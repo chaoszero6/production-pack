@@ -30,8 +30,15 @@ Provider names must match registered providers in your DSH profiles.
 Model identifiers must also be registered under that provider.
 Leave blank to use built-in defaults below.
 
-FALLBACK: If the cloud provider returns 402/429, the script detects it
-and falls back to local NInfer. Requires CLOUD_ROUTING=0 in run.sh.
+DEFAULT ROUTE (2026-10-11): reasoning AND execution tiers run on the LOCAL
+Qwen 3.8 Flash Next 125B served by Strata (dsh provider "strata-swift",
+model swift-1.5-iq3_xxs, http://127.0.0.1:8321/v1, effort xhigh,
+maxTokens 131072 in the headless profile). It is TEXT ONLY, so the vision
+tier (qa-inspector) stays on OpenRouter gemini-3-flash-preview.
+The unit/port/model constants live in pipeline/local_llm.py — change them there.
+
+FALLBACK: If a cloud provider returns 402/429, the script detects it
+and falls back to the local LLM. Requires CLOUD_ROUTING=0 in run.sh.
 
 NOTE: dsh resolves the model from agent-default-model AT LAUNCH, so it
 must be rewritten before every dsh call.
@@ -55,6 +62,9 @@ try:
     import requests
 except ImportError:
     requests = None
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import local_llm  # noqa: E402  (single source of truth for the local LLM)
 
 SETTINGS = os.environ.get("DSH_SETTINGS", "/root/.dsh/settings.yaml")
 
@@ -83,7 +93,10 @@ _DEFAULTS = {
     # ── Local ninfer-qwen36-35b — primary execution & vision provider ────
     ("ninfer-qwen36-35b",  "execution"):  ("qwen3.6-35b-a3b",                "xhigh"),
     ("ninfer-qwen36-35b",  "vision"):     ("qwen3.6-35b-a3b",                "xhigh"),
-    # ── Local Qwen 3.8 27B — primary provider for all tiers ────────────────
+    # ── Local Strata Swift (Qwen 3.8 Flash Next 125B) — PRIMARY reasoning+execution ──
+    (local_llm.PROVIDER, "reasoning"): (local_llm.MODEL,                     local_llm.EFFORT),
+    (local_llm.PROVIDER, "execution"): (local_llm.MODEL,                     local_llm.EFFORT),
+    # ── Retired local Qwen 3.8 27B (ninfer units are masked on 207) ────────
     ("ninfer",         "reasoning"):  ("qwen3.8-27b",                        "xhigh"),
     ("ninfer",         "execution"):  ("qwen3.8-27b",                        "xhigh"),
     ("ninfer",         "vision"):     ("qwen3.8-27b",                        "xhigh"),
@@ -93,8 +106,9 @@ _DEFAULTS = {
 
 
 # Read env vars at import time
-_REASONING_LOCAL_DEFAULT = "ninfer"            # Local Qwen 3.8 27B for reasoning
-_EXECUTION_LOCAL_DEFAULT = "ninfer"            # Local Qwen 3.8 27B for execution/vision
+_REASONING_LOCAL_DEFAULT = local_llm.PROVIDER  # Strata Swift — Qwen 3.8 Flash Next (local)
+_EXECUTION_LOCAL_DEFAULT = local_llm.PROVIDER  # same model, same xhigh effort
+_VISION_DEFAULT          = "openrouter"        # Strata is text-only; QA needs pixels
 _CLOUD_DEFAULT           = "openrouter"        # fallback base
 
 REASONING_PROVIDER   = _env("DSH_REASONING_PROVIDER",   _REASONING_LOCAL_DEFAULT)
@@ -105,7 +119,7 @@ EXECUTION_PROVIDER   = _env("DSH_EXECUTION_PROVIDER",   _EXECUTION_LOCAL_DEFAULT
 EXECUTION_MODEL_ENV  = _env("DSH_EXECUTION_MODEL",       None)
 EXECUTION_EFFORT_ENV = _env("DSH_EXECUTION_EFFORT",      None)
 
-VISION_PROVIDER      = _env("DSH_VISION_PROVIDER",      _EXECUTION_LOCAL_DEFAULT)
+VISION_PROVIDER      = _env("DSH_VISION_PROVIDER",      _VISION_DEFAULT)
 VISION_MODEL_ENV     = _env("DSH_VISION_MODEL",          None)
 VISION_EFFORT_ENV    = _env("DSH_VISION_EFFORT",         None)
 
@@ -194,8 +208,9 @@ VISION_PRESETS = {
     "qa-inspector",
 }
 
-# Local fallback tier — NInfer services for CLOUD_ROUTING=0 mode
+# Local fallback tier — the Strata unit first, retired NInfer units after it
 LOCAL_ALTS = (
+    (local_llm.PROVIDER, local_llm.MODEL, local_llm.UNIT, local_llm.HEALTH_URL),
     ("ninfer", "qwen3.8-27b", "ninfer.service", "http://127.0.0.1:8080/health"),
     (
         "ninfer-us",
@@ -256,8 +271,8 @@ def _try_cloud_route(provider, model, effort):
     if provider.startswith("opencode-go"):
         return provider, model, effort
     
-    # Skip for ninfer variants — handled separately
-    if provider.startswith("ninfer") or provider == "local-qwen-q6k":
+    # Skip for local providers — their lifecycle is handled by local_llm / run.sh
+    if provider.startswith("ninfer") or provider in ("local-qwen-q6k", local_llm.PROVIDER):
         return provider, model, effort
     
     ok = True
@@ -294,20 +309,27 @@ def _try_cloud_route(provider, model, effort):
 
 
 def _fallback_to_local():
-    """Find the first healthy local LLM service and return its route."""
+    """Find the first healthy local LLM service and return its route.
+
+    The Strata unit is tried first; if nothing answers it is STARTED here
+    (≈2 min) because a route to a dead provider only produces
+    "TRANSPORT: Connection error" three retries later."""
     for name, model, unit, health_url in LOCAL_ALTS:
         try:
             r = requests.get(health_url, timeout=3)
             if r.status_code == 200:
-                return name, model, "xhigh"
+                return name, model, local_llm.EFFORT
         except Exception:
             continue
 
-    # No local LLM healthy — warn user
+    print(f"[set_agent_model] no local LLM healthy — starting {local_llm.UNIT} "
+          f"(≈2 min)", file=sys.stderr)
+    if local_llm.start():
+        return local_llm.PROVIDER, local_llm.MODEL, local_llm.EFFORT
     units = ", ".join(u for _, _, u, _ in LOCAL_ALTS)
     print(f"[set_agent_model] WARNING: no local LLM healthy ({units}). "
           "Agent call will likely fail.", file=sys.stderr)
-    return "ninfer", "qwen3.8-27b", "xhigh"
+    return local_llm.PROVIDER, local_llm.MODEL, local_llm.EFFORT
 
 
 # ── Main entry point ────────────────────────────────────────
@@ -319,6 +341,13 @@ def main():
 
     preset = sys.argv[1]
     show_only = "--show" in sys.argv
+
+    # run.sh calls `set_agent_model.py --mark-exhausted "<reason>"` on a runtime
+    # 402/429 so the next route skips the cloud without re-probing it.
+    if preset == "--mark-exhausted":
+        _mark_cloud_exhausted(" ".join(sys.argv[2:]) or "runtime error")
+        print("[set_agent_model] cloud marked exhausted", file=sys.stderr)
+        return 0
 
     # Determine which provider to use based on preset type
     if preset in PRO_PRESETS:
@@ -341,6 +370,14 @@ def main():
     if show_only:
         print(f"{preset} -> {provider}/{model} (effort={effort})")
         return 0
+
+    # A local route is only useful if the service answers — start it (≈2 min) if not.
+    if provider == local_llm.PROVIDER and not local_llm.healthy():
+        print(f"[set_agent_model] {local_llm.UNIT} not serving — starting it before routing",
+              file=sys.stderr)
+        if not local_llm.start():
+            print(f"[set_agent_model] WARNING: {local_llm.UNIT} did not come up; "
+                  "the agent call will fail with a transport error", file=sys.stderr)
 
     # Check if cloud is exhausted — auto-fallback
     if _is_cloud_exhausted():
