@@ -845,6 +845,39 @@ restart_comfyui_clean() {
     systemctl restart comfyui.service 2>/dev/null || true
 }
 
+# Wait for the local LLM's "I am back" announcement: output/.llm_ready written
+# by pipeline/llm_ready_notify.sh (ExecStartPost of the Strata unit) newer than
+# the failure, or the API answering directly. If the unit is not even starting
+# (parked by a render that is still running), kick it: llm_monitor.py would do
+# the same on its next pass, but the agent turn is waiting right now.
+_wait_llm_ready() {
+    local timeout="${1:-330}" since waited=0 ready="$OUTPUT_DIR/.llm_ready"
+    local health="${LLM_HEALTH_URL:-http://127.0.0.1:8321/v1/models}"
+    local unit="${LLM_UNIT:-strata-swift-iq3-xxs.service}"
+    since=$(date +%s)
+    while [ "$waited" -lt "$timeout" ]; do
+        if [ -f "$ready" ] && [ "$(stat -c %Y "$ready" 2>/dev/null || echo 0)" -ge "$since" ]; then
+            log "LLM announced it is back ($(cat "$ready" 2>/dev/null | head -c 160)) — resuming"
+            return 0
+        fi
+        if curl -sf --max-time 4 "$health" > /dev/null 2>&1; then
+            log "LLM answering again after ${waited}s — resuming"
+            return 0
+        fi
+        if [ "$waited" -ge 20 ] && [ ! -f "$OUTPUT_DIR/.llm_parked" ] && \
+           [ "$(systemctl is-active "$unit" 2>/dev/null)" != "active" ] && \
+           [ "$(systemctl is-active "$unit" 2>/dev/null)" != "activating" ]; then
+            log "LLM unit is $(systemctl is-active "$unit" 2>/dev/null) and not parked — starting it (≈2 min)"
+            systemctl reset-failed "$unit" 2>/dev/null || true
+            systemctl start "$unit" 2>/dev/null || true
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    log "WARNING: LLM did not come back within ${timeout}s — retrying the turn anyway"
+    return 1
+}
+
 # ── Public Agent Launcher ─────────────────────────────────────
 # This is the function called throughout run.sh by every pipeline step.
 # It delegates to _run_dsh_agent_with_phase for VRAM-safe transitions,
@@ -866,8 +899,13 @@ restart_comfyui_clean() {
         # Detect a transient transport/admission failure from the stderr log
         local errfile="${RUN_DIR}/${preset}_stderr.log"
         if grep -qE 'TRANSPORT: Connection error|expired while waiting for admission|PI_AI_ERROR' "$errfile" 2>/dev/null; then
-            log "[$preset] transient transport error (attempt $attempt/3) — backing off and retrying"
-            sleep 5
+            # The usual cause: ComfyUI/TTS took the GPU and the Strata unit was
+            # stopped mid-turn. Its ExecStartPost (pipeline/llm_ready_notify.sh)
+            # writes output/.llm_ready once the API answers again — wait for
+            # that announcement (≤ 330 s, ≈2 min typical) and then re-issue the
+            # SAME prompt file; agent turns are idempotent (every output is a file).
+            log "[$preset] transient transport error (attempt $attempt/3) — waiting for the LLM to announce it is back"
+            _wait_llm_ready 330
             attempt=$((attempt+1))
             continue
         fi
