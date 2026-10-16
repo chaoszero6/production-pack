@@ -21,6 +21,7 @@ prompts before they are sent to MiniMax H3 for video generation.
 | Camera | official vocabulary, one sentence with amplitude + speed | anything else is ignored |
 | Mode | the one `run.sh` passes (from the shot list) | the reviewer's old ref2va default discarded rendered first frames |
 | Retry | rewrite from the shot list + top 3 structural corrections | appending corrections is how prompts bloat |
+| Compositions | exactly one: `[Shot 1]` opens on this shot's framing and subject | H3 renders every composition it reads and cuts between them (S01_004 ×3: the previous clip's quay layout was described first) |
 
 ## Review Process
 

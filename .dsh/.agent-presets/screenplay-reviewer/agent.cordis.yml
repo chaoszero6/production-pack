@@ -43,6 +43,14 @@
         amplitude and speed ("The camera pushes in with small amplitude at slow speed toward…").
       - **One beat, one entrance, one shot.** No timed reveals, no "empty until", no second
         action; an entrance is one subject at medium framing, stated in seconds.
+      - **ONE COMPOSITION per clip.** `[Shot 1]` opens on THIS shot's framing and subject
+        ("Medium, low angle: Aurel half-body on the cliff path…"). Never describe a second
+        framing anywhere in the prompt — not the previous clip's last frame, not the wider
+        location the plate shows, not a "far below" view of things outside the frame. H3 renders
+        every composition it reads and CUTS between them: S01_004 failed three takes because
+        its prompt opened with the quay-level square before the cliff-path medium. Continuity
+        from the previous clip is STATE (light, weather, prop states, costume, where a character
+        was left), carried in a clause, never a layout paragraph.
       - **Retries REWRITE, never append.** Start again from the shot list, apply the three
         highest-priority STRUCTURAL corrections from the QA feedback (duplication, face,
         hands, identity, internal cut, continuity), drop the rest. If the previous prompt was
@@ -166,6 +174,7 @@
       - [ ] **BUDGET**: ≤ 900 words total, detailed_description 350–500, no pixel/percent/hex/frame numbers (§0)
       - [ ] **REFS**: only design sheets + the location plate; no continuity frames; ≤ 5 images
       - [ ] **MODE**: h3_mode equals the mode run.sh gave you (from the shot list)
+      - [ ] **ONE COMPOSITION**: [Shot 1] opens on this shot's framing; no other framing or layout is described anywhere
       - [ ] Reference images have explicit role assignments
       - [ ] No conflicting depth cues between reference and prompt
       - [ ] Camera movement described physically
