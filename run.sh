@@ -1322,6 +1322,59 @@ PYEOF
     fi
 fi
 
+# ── Per-scene gate: lint + Director fix right before a scene's first clip ──────────
+# The 1b-lint step only runs in Phase 1, so a resumed run (and a story whose later scenes
+# were never fixed) would carry copy-pasted actions, counted crowds and 4-character frames
+# into H3 and burn three takes each before escalating. Gate each scene once, just in time:
+# skip if any clip of the scene already PASSED (never rewrite a scene mid-production).
+# The Director keeps the SAME shot ids and count (the clip loop iterates a fixed list).
+scene_gate() {
+    local scene="$1"
+    local rep="$RUN_DIR/shot_list_lint_${scene}.json"
+    local fix="$RUN_DIR/shot_list_${scene}.fix.json"
+    if python3 - "$RUN_DIR" "$scene" <<'PYEOF'
+import json, os, sys
+run_dir, scene = sys.argv[1:3]
+for s in json.load(open(os.path.join(run_dir, "shot_list.json")))["shots"]:
+    if s.get("scene_id") != scene:
+        continue
+    v = os.path.join(run_dir, "clips", s["shot_id"], "qa_verdict.json")
+    try:
+        if json.load(open(v)).get("verdict") == "PASS":
+            sys.exit(0)   # scene already in production — do not touch it
+    except Exception:
+        pass
+sys.exit(1)
+PYEOF
+    then
+        log "[gate $scene] a clip of this scene already passed — scene is locked, no rewrite"
+        return 0
+    fi
+    local rounds=0 lint_out=""
+    while ! lint_out=$(python3 "$PACK_DIR/pipeline/shot_list_lint.py" --shots "$RUN_DIR/shot_list.json" \
+            --run-dir "$RUN_DIR" --scene "$scene" --out "$rep" --fix 2>&1); do
+        log "[gate $scene] $lint_out"
+        rounds=$((rounds + 1))
+        if [ "$rounds" -gt 2 ]; then
+            notify "Scene $scene still has blocking H3-envelope issues after $rounds Director fixes — continuing; QA will judge (see $rep)" "Scene Gate"
+            return 0
+        fi
+        local ids
+        ids=$(python3 -c "import json; print(', '.join(s['shot_id'] for s in json.load(open('$RUN_DIR/shot_list.json'))['shots'] if s.get('scene_id')=='$scene'))")
+        write_prompt "$RUN_DIR/prompt_director_gate_${scene}.txt" \
+            "Fix ONLY the shots of $scene ($ids) in $RUN_DIR/shot_list.json. Read $rep (the blocking issues) and $RUN_DIR/story.json for that scene. Keep the SAME shot ids, the same count and order, the same narration/dialogue assignments and the same scene_id. Rules (knowledge/minimax_h3_rules.md section 0): each character in characters_in_frame gets its OWN action, hand_position, expression and facing written for THIS shot (never the same string on two characters; creatures get a body pose, no hands); at most 3 named characters per frame (drop the least important to 'a few distant figures, backs to camera' in action_description); a montage shot keeps its single strongest beat, the other beats are dropped (do NOT add shots); no counted crowds; extreme-wide shots carry no named characters and no faces; faces only at medium or closer; duration 5-8 s (10 s max without dialogue); the picture illustrates the narration line over it; reference_images.source only canonical existing files (locations/<id>/<id>.png, characters/<id>/<id>_side.png). Keep every editing-grammar field (edit.cut_in/cut_out, handles, readable_props). Write ONLY {\"shots\": [...]} for these $(echo "$ids" | tr ',' '\n' | wc -l) shots, same schema, to $fix. Do NOT modify shot_list.json."
+        rm -f "$fix"
+        run_dsh_agent "director" "$RUN_DIR/prompt_director_gate_${scene}.txt" "$fix" || true
+        if [ -s "$fix" ] && python3 "$PACK_DIR/pipeline/splice_scene.py" "$RUN_DIR/shot_list.json" "$scene" "$fix" 2>&1 | tee -a "$RUN_DIR/pipeline.log"; then
+            log "[gate $scene] Director fix round $rounds spliced"
+        else
+            log "[gate $scene] Director fix round $rounds rejected or missing — retrying"
+        fi
+    done
+    log "[gate $scene] $lint_out"
+    return 0
+}
+
 for SHOT_ID in $SHOT_IDS; do
     CURRENT=$((CURRENT + 1))
     CLIP_DIR="$RUN_DIR/clips/$SHOT_ID"
@@ -1331,6 +1384,13 @@ for SHOT_ID in $SHOT_IDS; do
     if ! should_process_clip "$SHOT_ID"; then
         log "SKIP (filter): $SHOT_ID"
         continue
+    fi
+
+    SHOT_SCENE=$(python3 -c "import json; print(next((s.get('scene_id','') for s in json.load(open('$RUN_DIR/shot_list.json'))['shots'] if s.get('shot_id')=='$SHOT_ID'), ''))" 2>/dev/null || echo "")
+    if [ -n "$SHOT_SCENE" ] && [ "$SHOT_SCENE" != "${LAST_GATED_SCENE:-}" ]; then
+        LAST_GATED_SCENE="$SHOT_SCENE"
+        ensure_local_llm_running
+        scene_gate "$SHOT_SCENE"
     fi
 
     # Resume: skip clips that already passed QA

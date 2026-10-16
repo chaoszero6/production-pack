@@ -198,6 +198,7 @@ def main():
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--out", default=None)
     ap.add_argument("--fix", action="store_true", help="apply mechanical fixes in place")
+    ap.add_argument("--scene", default=None, help="lint only the shots of this scene_id")
     a = ap.parse_args()
     try:
         data = load(a.shots)
@@ -208,11 +209,12 @@ def main():
     if not isinstance(shots, list):
         print("shot_list_lint: no 'shots' list", file=sys.stderr)
         return 2
-    issues = lint(shots, a.run_dir, a.fix)
+    subset = [s for s in shots if not a.scene or s.get("scene_id") == a.scene]
+    issues = lint(subset, a.run_dir, a.fix)
     if a.fix and any(i["auto_fixed"] for i in issues):
         atomic_write(a.shots, data)
     blocking = [i for i in issues if i["blocking"]]
-    report = {"shots": len(shots), "issues": issues, "blocking": len(blocking),
+    report = {"shots": len(subset), "scene": a.scene, "issues": issues, "blocking": len(blocking),
               "advisory": len(issues) - len(blocking),
               "auto_fixed": sum(1 for i in issues if i["auto_fixed"])}
     if a.out:
@@ -221,7 +223,7 @@ def main():
     for i in issues:
         by_type[i["type"]] = by_type.get(i["type"], 0) + 1
     summary = ", ".join(f"{k} {v}" for k, v in sorted(by_type.items())) or "clean"
-    print(f"[shot_list_lint] {len(shots)} shots: {len(blocking)} blocking, "
+    print(f"[shot_list_lint] {len(subset)} shots{' of ' + a.scene if a.scene else ''}: {len(blocking)} blocking, "
           f"{len(issues) - len(blocking)} advisory ({summary})"
           + (f" -> {a.out}" if a.out else ""))
     for i in blocking[:12]:
