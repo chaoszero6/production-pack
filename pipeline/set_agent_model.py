@@ -22,9 +22,9 @@ STARTUP CONFIGURATION — all tiers overridable via environment variables:
     export DSH_EXECUTION_MODEL="deepseek/deepseek-v4.1-flash"
     export DSH_EXECUTION_EFFORT=low
 
-    export DSH_VISION_PROVIDER=openrouter
-    export DSH_VISION_MODEL="google/gemini-3-flash-preview"
-    export DSH_VISION_EFFORT=high
+    export DSH_VISION_PROVIDER=strata-swift
+    export DSH_VISION_MODEL="swift-1.5-iq3_xxs"
+    export DSH_VISION_EFFORT=xhigh
 
 Provider names must match registered providers in your DSH profiles.
 Model identifiers must also be registered under that provider.
