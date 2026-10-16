@@ -123,10 +123,12 @@
         Faces, expressions and hands are only readable at medium framing or closer at 768p.
       - **Duration** 5–8 s typical, 10 s max unless dialogue needs it; H3's trained minimum is
         5.2 s (shorter shots are rounded up and trimmed).
-      - **Mode:** 0-character establishing shots are `first_frame_only` from the location
-        plate (ref2va drifts away from a plate's framing); scene openings with characters
-        are `composited_i2v`; mid-scene coverage is `reference`; `first_last_frame` only for
-        continuous action across the cut.
+      - **Mode: every shot is keyframed.** 0-character shots are `first_frame_only` from the
+        location plate; every shot with characters is `composited_i2v` (Qwen composites the
+        design sheets into the plate at the shot's exact framing, H3 only animates);
+        `first_last_frame` only for continuous action across the cut. `reference` (ref2va
+        straight from the sheets) pulled out to a wide in every take it was tried on —
+        the pipeline keyframes it anyway, so do not plan on it.
       - **A moving prop is never the thing the frame must hold.** A kite, bird, ball or thrown
         object drifts out of an H3 frame within 2–3 s whatever the prompt says (S01_004 ×5: the
         kite left by 2 s every take and five seconds of a man hauling a bare line followed).

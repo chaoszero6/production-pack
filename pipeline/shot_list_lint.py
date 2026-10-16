@@ -166,6 +166,14 @@ def lint(shots, run_dir, fix):
         refs = ks.get("reference_images") or []
         has_plate = any("location" in str(r.get("role") or "").lower() or "/locations/" in str(r.get("source") or "")
                         for r in refs if isinstance(r, dict))
+        if chars and mode in ("reference", "ref2va"):
+            if fix:
+                ks["mode"] = "composited_i2v"
+                ks["first_frame_source"] = "Qwen Image 2.1 composite of the design sheets into the plate (every shot is keyframed; ref2va drifts wide)"
+                s["keyframe_strategy"] = ks
+                add(sid, "keyframe_mode", False, "reference with named characters -> composited_i2v (every shot is keyframed)", fixed=True)
+            else:
+                add(sid, "keyframe_mode", False, "reference with named characters: ref2va drifts wide — use composited_i2v")
         if not chars and mode in ("reference", "ref2va") and has_plate:
             if fix:
                 ks["mode"] = "first_frame_only"

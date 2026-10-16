@@ -644,6 +644,22 @@ def main():
         if dialogue_name:
             log(f"  Dialogue audio uploaded for lip sync")
 
+    # i2va needs a frame: a rendered keyframe, a composite, or (0-character shots) the plate.
+    # With none of them the clip falls back to ref2va instead of failing the take.
+    i2va_img = None
+    if h3_mode == "i2va":
+        composited = os.path.join(shot_dir, "composited_frame.png")
+        first_frame = _shot_path(shot_dir, frame_meta.get("first_frame"))
+        i2va_img = composited if os.path.exists(composited) else first_frame
+        if not i2va_img or not os.path.exists(i2va_img):
+            plate = _first_plate(rp, frame_meta, run_dir)
+            if plate:
+                log(f"  no rendered first frame — using the location plate as first frame: {plate}")
+                i2va_img = plate
+        if not i2va_img or not os.path.exists(i2va_img):
+            log("WARNING: no keyframe for i2va — falling back to ref2va with the reference images")
+            h3_mode = "ref2va"
+
     # Upload reference images and build workflow
     if h3_mode == "ref2va":
         ref_assignments = rp.get("reference_assignments", [])
@@ -710,20 +726,7 @@ def main():
         workflow = build_fl2va_workflow(prompt_text, ff_name, lf_name, duration_s, dialogue_name)
 
     elif h3_mode == "i2va":
-        composited = os.path.join(shot_dir, "composited_frame.png")
-        first_frame = _shot_path(shot_dir, frame_meta.get("first_frame"))
-        img_path = composited if os.path.exists(composited) else first_frame
-        if not img_path or not os.path.exists(img_path):
-            # 0-character plate shots (first_frame_only without a render): the location
-            # plate itself is the first frame — i2va holds its framing, ref2va does not.
-            plate = _first_plate(rp, frame_meta, run_dir)
-            if plate:
-                log(f"  no rendered first frame — using the location plate as first frame: {plate}")
-                img_path = plate
-
-        if not img_path or not os.path.exists(img_path):
-            log("ERROR: no image found for i2va mode")
-            return 1
+        img_path = i2va_img
 
         img_name = upload_image(img_path, COMFYUI)
         if not img_name:

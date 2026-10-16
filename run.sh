@@ -1566,7 +1566,10 @@ try:
     m = (s.get("keyframe_strategy") or {}).get("mode") or (s.get("production_notes") or {}).get("minimax_h3_mode") or "reference"
 except Exception:
     pass
-table = {"reference": "ref2va", "ref2va": "ref2va", "composited_i2v": "i2va", "first_frame_only": "i2va",
+# Every shot is keyframed (rules §0.1): ref2va pulled every reference-mode take out to a wide
+# (S01_001 x10, S01_004 take 6) while i2va from a composited keyframe held its framing in every
+# take. "reference" therefore maps to i2va too; ref2va only remains for text_only shots.
+table = {"reference": "i2va", "ref2va": "i2va", "composited_i2v": "i2va", "first_frame_only": "i2va",
          "first_from_previous": "i2va", "i2va": "i2va", "first_last_frame": "fl2va", "fl2va": "fl2va", "text_only": "ref2va"}
 mode = table.get(str(m).lower(), "ref2va")
 # a rendered first frame from an earlier take forces i2va (never discard it again)
@@ -1769,7 +1772,8 @@ try:
     shots = json.load(open('$RUN_DIR/shot_list.json'))['shots']
     s = next(x for x in shots if x.get('shot_id') == '$SHOT_ID')
     mode = str((s.get('keyframe_strategy') or {}).get('mode') or 'reference').lower()
-    print('no' if mode in ('reference', 'ref', 'ref2va', 't2v', 'text_only', 'text_to_video') else 'yes')
+    # every shot renders a keyframe (ref2va drifts wide); only text_only skips it
+    print('no' if mode in ('t2v', 'text_only', 'text_to_video') else 'yes')
 except Exception:
     print('yes')
 " 2>/dev/null || echo yes)
