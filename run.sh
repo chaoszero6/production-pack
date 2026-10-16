@@ -1092,8 +1092,9 @@ if ! skip_if_done "$RUN_DIR/shot_list.json" "Director"; then
     step "1b. Director — creating shot list"
     write_prompt "$RUN_DIR/prompt_director.txt" \
         "Read the structured story at $RUN_DIR/story.json. Create a complete shot list following the shot-list-schema skill. For each scene, plan shots:
-- Duration: 3-15 seconds per clip
-- Mode: ref2va (default), composited_i2v (new scenes with characters), fl2va (continuity only)
+- Duration: 5-8 seconds per clip (10 s max unless dialogue needs it; H3 minimum 5.2 s)
+- Mode: reference (mid-scene coverage), composited_i2v (scene openings with characters), first_frame_only (0-character establishing shots from the plate), first_last_frame (continuous action only)
+- H3 ENVELOPE (knowledge/minimax_h3_rules.md section 0, enforced by shot_list_lint.py): ONE beat per shot (a montage = one shot per beat); <= 3 named characters per frame, extras are 'a few distant figures, backs to camera' and never counted; EACH character gets its own action / hand_position / expression (no copy-paste); extreme-wide shots carry no named characters and no faces; faces and hands only at medium or closer; the picture must illustrate the narration line laid over it; reference_images.source only canonical files (characters/<id>/<id>_side.png, locations/<id>/<id>.png)
 - Mark which shots have DIALOGUE (needs lip sync) vs NARRATION (no lip sync)
 - Specify camera, characters, hand positions, identity anchors
 - EDITING (editing-grammar skill, mandatory): consecutive shots in a scene differ by subject, >= 2 shot sizes or >= 30 degrees (no jump cuts); never three shots of the same size in a row; every shot has edit.handle_head_s / edit.handle_tail_s >= 1.0 INCLUDED in duration_seconds, edit.cut_in and edit.cut_out (pose, gaze, prop state, motion phase); every dialogue scene has a reaction single and an insert; readable_props (clock faces, counts) pinned per scene; transition_to_next.type = cut unless a story reason
@@ -1127,6 +1128,26 @@ if ! skip_if_done "$RUN_DIR/shot_list.json" "Director"; then
             || die "director edit-fix failed (check $RUN_DIR/pipeline.log)"
     done
     log "$EDIT_ISSUES"
+
+    # Lint the shot list against the H3 envelope — montage-in-one-shot, > 3 named
+    # characters, copy-pasted character actions, counted crowds, invented reference
+    # files (Cinderquay postmortem 2026-10-16, knowledge/minimax_h3_rules.md §0).
+    step "1b-lint. Shot List H3-Envelope Lint"
+    LINT_ROUNDS=0
+    while ! LINT_ISSUES=$(python3 "$PACK_DIR/pipeline/shot_list_lint.py" --shots "$RUN_DIR/shot_list.json" \
+            --run-dir "$RUN_DIR" --out "$RUN_DIR/shot_list_lint_report.json" --fix 2>&1); do
+        log "$LINT_ISSUES"
+        LINT_ROUNDS=$((LINT_ROUNDS + 1))
+        if [ "$LINT_ROUNDS" -gt 2 ]; then
+            notify "Shot list still has blocking H3-envelope issues after $LINT_ROUNDS fixes — continuing, see shot_list_lint_report.json" "Shot Lint"
+            break
+        fi
+        write_prompt "$RUN_DIR/prompt_director_lint_fix.txt" \
+            "Your shot list $RUN_DIR/shot_list.json breaks the MiniMax H3 envelope (knowledge/minimax_h3_rules.md section 0). Read $RUN_DIR/shot_list_lint_report.json and fix EVERY blocking issue: split a montage into one shot per beat (5-8 s each, new shot ids, renumber the scene); no more than 3 named characters in a frame (extras become 'a few distant figures, backs to camera' in action_description, never counted); write each character's OWN action, hand_position and expression (no identical strings between characters); extreme-wide shots carry no named characters and no faces. Keep every editing-grammar rule (handles, cut_in/cut_out, no jump cuts, readable_props). Rewrite $RUN_DIR/shot_list.json in place, same schema, valid JSON only."
+        run_dsh_agent "director" "$RUN_DIR/prompt_director_lint_fix.txt" "$RUN_DIR/shot_list.json" \
+            || die "director lint-fix failed (check $RUN_DIR/pipeline.log)"
+    done
+    log "$LINT_ISSUES"
 fi
 
 # Post shot plan summary to Discord
@@ -1280,7 +1301,7 @@ for SHOT_ID in $SHOT_IDS; do
     if [ "$RESUME" = "true" ] && [ -f "$CLIP_DIR/qa_verdict.json" ]; then
         RETRY=$(python3 -c "import json; print(json.load(open('$CLIP_DIR/qa_verdict.json')).get('retry_count', 0))" 2>/dev/null || echo 0)
     fi
-    MAX_RETRY=5
+    MAX_RETRY=3   # each take ≈ 30 min (review 8 + render 6 + QA 12 + two LLM reloads); best take is restored at escalation
     PASSED=false
 
     # ── Stage-level resume ──────────────────────────────────
@@ -1355,7 +1376,7 @@ except Exception:
                     log "[$SHOT_ID] Extracted last frame from prev clip $PREV_CLIP_ID" || \
                     log "[$SHOT_ID] WARNING: Could not extract last frame from $PREV_CLIP_ID"
             fi
-            [ -f "$PREV_LASTFRAME" ] && CONTINUITY_REFS="CONTINUITY ANCHOR (previous clip $PREV_CLIP_ID last frame): $PREV_LASTFRAME — Include as <Picture N> ref with role 'continuity anchor: match spatial layout, lighting, prop positions, character state'. This clip's FIRST FRAME must visually match this."
+            [ -f "$PREV_LASTFRAME" ] && CONTINUITY_REFS="CONTINUITY (previous clip $PREV_CLIP_ID last frame): $PREV_LASTFRAME — look at it and describe the matching start state IN WORDS in the first sentence of [Shot 1] (layout, light, prop positions, character state). It is NOT a ref2va reference and must NOT appear in reference_assignments: H3 copies the content of every reference into the clip (rules §0). The keyframe planner uses it for i2va/fl2va frames."
         fi
 
         # Extract scene establishing shot's first frame (room layout anchor)
@@ -1366,7 +1387,7 @@ except Exception:
                     log "[$SHOT_ID] Extracted establishing frame from scene first clip $FIRST_CLIP_ID" || \
                     log "[$SHOT_ID] WARNING: Could not extract establishing frame from $FIRST_CLIP_ID"
             fi
-            [ -f "$SCENE_FIRSTFRAME" ] && CONTINUITY_REFS="$CONTINUITY_REFS SCENE LAYOUT ANCHOR (establishing shot $FIRST_CLIP_ID first frame): $SCENE_FIRSTFRAME — Include as <Picture N> ref with role 'scene layout anchor: room geometry, window/door positions, furniture arrangement must match this establishing shot'."
+            [ -f "$SCENE_FIRSTFRAME" ] && CONTINUITY_REFS="$CONTINUITY_REFS SCENE LAYOUT (establishing shot $FIRST_CLIP_ID first frame): $SCENE_FIRSTFRAME — describe the room geometry / window and door positions in words; NOT a ref2va reference (the location plate already is one)."
         fi
 
         # Extract next clip's first frame if it exists (end-of-clip anchor for retries)
@@ -1377,7 +1398,9 @@ except Exception:
                     log "[$SHOT_ID] Extracted first frame from next clip $NEXT_CLIP_ID" || \
                     log "[$SHOT_ID] WARNING: Could not extract first frame from $NEXT_CLIP_ID"
             fi
-            [ -f "$NEXT_FIRSTFRAME" ] && CONTINUITY_REFS="$CONTINUITY_REFS END-OF-CLIP ANCHOR (next clip $NEXT_CLIP_ID first frame): $NEXT_FIRSTFRAME — Include as <Picture N> ref with role 'end anchor: this clip must END in a state that transitions smoothly to this frame'."
+            # NOT passed to the reviewer: feeding the next clip's first frame to ref2va as an
+            # "end anchor" copied its whole crowd into S01_001 (rules §0). The file stays on
+            # disk for the keyframe planner (fl2va last frame) only.
         fi
 
         # ── 2a. Screenplay Reviewer — skip if reviewed_prompt.json already done ──
@@ -1386,10 +1409,63 @@ except Exception:
         else
             log "[$SHOT_ID] Prompt review..."
             CORRECTIONS=""
-            [ -f "$CLIP_DIR/qa_verdict.json" ] && CORRECTIONS="Previous QA feedback: $(cat "$CLIP_DIR/qa_verdict.json")"
+            # Compact feedback: the verdict summary + up to 5 corrections. Dumping the whole
+            # verdict (16 corrections, pixel gates) is how prompts grew to 3 000 words.
+            [ -f "$CLIP_DIR/qa_verdict.json" ] && CORRECTIONS=$(python3 - "$CLIP_DIR/qa_verdict.json" <<'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+out = ["Previous take QA: " + str(d.get("verdict", "?"))]
+s = d.get("summary")
+if isinstance(s, str) and s.strip():
+    out.append("Summary: " + s.strip()[:600])
+sc = d.get("scores") or d.get("categories") or d.get("category_scores") or {}
+low = []
+for k, v in (sc.items() if isinstance(sc, dict) else []):
+    x = v.get("score") if isinstance(v, dict) else v
+    if isinstance(x, (int, float)) and x < 0.75:
+        low.append(f"{k} {x:.2f}")
+if low:
+    out.append("Low categories: " + ", ".join(low))
+corr = d.get("corrections") or d.get("prompt_corrections") or []
+lines = []
+for c in (corr if isinstance(corr, list) else [corr])[:5]:
+    t = c if isinstance(c, str) else (c.get("prompt_fix") or c.get("fix") or c.get("description") or json.dumps(c))
+    lines.append("- " + str(t).strip()[:300])
+if lines:
+    out.append("Top corrections (apply the structural ones, REWRITE the prompt, do not append):")
+    out.extend(lines)
+print(" ".join(out).replace("\n", " "))
+PYEOF
+)
+            SHOT_H3_MODE=$(python3 - "$RUN_DIR/shot_list.json" "$SHOT_ID" "$CLIP_DIR" <<'PYEOF'
+import json, os, sys
+m = "reference"
+try:
+    shots = json.load(open(sys.argv[1]))["shots"]
+    s = next(x for x in shots if x.get("shot_id") == sys.argv[2])
+    m = (s.get("keyframe_strategy") or {}).get("mode") or (s.get("production_notes") or {}).get("minimax_h3_mode") or "reference"
+except Exception:
+    pass
+table = {"reference": "ref2va", "ref2va": "ref2va", "composited_i2v": "i2va", "first_frame_only": "i2va",
+         "first_from_previous": "i2va", "i2va": "i2va", "first_last_frame": "fl2va", "fl2va": "fl2va", "text_only": "ref2va"}
+mode = table.get(str(m).lower(), "ref2va")
+# a rendered first frame from an earlier take forces i2va (never discard it again)
+try:
+    fm = json.load(open(os.path.join(sys.argv[3], "frame_meta.json")))
+    if mode == "ref2va" and isinstance(fm.get("first_frame"), str) and os.path.isfile(fm["first_frame"]):
+        mode = "fl2va" if isinstance(fm.get("last_frame"), str) and os.path.isfile(fm["last_frame"]) else "i2va"
+except Exception:
+    pass
+print(mode)
+PYEOF
+)
+            [ -z "$SHOT_H3_MODE" ] && SHOT_H3_MODE=ref2va
 
             write_prompt "$CLIP_DIR/prompt_review.txt" \
-                "Review shot $SHOT_ID from $RUN_DIR/shot_list.json. Build the MiniMax H3 ref2va prompt in 6-section format (subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape, non_diegetic_music). Apply rules from knowledge/minimax_h3_rules.md. Character refs: $RUN_DIR/characters/. Location refs: $RUN_DIR/locations/. DIALOGUE lines get <d> tags + <Audio> ref. NARRATION clips: NO <d> tags, describe characters with closed lips. $CONTINUITY_REFS $CORRECTIONS"
+                "Review shot $SHOT_ID from $RUN_DIR/shot_list.json. H3 MODE for this shot: $SHOT_H3_MODE — write exactly that in h3_mode (ref2va = 6-section format: subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape, non_diegetic_music; i2va/fl2va = the timecoded [Xs-Ys] format with the first/last frame as the literal start/end state). HARD LIMITS (knowledge/minimax_h3_rules.md section 0): whole prompt <= 900 words, detailed_description 350-500 words; NO frame numbers, pixel sizes, percentages, hex colours or 'exactly N' counts; <= 3 named subjects, extras uncounted with backs to camera; faces/hands only at medium or closer; camera only in the official vocabulary (push in / pull out / pan / truck / tilt / pedestal / arc / tracking / static, 'with small amplitude at slow speed'); one beat, one continuous shot. reference_assignments: ONLY design sheets under $RUN_DIR/characters/ (one per character in frame) and the location plate under $RUN_DIR/locations/, <= 5 images, never a prev/next clip frame. DIALOGUE lines get <d> tags + <Audio> ref. NARRATION clips: NO <d> tags, describe characters with closed lips. On a retry REWRITE from the shot list and apply only the top 3 structural corrections. $CONTINUITY_REFS $CORRECTIONS"
 
             run_dsh_agent "screenplay-reviewer" "$CLIP_DIR/prompt_review.txt" "$CLIP_DIR/reviewed_prompt.json"
         fi
@@ -1567,17 +1643,16 @@ Save to $CLIP_DIR/dialogue.wav and $CLIP_DIR/dialogue_meta.json (include engine_
         fi
 
         # ── 2c. Image Generation — skip if frame_meta exists or mode needs no frames ──
+        # The SHOT LIST decides whether a keyframe is rendered (S01_002 was planned
+        # composited_i2v, the reviewer wrote h3_mode ref2va, and the rendered first
+        # frame was never used). ref2va needs no frame; every other mode does.
         NEED_FRAMES=$(python3 -c "
 import json
 try:
-    d = json.load(open('$CLIP_DIR/reviewed_prompt.json'))
-    mode = (d.get('h3_mode') or d.get('mode') or '').lower()
-    # generate_video_direct.py only reads frame_meta['first_frame'/'last_frame']
-    # for fl2va/i2va. ref2va builds its inputs from reference_assignments
-    # (location/character refs), so a generated first frame would be dead work
-    # — and the image-generator step is the one that needs ~10 GB of ComfyUI
-    # VRAM beside the local LLM.
-    print('no' if mode in ('reference', 'ref', 't2v', 'text_to_video', 'ref2va') else 'yes')
+    shots = json.load(open('$RUN_DIR/shot_list.json'))['shots']
+    s = next(x for x in shots if x.get('shot_id') == '$SHOT_ID')
+    mode = str((s.get('keyframe_strategy') or {}).get('mode') or 'reference').lower()
+    print('no' if mode in ('reference', 'ref', 'ref2va', 't2v', 'text_only', 'text_to_video') else 'yes')
 except Exception:
     print('yes')
 " 2>/dev/null || echo yes)
@@ -1673,7 +1748,7 @@ except Exception:
         CROSS_CLIP_CTX=$(python3 "$PACK_DIR/pipeline/qa_context.py" "$SHOT_ID" "$RUN_DIR" 2>/dev/null || echo "")
 
         write_prompt "$CLIP_DIR/prompt_qa.txt" \
-            "Review $CLIP_DIR/clip.mp4 for a Pixar-quality animated movie. This must look like a GREAT movie — be strict.
+            "Review $CLIP_DIR/clip.mp4 for a Pixar-quality animated movie. Score what a viewer sees at playback scale; the calibrated gate below decides (knowledge/minimax_h3_rules.md section 0).
 
 CLIP CONTEXT: Shot $SHOT_ID from $RUN_DIR/shot_list.json.
 Character references: $RUN_DIR/characters/
@@ -1681,17 +1756,17 @@ Location references: $RUN_DIR/locations/
 
 FRAME EXTRACTION: Extract frames with ffmpeg at 2fps for general review, 10fps for motion, 30fps for lip sync.
 
-QUALITY CHECKS (score 0.0-1.0 each, threshold 0.85):
-1. HANDS & LIMBS: Count fingers, check merging, extra limbs, impossible positions
-2. FACE & EXPRESSION: Symmetry, distortion, morphing, expression matches story beat
+QUALITY CHECKS (score 0.0-1.0 each; STRUCTURAL floor 0.70):
+1. HANDS & LIMBS: merging, extra limbs, impossible positions — judged ONLY at medium framing or closer (0.85 'not resolvable' otherwise)
+2. FACE & EXPRESSION: distortion, morphing, expression matches story beat — judged ONLY at medium framing or closer
 3. CHARACTER IDENTITY: Match against reference sheets — hair, clothes, accessories, prosthetics
-4. DUPLICATION: No cloned characters, doubled props, ghost objects
+4. DUPLICATION: a NAMED character twice, or an identical clone pair side by side (a crowd of similar extras is not duplication)
 5. MOTION: Smooth, physically plausible, no jitter/teleporting
 6. LIP SYNC: Dialogue clips = lips move in sync; Narration clips = lips CLOSED
 7. TEXTURE & VISUAL: No swimming textures, resolution drops, banding, noise
-8. COMPOSITION: Framing matches Director spec, camera angle correct
+8. COMPOSITION: shot size and angle match the SHOT LIST (not the prompt's pixel targets or crowd counts)
 
-CROSS-CLIP CONTINUITY CHECKS (score 0.0-1.0, threshold 0.85):
+CROSS-CLIP CONTINUITY CHECKS (score 0.0-1.0; STRUCTURAL floor 0.70):
 9. CONTINUITY: Compare against adjacent clips in the same scene.
    If the previous clip exists, extract its LAST FRAME and compare with this clip's FIRST FRAME.
    Check: prop continuity (objects don't appear/disappear), character facing direction,
@@ -1700,7 +1775,7 @@ CROSS-CLIP CONTINUITY CHECKS (score 0.0-1.0, threshold 0.85):
 
 $CROSS_CLIP_CTX
 
-VOICE QUALITY (dialogue clips only, score 0.0-1.0, threshold 0.85):
+VOICE QUALITY (dialogue clips only, score 0.0-1.0; SOFT category):
 10. VOICE QUALITY: Analyze the dialogue.wav stem in this clip directory.
     Check for robotic indicators: monotone pitch, flat prosody, metallic timbre,
     missing breath sounds, emotion mismatch with the scene's emotional beat.
@@ -1708,19 +1783,20 @@ VOICE QUALITY (dialogue clips only, score 0.0-1.0, threshold 0.85):
     Voice quality below 0.70 = critical failure (robotic voice is unacceptable).
     For narration-only clips (no dialogue.wav): skip, mark N/A.
 
-CINEMATIC QUALITY (score 0.0-1.0, threshold 0.80):
+CINEMATIC QUALITY (score 0.0-1.0; SOFT category):
 11. FILM QUALITY: Does this look like a frame from a professional animated movie?
     Check: appealing color palette, proper depth of field, cinematic lighting,
     natural character posing, clean composition with visual weight balance,
     environment detail and atmosphere. A great movie doesn't just avoid artifacts —
     it looks BEAUTIFUL.
 
-VERDICT RULES:
-- ALL categories 1-10 must score >= 0.85
-- FILM QUALITY (11) must score >= 0.80
-- Any critical issue in categories 1-10 = automatic FAIL regardless of score
-- Voice quality below 0.70 = CRITICAL FAIL (robotic voice breaks immersion)
-- Output JSON with verdict PASS/FAIL, all 11 scores, and detailed corrections if FAIL"
+VERDICT RULES (calibrated gate — normalise_qa_verdict.py is the final arbiter):
+- STRUCTURAL categories (hands_limbs, face_expression, character_identity, duplication, motion_quality, composition, continuity): each >= 0.70
+- overall_score >= 0.75 (weighted as in the qa-inspection skill)
+- SOFT categories (texture_visual, film_quality, audio_quality, voice_quality, lip_sync offset, exposure/saturation drift, prop presence, crowd size) never FAIL a clip on their own: write them as assembly/grading notes
+- Never invent numeric gates (pixel heights, % luma, NCC, gradient energy, frame indices); measurements are evidence for a score, not rules
+- re_render_recommended: true ONLY with a structural category < 0.70 or a critical structural correction
+- Output JSON with verdict PASS/FAIL, scores for all 11 categories under the exact keys hands_limbs, face_expression, character_identity, duplication, motion_quality, lip_sync, texture_visual, composition, continuity, voice_quality, film_quality, overall_score, re_render_recommended, and <= 5 one-sentence corrections if FAIL"
         VERDICT=""
         QA_NORM=""
         for QA_TRY in 1 2 3; do
@@ -1774,6 +1850,11 @@ except: print('')
         else
             RETRY=$((RETRY + 1))
             log "[$SHOT_ID] QA FAILED (attempt $RETRY/$MAX_RETRY)"
+            # Keep every take: a retry can score LOWER than the take it replaces
+            # (S01_005: hands 0.87 -> 0.74). best_take.py restores the best at escalation.
+            mkdir -p "$CLIP_DIR/takes"
+            cp -f "$CLIP_DIR/clip.mp4" "$CLIP_DIR/takes/take_${RETRY}.mp4" 2>/dev/null || true
+            cp -f "$CLIP_DIR/qa_verdict.json" "$CLIP_DIR/takes/take_${RETRY}_verdict.json" 2>/dev/null || true
             # Build failure summary for Discord
             QA_ISSUES=$(python3 -c "
 import json
@@ -1796,6 +1877,7 @@ except: print('')
     done
 
     if [ "$PASSED" = "false" ]; then
+        python3 "$PACK_DIR/pipeline/best_take.py" "$CLIP_DIR" 2>&1 | tee -a "$RUN_DIR/pipeline.log" || true
         log "[$SHOT_ID] ESCALATED after $MAX_RETRY retries"
         notify "Clip $SHOT_ID ESCALATED — failed $MAX_RETRY attempts\nNeeds manual review or shot redesign" "ESCALATION" "$CLIP_DIR/clip.mp4"
     fi

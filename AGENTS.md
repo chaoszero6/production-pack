@@ -75,7 +75,7 @@ at dsh launch**, so the route is rewritten before every agent call.
 **Since 2026-10-11 every text agent runs on the LOCAL Qwen 3.8 Flash Next 125B** served by Strata
 Swift on 207 (`strata-swift-iq3-xxs.service`, OpenAI API `http://127.0.0.1:8321/v1`, dsh provider
 `strata-swift`, model `swift-1.5-iq3_xxs`, 262k context, maxTokens 131072, effort **xhigh** for both
-reasoning and execution). It is text-only, so the one vision agent stays on OpenRouter. The unit, port
+reasoning and execution). Its `strata-vision` sidecar reads images, so the QA inspector runs locally too (verified 2026-10-16; OpenRouter is only a fallback). The unit, port
 and model are defined once in `pipeline/local_llm.sh` / `pipeline/local_llm.py`; everything else
 imports them. `CLOUD_ROUTING=0` in `run.sh` is the active mode.
 
@@ -87,7 +87,7 @@ the previous agent call's route). If the Strata unit is not serving when a route
 | Agent | Provider / model | Effort |
 |-------|------------------|--------|
 | Story Creator, Director, Screenplay Reviewer, Character Designer, Location Designer | `strata-swift` / `swift-1.5-iq3_xxs` (local :8321) | xhigh |
-| QA Inspector — the ONLY vision agent | `openrouter` / `google/gemini-3-flash-preview` | high |
+| QA Inspector — the ONLY vision agent | `strata-swift` / `swift-1.5-iq3_xxs` (local :8321, strata-vision encoder — verified 2026-10-16) | xhigh |
 | All other agents | `strata-swift` / `swift-1.5-iq3_xxs` (local :8321) | xhigh |
 
 ### The GPU has exactly ONE owner: Strata LLM | ComfyUI | TTS cluster
@@ -252,7 +252,9 @@ makes that one field wrong costs real GPU hours, so it is normalised, never trus
 qa-inspector writes its rich report to `clips/<SHOT_ID>/qa_report.json` **or** `qa/<SHOT_ID>/qa_report.json`
 — it uses both, so read both and take the newest — and it sometimes writes `qa_verdict.json` as prose.
 `normalise_qa_verdict.py` runs after every QA pass and is the ONLY writer of the field the gate reads.
-It resolves the verdict from the richest source available, then applies the downgrade below.
+It resolves the verdict from the richest source available, applies the **calibrated gate** first
+(structural categories ≥ 0.70 and overall ≥ 0.75 → PASS, soft categories → assembly notes; see
+"H3 Envelope & QA Calibration"), then the assembly-fixable downgrade below.
 
 ### Assembly-fixable FAIL → PASS (do NOT re-render)
 A FAIL whose defect lives in the audio stem or the edit — not in the pixels — is downgraded to `PASS`
@@ -319,6 +321,28 @@ Pipeline hooks: `run.sh` 1b validates the shot list for jump cuts and handles
 (`edit_check.py --shot-list`), 1e builds the voice line-up, 3d runs `edit_check.py --run-dir` and
 hands `final/edit_report.json` to the Post-Production Editor, who records every boundary decision in
 `final/edit_decisions.json` and cuts straight (no `xfade` unless the Director scripted it).
+
+## H3 Envelope & QA Calibration — *Cinderquay* postmortem (2026-10-16)
+
+The first run after the Strata switch rendered S01_001 ten times and S01_002 six times and
+passed nothing. The clips were not the problem class the gate assumed: the shot list, the
+prompts and the QA rubric were all asking for things MiniMax H3 cannot do. What H3 verifiably
+is (node source, model card, official prompt guides) and what the run proved are written up in
+`knowledge/minimax_h3_rules.md §0`; the rules that must never regress:
+
+| Symptom | Root cause | Rule / tool |
+|---|---|---|
+| S01_002's mufflered crowd and lantern reader appeared in S01_001, which banned both | the next clip's first frame was fed to ref2va as an "end anchor"; every ref2va image is a CONTENT source | continuity frames are never references — `generate_video_direct.py` refuses them; they enter only as i2va/fl2va frames |
+| extreme-wide establishing shot became a crowd-level medium in 10/10 takes | ref2va re-frames toward its subjects | 0-character plate shots run as i2va from the plate (`shot_list_lint.py --fix`); composition-critical shots render a first frame |
+| planned `composited_i2v`, rendered a good first frame, ran as ref2va without it | the reviewer's `h3_mode` default won | mode comes from the shot list (`run.sh` passes `SHOT_H3_MODE`); a rendered first frame forces i2va/fl2va |
+| prompt grew 1 301 → 3 114 words, full of hex colours, frame numbers and px sizes | QA corrections appended, never applied | ≤ 900 words, `detailed_description` 350–500, no numbers H3 cannot read, retries rewrite from the shot list (reviewer preset + prompt-review skill) |
+| "exactly ten figures", four montage beats in one shot, three characters with one copy-pasted action, a whale with a hand_position | shot list outside the envelope | `pipeline/shot_list_lint.py` (step 1b-lint, Director fix rounds): one beat per shot, ≤ 3 named characters, own action per character, extras uncounted |
+| gate demanded all 11 categories ≥ 0.85 incl. "figure ≤ 12 % of frame height", "luma ± 10 %" | inspector invented pixel gates; gate trusted them | **the inspector scores, `normalise_qa_verdict.py` decides**: structural categories (hands_limbs, face_expression, character_identity, duplication, motion_quality, composition, continuity) ≥ 0.70 each and overall ≥ 0.75 → PASS; soft categories go to `assembly_fixes.json` |
+| a retry can score lower than the take it replaced | last take always kept | failed takes archived under `clips/<id>/takes/`; `pipeline/best_take.py` restores the best at escalation; `MAX_RETRY=3` |
+
+Verified 2026-10-16: the local Strata model DOES read images (its `strata-vision` encoder
+described a frame's whale, bell, lantern and counted the figures), so qa-inspector runs
+locally; the OpenRouter route is no longer needed for vision.
 
 ## Service Dependencies
 

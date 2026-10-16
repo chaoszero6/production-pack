@@ -4,6 +4,54 @@
 > Sources: MiniMax official docs, HuggingFace discussions, community reports, fal.ai guide, ComfyUI forums.
 
 ---
+## 0. THE H3 ENVELOPE — verified 2026-10-16 (read before anything else)
+
+What the local H3 actually is (sources: `comfy_extras/nodes_minimax_h3.py`,
+`comfy/text_encoders/minimax.py`, the MiniMaxAI/MiniMax-H3 model card, the official
+`VIDEO_PROMPT_WRITING_GUIDE_base_en.md` / `_ref_en.md` shipped with the H3 Prompt Writer node):
+
+- **Model.** H3-Base open weights: a 33B dense single-stream transformer; text and images are read
+  by a Qwen3-VL-32B encoder (50 layers). Two variants on 207: `ref2va` (omni-reference, ≤ 9 images)
+  and `fl2va` (0/1/2 frames → t2va / i2va / l2va / fl2va). CFG-distilled. Native 32 kHz stereo
+  audio (the pipeline discards it).
+- **Canvas.** 768 short edge, area cap 1344×768, 24 fps. Frame count = 17k+5; trained range
+  124–362 frames (5.2 s – 15.1 s). `generate_video_direct.py` rounds UP; the editor trims.
+- **Speed.** Turbo LoRA (larryvrh): 4–8 steps, 8 is best, strength 1.0; its own README names
+  "audio and fast, intense motion" as the weak spots. Ours: 8 steps, ddim/beta, ≈ 6 min per 10 s.
+- **The prompt is prose read by Qwen3-VL.** The node has no token cap, but the OFFICIAL guide sizes
+  `detailed_description` at 350–500 words and a whole Context-IR output lands around 600–900.
+  H3 has no concept of pixels, percentages, frame numbers, hex colours, NCC, luma budgets,
+  "exactly ten" or "92 px of 768". Those words displace the description it does read.
+- **Every ref2va image is a CONTENT source.** H3 copies what it sees in a reference — people,
+  props, costumes, weather — into the clip. A reference is never "an anchor to end on".
+- **Camera vocabulary (official).** Push In / Pull Out, Pan Left/Right, Truck Left/Right,
+  Tilt Up/Down, Pedestal Up/Down, Arc Shot, Tracking Shot, Static Shot, Shake Slightly/Strongly,
+  POV, Roll — as a sentence: "The camera pushes in with small amplitude at slow speed toward …".
+  Nothing else ("monotone 1.00→1.15 cumulative scale, no pull-back") is understood.
+
+### 0.1 What the Cinderquay run proved (run_20261011_130959 — S01_001 ×10 takes, S01_002 ×6, 0 passes)
+
+| Observed in the render | Root cause | Rule now enforced |
+|---|---|---|
+| Olive-coat crowd in wool mufflers, a man reading a ledger beside a lantern — in a shot that banned mufflers and had no reader | `next_clip_firstframe.png` (S01_002's first frame, which shows exactly those figures) was fed to ref2va as an "end anchor" | Continuity frames are **never** ref2va references. A previous/next frame enters as the i2va first frame or the fl2va last frame, or not at all. `generate_video_direct.py` refuses them. |
+| "extreme-wide, high angle, slow push in" became a crowd-level medium shot by 1.5 s in all 10 takes | ref2va does not hold a plate's framing — it re-frames toward the subjects it was given | Composition-critical shots (establishing, placed groups, 0-character plates) render a FIRST FRAME and run as i2va. H3 only animates. `shot_list_lint.py --fix` switches 0-character "reference" shots to `first_frame_only`. |
+| 11 → 14 → 8 figures against "exactly ten"; one face repeated across a clone cluster | crowds are drawn as clone clusters; counts are not controllable | ≤ 3 named characters per clip. Extras are "a few distant figures, backs to camera" — never counted, never costumed one by one. |
+| Crowd "materialised at frame 7" against "empty until frame 30" | frame-numbered reveals are not understood; figures pop in | No frame numbers, no timed reveals. One entrance per clip, one subject, medium framing, in seconds (± 1 s). |
+| Fused mitten hands and repeated faces on figures ~300 px tall | at 768p faces and hands are unreadable below medium framing | Faces/hands are prompted AND scored only at medium framing or closer. Wide = backs, silhouettes. |
+| Prompt grew 1 301 → 3 114 words over ten takes; every take failed | QA corrections were appended, never applied; numeric gates replaced description | Each take is REWRITTEN from the shot list: ≤ 900 words total, `detailed_description` 350–500, the three highest-priority structural corrections applied, the rest dropped. |
+| S01_002 was planned `composited_i2v`; a good first frame was rendered; the clip ran as ref2va without it | the reviewer's `h3_mode` default (ref2va) overrode the shot list | Mode comes from the shot list (`run.sh` passes it); a rendered first frame forces i2va/fl2va in `generate_video_direct.py`. |
+| A 10 s shot asked for four montage beats (nets, bell, kite, baby) and an entrance at 9.0 s | a montage was written as one shot | One beat per clip (`shot_list_lint.py` blocks `montage_in_one_shot`). |
+| The QA gate demanded all 11 categories ≥ 0.85 including "figure ≤ 12 % of frame height", "wall gradient energy ≥ 0.75 of plate", "luma within ± 10 %" | the inspector invented pixel gates and the gate trusted them | The inspector scores; `normalise_qa_verdict.py` decides: structural categories ≥ 0.70, overall ≥ 0.75 → PASS. Soft categories go to the assembly ledger. Invented numeric gates are evidence, not rules. |
+
+### 0.2 Narration
+The official voiceover pattern is `The narrator (S1) says in an off-screen voiceover: <d>…</d>
+while <Subject 1>'s lips remain completely closed.` The pipeline does NOT use it: `run.sh`
+treats any `<d>` as dialogue (it would trigger a TTS stem and lip sync). Narration clips keep
+the closed-lips description and the stem is laid in post. Make the PICTURE illustrate the
+narration line (the Director's job: S01_002's narration was a kite and a laughing baby while
+the shot showed a whale hunt).
+
+---
 
 ## 1. CRITICAL ARTIFACTS — Must Prevent
 
@@ -216,7 +264,9 @@ Combine with ` + `: `keyframe completion`, `reference generation`, `video editin
 `video continuation`, `audio reuse`, `audio reference`
 
 ### 3.8 Quality Standards
-- `detailed_description`: 350-500 words for generation tasks
+- `detailed_description`: 350-500 words for generation tasks (official); whole prompt ≤ 900 words
+- NO frame numbers, pixel sizes, percentages, hex colours or "exactly N" counts — H3 does not read them (§0)
+- Camera moves ONLY in the official vocabulary (§0): "The camera pushes in with small amplitude at slow speed"
 - Be concrete: composition, subject state, actions, camera movement, sound
 - Output ONLY the formatted prompt — no commentary
 - Use real camera terms: "shallow depth of field", "rack focus", "dolly push-in"

@@ -253,3 +253,11 @@ svc_transition video_gen   # or whichever phase you need
 3. **Cloud routing bypasses local management** — agents on OpenRouter don't touch the GPU
 4. **VRAM budget is conservative** — estimated service VRAM is less than peak to allow headroom
 5. **Backward compatible** — `swap_to_27b`, `ensure_local_llm_running`, `stop_all_llms` all still work as before
+
+## 1b-lint — Shot list H3-envelope lint (2026-10-16)
+`pipeline/shot_list_lint.py --shots shot_list.json --run-dir <run> --fix` runs after the edit
+validation: blocks montage-in-one-shot, > 3 named characters and copy-pasted character actions
+(Director fix rounds, ≤ 2); auto-fixes 0-character plate shots to `first_frame_only`, silent
+shots > 10 s, and reference paths that do not exist. Failed takes are archived under
+`clips/<id>/takes/` and `pipeline/best_take.py` restores the best one at escalation.
+See `knowledge/minimax_h3_rules.md §0`.

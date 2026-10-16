@@ -31,6 +31,13 @@ TURBO_LORA_REF2V = "minimax/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.
 TURBO_LORA_FL2V = "minimax/minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
 
 OUTPUT_PREFIX = "video/production_pack"
+# Continuity frames are NEVER ref2va references: H3 copies the content of every reference
+# into the clip (S01_001 inherited S01_002's mufflered crowd from its 'end anchor').
+CONTINUITY_FRAME_NAMES = {"prev_clip_lastframe.png", "next_clip_firstframe.png",
+                          "scene_establishing_frame.png", "curr_first_frame.png", "prev_last_frame.png"}
+PROMPT_WORD_BUDGET = 900   # official guide: detailed_description 350-500 words, whole prompt < ~900
+MODE_ALIASES = {"reference": "ref2va", "ref": "ref2va", "composited_i2v": "i2va", "first_frame_only": "i2va",
+                "first_from_previous": "i2va", "first_last_frame": "fl2va", "text_only": "ref2va"}
 WIDTH = 1344
 HEIGHT = 768
 FPS = 24
@@ -47,6 +54,54 @@ def _shot_path(shot_dir, p):
         return None
     p = p.strip()
     return p if os.path.isabs(p) else os.path.join(shot_dir, p)
+
+
+def _resolve_rel(path, run_dir):
+    """Pack-relative refs come as "output/<run>/x", "output/x" or "x"; run_dir already IS
+    output/<run>, so both prefixes are dropped (the old code produced output/<run>/<run>/x)."""
+    p = path.strip()
+    if os.path.isabs(p):
+        return p
+    run_name = os.path.basename(os.path.normpath(run_dir))
+    for prefix in (f"output/{run_name}/", "output/"):
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+            break
+    if p.startswith(run_name + "/"):
+        p = p[len(run_name) + 1:]
+    return os.path.join(run_dir, p)
+
+
+def _sibling_ref(path):
+    """A Director-invented variant (harbour_square_bell.png) resolves to the canonical file
+    in the same directory: <id>.png, <id>_side.png, <id>_three_quarter.png, <id>_front.png."""
+    d = os.path.dirname(path)
+    if not os.path.isdir(d):
+        return None
+    stem = os.path.basename(d)
+    for name in (f"{stem}.png", f"{stem}_side.png", f"{stem}_three_quarter.png", f"{stem}_front.png"):
+        c = os.path.join(d, name)
+        if os.path.isfile(c):
+            return c
+    pngs = sorted(f for f in os.listdir(d) if f.lower().endswith(".png"))
+    return os.path.join(d, pngs[0]) if pngs else None
+
+
+def _first_plate(rp, frame_meta, run_dir):
+    """The first location plate among the references (for plate-only i2va)."""
+    for ref in (frame_meta.get("video_references") or rp.get("reference_assignments") or []):
+        if not isinstance(ref, dict):
+            continue
+        raw = ref.get("resolved_path") or ref.get("image") or ref.get("declared_path") or ""
+        if not isinstance(raw, str) or "/locations/" not in raw:
+            continue
+        p = _resolve_rel(raw, run_dir)
+        if os.path.isfile(p):
+            return p
+        alt = _sibling_ref(p)
+        if alt:
+            return alt
+    return None
 
 
 def h3_frame_count(duration_s):
@@ -281,7 +336,7 @@ def build_fl2va_workflow(prompt_text, first_frame, last_frame, duration_s, dialo
     """
     length = h3_frame_count(duration_s)
     seed = random.randint(0, 2**53)
-    steps = 4
+    steps = 8   # the LoRA is the 8-step fl2v turbo; 4 steps smears fast motion (larryvrh README)
 
     log(f"  fl2va: {duration_s}s -> {length} frames, {steps} steps")
 
@@ -529,12 +584,19 @@ def main():
     except Exception as e:
         log(f"ERROR: reviewed_prompt.json is not valid JSON ({e})")
         return 1
-    h3_mode = rp.get("h3_mode", "ref2va")
+    h3_mode = str(rp.get("h3_mode") or "ref2va").strip().lower()
+    h3_mode = MODE_ALIASES.get(h3_mode, h3_mode)
     prompt_text = rp.get("final_prompt", "")
 
     if not prompt_text:
         log("ERROR: empty final_prompt in reviewed_prompt.json")
         return 1
+    n_words = len(str(prompt_text).split())
+    if n_words > PROMPT_WORD_BUDGET:
+        log(f"  WARNING: prompt is {n_words} words (budget {PROMPT_WORD_BUDGET}); H3 reads prose, not pixel gates — "
+            "the reviewer must rewrite, not append (rules §0)")
+    else:
+        log(f"  prompt {n_words} words, mode {h3_mode}")
 
     # Get duration from args or shot_list
     duration_s = args.duration
@@ -565,6 +627,15 @@ def main():
             log(f"  WARNING: frame_meta.json unreadable ({e}) — continuing without it")
             frame_meta = {}
 
+    # A rendered first frame always wins over the reviewer's mode guess: S01_002 was
+    # planned composited_i2v, its first frame was rendered, and the clip ran as ref2va
+    # without it because reviewed_prompt.json said so.
+    ff_file = _shot_path(shot_dir, frame_meta.get("first_frame"))
+    lf_file = _shot_path(shot_dir, frame_meta.get("last_frame"))
+    if h3_mode == "ref2va" and ff_file and os.path.isfile(ff_file):
+        h3_mode = "fl2va" if (lf_file and os.path.isfile(lf_file)) else "i2va"
+        log(f"  frame_meta has a rendered first frame -> mode {h3_mode} (reviewer said ref2va)")
+
     # Check for dialogue audio
     dialogue_wav = os.path.join(shot_dir, "dialogue.wav")
     dialogue_name = None
@@ -590,23 +661,27 @@ def main():
                 log(f"  WARNING: ref entry has no usable path — skipped ({ref.get('tag', '?')})")
                 continue
             path = raw.strip()
-            if not os.path.isabs(path):
-                # Pack-relative refs are written as "output/<run>/..." while
-                # run_dir already IS output/<run> — drop the leading "output/"
-                # (exactly that prefix; lstrip("output/") also eats real chars).
-                rel = path[len("output/"):] if path.startswith("output/") else path
-                path = os.path.join(run_dir, rel)
+            if os.path.basename(path) in CONTINUITY_FRAME_NAMES:
+                log(f"  REFUSED {os.path.basename(path)} as a ref2va reference — H3 copies reference content; "
+                    "continuity frames enter only as i2va/fl2va frames (rules §0)")
+                continue
+            path = _resolve_rel(path, run_dir)   # "output/<run>/x", "output/x" or "x" -> run_dir/x
             if os.path.isfile(path):
                 ref_paths.append(path)
             else:
-                log(f"  WARNING: ref image not found: {path}")
+                alt = _sibling_ref(path)
+                if alt:
+                    log(f"  ref image not found: {path} -> using {alt}")
+                    ref_paths.append(alt)
+                else:
+                    log(f"  WARNING: ref image not found: {path}")
 
         if not ref_paths:
             log("ERROR: no reference images found for ref2va mode")
             return 1
 
         uploaded = []
-        for p in ref_paths[:10]:
+        for p in ref_paths[:9]:   # H3 ref2va takes at most 9 images
             name = upload_image(p, COMFYUI)
             if name:
                 uploaded.append(name)
@@ -634,10 +709,17 @@ def main():
 
         workflow = build_fl2va_workflow(prompt_text, ff_name, lf_name, duration_s, dialogue_name)
 
-    elif h3_mode in ("i2va", "composited_i2v"):
+    elif h3_mode == "i2va":
         composited = os.path.join(shot_dir, "composited_frame.png")
         first_frame = _shot_path(shot_dir, frame_meta.get("first_frame"))
         img_path = composited if os.path.exists(composited) else first_frame
+        if not img_path or not os.path.exists(img_path):
+            # 0-character plate shots (first_frame_only without a render): the location
+            # plate itself is the first frame — i2va holds its framing, ref2va does not.
+            plate = _first_plate(rp, frame_meta, run_dir)
+            if plate:
+                log(f"  no rendered first frame — using the location plate as first frame: {plate}")
+                img_path = plate
 
         if not img_path or not os.path.exists(img_path):
             log("ERROR: no image found for i2va mode")

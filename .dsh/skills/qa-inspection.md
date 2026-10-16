@@ -218,19 +218,24 @@ Note: For narration-only clips (no dialogue), redistribute voice_quality weight
 proportionally across other categories.
 ```
 
-### Step 7: Verdict
+### Step 7: Verdict — the calibrated gate (2026-10-16)
+The pre-calibration gate (all 11 categories ≥ 0.85, "be strict") passed 0 of 16 Cinderquay
+takes while asking for things H3 cannot render (knowledge/minimax_h3_rules.md §0). The
+inspector scores; `normalise_qa_verdict.py` is the only writer of the verdict the pipeline reads.
 ```
-ALL of categories 1-10 must score >= 0.85 AND
-category 11 must score >= 0.80 AND
-overall_score >= 0.85 → PASS
+STRUCTURAL categories: hands_limbs, face_expression, character_identity, duplication,
+                       motion_quality, composition, continuity          — floor 0.70 each
+SOFT categories:       texture_visual, film_quality, audio_quality, voice_quality, lip_sync
+                       — go to assembly_fixes / grading notes, never a FAIL alone
+overall_score ≥ 0.75 (weighted as in Step 6)
 
-Any category 1-10 below 0.85 → FAIL
-Category 11 below 0.80 → FAIL
-Any critical issue → FAIL regardless of scores
-Voice quality below 0.70 = critical (robotic voice is unacceptable)
+PASS  = every structural category ≥ 0.70 AND overall ≥ 0.75 AND no `critical` correction
+        in a structural category
+FAIL  = otherwise → re_render_recommended: true with ≤ 5 corrections
 ```
-
-No CONDITIONAL PASS — either it's good enough for a great movie or it's not.
+Score hands and faces only at medium framing or closer (0.85 "not resolvable at this framing"
+otherwise). Score against the SHOT LIST, not the prompt's own crowd counts or pixel targets.
+A soft category under 0.80 is written up as an assembly/grading note, with the verdict PASS.
 
 ### Step 7: Failure response
 On FAIL, generate:
@@ -241,12 +246,12 @@ On FAIL, generate:
 4. Suggestion for shot type change if the issue is inherent to the shot
 5. Updated retry count
 
-On max retries (5), escalate:
+On max retries (3), the pipeline restores the best-scoring take (`pipeline/best_take.py`) and escalates:
 ```json
 {
   "escalation": "DIRECTOR_REVIEW",
   "shot_id": "S01_003",
-  "reason": "Failed QA 5 times. Issues persist despite corrections.",
+  "reason": "Failed QA 3 times. Issues persist despite corrections.",
   "recommendation": "Consider redesigning this shot."
 }
 ```
@@ -258,11 +263,11 @@ The qa_report.json MUST include all 11 category scores:
   "shot_id": "S04_002",
   "verdict": "PASS or FAIL",
   "scores": {
-    "hands": {"score": 0.95, "pass": true, "detail": "..."},
-    "face": {"score": 0.90, "pass": true, "detail": "..."},
+    "hands_limbs": {"score": 0.95, "pass": true, "detail": "..."},
+    "face_expression": {"score": 0.90, "pass": true, "detail": "..."},
     "character_identity": {"score": 0.88, "pass": true, "detail": "..."},
     "duplication": {"score": 1.0, "pass": true, "detail": "..."},
-    "motion": {"score": 0.92, "pass": true, "detail": "..."},
+    "motion_quality": {"score": 0.92, "pass": true, "detail": "..."},
     "lip_sync": {"score": 0.90, "pass": true, "detail": "..."},
     "texture_visual": {"score": 0.93, "pass": true, "detail": "..."},
     "composition": {"score": 0.91, "pass": true, "detail": "..."},

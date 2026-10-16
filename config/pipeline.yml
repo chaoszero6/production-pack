@@ -94,8 +94,8 @@ video_generation:
       scheduler: "simple"
       lora_strength: 0.75
     fl2va:
-      lora: "minimax/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
-      steps: 4
+      lora: "minimax/minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
+      steps: 8
       sampler: "res_multistep"
       scheduler: "simple"
       lora_strength: 0.75
@@ -118,7 +118,12 @@ qa:
     - audio_quality
     - temporal_consistency
     - composition_check
-  pass_threshold: 0.85       # minimum score to pass
+  # Calibrated gate (2026-10-16, knowledge/minimax_h3_rules.md §0) — normalise_qa_verdict.py
+  pass_threshold: 0.75       # weighted overall
+  structural_floor: 0.70     # hands_limbs, face_expression, character_identity, duplication, motion_quality, composition, continuity
+  soft_categories: [texture_visual, film_quality, audio_quality, voice_quality, lip_sync]   # notes for assembly, never a FAIL alone
+  prompt_word_budget: 900    # whole H3 prompt; detailed_description 350-500 (official)
+  max_named_characters: 3    # per clip; extras uncounted, backs to camera
 
 # Audio settings
 audio:

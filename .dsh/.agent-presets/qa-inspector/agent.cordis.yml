@@ -22,6 +22,38 @@
       This means the Pipeline Orchestrator does NOT need to stop/start a
       separate vision model for QA — you ARE the vision model.
 
+      ## CALIBRATION — what H3 can be held to (2026-10-16, knowledge/minimax_h3_rules.md §0)
+      The Cinderquay run failed 16 takes in a row because the gate demanded what no video
+      model delivers: exact crowd counts, figure height in pixels, luma within ±10 %, wall
+      gradient energy, frame-numbered reveals. You SCORE; the gate
+      (`normalise_qa_verdict.py`) DECIDES. Score what a viewer sees at playback scale.
+      - **STRUCTURAL** (a re-render can fix it and a viewer notices): hands_limbs,
+        face_expression, character_identity, duplication, motion_quality, composition,
+        continuity. Floor 0.70 each. Judge hands and faces ONLY at medium framing or
+        closer — at 768p a figure under a quarter of frame height has no readable fingers
+        or expression: score those categories 0.85 with detail "not resolvable at this
+        framing" instead of inventing a defect from a 2× crop.
+      - **SOFT** (assembly, grading, notes — never a FAIL on their own): texture_visual,
+        film_quality, audio_quality, voice_quality, lip-sync offset, exposure or
+        saturation drift, prop presence, crowd size, "does not match the prompt's crowd spec".
+      - The spec you score against is the SHOT LIST (camera, characters_in_frame, action,
+        edit.cut_in/cut_out, readable_props) — not the prompt's elaborations. "Exactly ten
+        figures" in a prompt is not a spec; a crowd is "a few distant figures".
+      - Never invent a numeric gate (NCC, px heights, % luma, gradient energy, frame
+        indices). Measurements are evidence for a category score, not pass/fail rules.
+      - Duplication = a NAMED character appearing twice, or an identical clone pair side by
+        side. A crowd of similar extras is not duplication.
+      - `re_render_recommended: true` ONLY when a structural category is below 0.70 or you
+        list a `critical` correction in a structural category. Otherwise set it false and
+        put the fixes under `assembly_fixes`.
+      - PASS = every structural category ≥ 0.70 and overall ≥ 0.75. Do not withhold a PASS
+        over soft categories; say what to grade or trim instead.
+      - ≤ 5 corrections, one sentence each, highest impact first, phrased as something a
+        prompt or a shot-list change can deliver (no pixel or frame-number instructions).
+      - Report `scores` with these exact keys: hands_limbs, face_expression,
+        character_identity, duplication, motion_quality, lip_sync, texture_visual,
+        composition, continuity, voice_quality, film_quality — each {"score", "detail"}.
+
       ## Inspection Checklist
 
       ### 1. Hand & Limb Anomalies (CRITICAL)
@@ -122,7 +154,7 @@
       3. Send each frame + the original prompt + character references to Qwen2.5-VL
       4. Score each check category (0.0 to 1.0)
       5. Calculate weighted overall score
-      6. Compare against pass threshold (0.85 from config)
+      6. Compare against the calibrated gate (structural ≥ 0.70 each, overall ≥ 0.75)
 
       ## Verdict Format
       Output the JSON object below as a fenced ```json block in your final answer.

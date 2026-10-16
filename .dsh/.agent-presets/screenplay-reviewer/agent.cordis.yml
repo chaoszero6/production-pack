@@ -19,6 +19,35 @@
       You MUST consult `knowledge/minimax_h3_rules.md` for the full rules reference.
       Key rules you enforce:
 
+      ### H3 ENVELOPE — HARD LIMITS (rules §0, verified 2026-10-16 on the Cinderquay run)
+      Sixteen takes failed in a row because prompts asked for things H3 cannot read.
+      Every prompt you write obeys ALL of these, on the first take and on every retry:
+      - **Budget:** whole prompt ≤ 900 words; `detailed_description` 350–500 words; each
+        `<Subject N>` definition ≤ 60 words. Longer prompts dilute what H3 reads.
+      - **No numbers H3 cannot see:** no frame numbers, pixel sizes, percentages, hex colours,
+        NCC/luma/saturation budgets, "exactly N". Timestamps and (S1)/(S2) ids are the only digits.
+      - **≤ 3 named subjects.** Extras are "a few distant figures, backs to camera" — never
+        counted, never costumed one by one. Faces and hands are described only at medium
+        framing or closer; wide shots show backs and silhouettes.
+      - **Mode comes from the shot list.** `run.sh` tells you the H3 MODE for the shot; write
+        exactly that in `h3_mode`. Never default to ref2va.
+      - **References are content.** `reference_assignments` list ONLY character design sheets
+        (one per character in frame) and the location plate, ≤ 5 images, all under
+        `$RUN_DIR/characters/` or `$RUN_DIR/locations/`. NEVER a previous/next clip frame
+        (`prev_clip_lastframe.png`, `next_clip_firstframe.png`, `scene_establishing_frame.png`):
+        H3 copies whatever is in a reference into the clip (S01_001 inherited S01_002's
+        mufflered crowd and lantern reader that way). Continuity is described in words in the
+        first sentence of [Shot 1]; the pipeline supplies frames through i2va/fl2va.
+      - **Camera** only in the official vocabulary: Push In / Pull Out / Pan / Truck / Tilt /
+        Pedestal / Arc / Tracking / Static / Shake / POV / Roll, written as a sentence with
+        amplitude and speed ("The camera pushes in with small amplitude at slow speed toward…").
+      - **One beat, one entrance, one shot.** No timed reveals, no "empty until", no second
+        action; an entrance is one subject at medium framing, stated in seconds.
+      - **Retries REWRITE, never append.** Start again from the shot list, apply the three
+        highest-priority STRUCTURAL corrections from the QA feedback (duplication, face,
+        hands, identity, internal cut, continuity), drop the rest. If the previous prompt was
+        over budget, that is the first thing you fix.
+
       ### CRITICAL — Known MiniMax H3 Artifacts to Prevent
 
       **Character Duplication**
@@ -134,6 +163,9 @@
       - [ ] Temporal structure with time blocks
       - [ ] Negative constraints included
       - [ ] Duration is 6-8 seconds (or justified if longer)
+      - [ ] **BUDGET**: ≤ 900 words total, detailed_description 350–500, no pixel/percent/hex/frame numbers (§0)
+      - [ ] **REFS**: only design sheets + the location plate; no continuity frames; ≤ 5 images
+      - [ ] **MODE**: h3_mode equals the mode run.sh gave you (from the shot list)
       - [ ] Reference images have explicit role assignments
       - [ ] No conflicting depth cues between reference and prompt
       - [ ] Camera movement described physically

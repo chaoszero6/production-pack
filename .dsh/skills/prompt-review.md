@@ -9,6 +9,19 @@ whenToUse: When reviewing or writing prompts for MiniMax H3 video generation
 This skill is used by the Screenplay Reviewer agent to validate and optimize
 prompts before they are sent to MiniMax H3 for video generation.
 
+## H3 envelope — hard limits on every prompt (knowledge/minimax_h3_rules.md §0, 2026-10-16)
+
+| Limit | Value | Why |
+|---|---|---|
+| Whole prompt | ≤ 900 words | official guide sizes a Context-IR output at ~600–900; the Cinderquay S01_001 prompt reached 3 114 words and failed 10/10 |
+| `detailed_description` | 350–500 words | official |
+| Named subjects | ≤ 3 | crowds render as clone clusters; counts are not controllable |
+| Numbers | timestamps and (Sx) ids only | H3 does not read px, %, hex, frame numbers, "exactly N" |
+| References | design sheets + location plate, ≤ 5 | every reference's CONTENT is copied into the clip — never a prev/next clip frame |
+| Camera | official vocabulary, one sentence with amplitude + speed | anything else is ignored |
+| Mode | the one `run.sh` passes (from the shot list) | the reviewer's old ref2va default discarded rendered first frames |
+| Retry | rewrite from the shot list + top 3 structural corrections | appending corrections is how prompts bloat |
+
 ## Review Process
 
 ### Step 1: Load the shot specification
@@ -47,7 +60,7 @@ If the requested shot type is unsafe for the content:
 
 ### Step 4: Build the structured prompt
 
-**For ref2va** (most clips), use the 6-section H3 format:
+**For ref2va** (when the shot-list mode is `reference`), use the 6-section H3 format:
 ```
 subject_definitions:
 <Subject 1> is {character with full identity anchors}.
@@ -136,7 +149,7 @@ For each reference in the prompt:
     "Character is gesturing — watch for hand artifacts in QA"
   ],
   "checklist_passed": true,
-  "h3_mode": "first_last_frame",
+  "h3_mode": "ref2va | i2va | fl2va — EXACTLY the mode run.sh passed for this shot",
   "estimated_quality": "high"
 }
 ```

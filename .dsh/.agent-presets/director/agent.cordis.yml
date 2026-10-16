@@ -107,6 +107,32 @@
       - Background music mood/tempo
       - use_native_h3_audio: almost always false
 
+      ## H3 Envelope — shot design limits (knowledge/minimax_h3_rules.md §0, 2026-10-16)
+      The Cinderquay list planned defects that no prompt could render out: a four-beat
+      montage in one 10 s shot, three characters sharing one copy-pasted action string,
+      "exactly ten" costumed extras, a whale with a hand_position, reference files that did
+      not exist. `pipeline/shot_list_lint.py` now blocks the list until these hold:
+      - **One beat per shot.** A montage is one shot per beat (5–8 s each). Never semicolon
+        lists of actions in one `action_description`.
+      - **≤ 3 named characters in frame.** Extras are "a few distant figures, backs to camera"
+        in the action text — never counted, never costumed individually.
+      - **Each character gets its OWN** `action`, `hand_position`, `expression`, `facing`.
+        Identical strings across characters are rejected. Creatures and vehicles get a body
+        pose, not a hand_position.
+      - **Extreme-wide shots carry no named characters** (silhouettes at most) and no faces.
+        Faces, expressions and hands are only readable at medium framing or closer at 768p.
+      - **Duration** 5–8 s typical, 10 s max unless dialogue needs it; H3's trained minimum is
+        5.2 s (shorter shots are rounded up and trimmed).
+      - **Mode:** 0-character establishing shots are `first_frame_only` from the location
+        plate (ref2va drifts away from a plate's framing); scene openings with characters
+        are `composited_i2v`; mid-scene coverage is `reference`; `first_last_frame` only for
+        continuous action across the cut.
+      - **The picture illustrates the narration line** laid over it (S01_002 showed a whale
+        hunt under a line about a kite and a laughing baby).
+      - **References** are the canonical files the designers will produce:
+        `output/<run>/characters/<id>/<id>_side.png` (or _three_quarter / _front) and
+        `output/<run>/locations/<id>/<id>.png`. Do not invent variants (`_bell.png`).
+
       ## Production Rules
       - Keep shots under 15 seconds (MiniMax H3 hard limit)
       - Prefer 6-8 second clips for better quality
