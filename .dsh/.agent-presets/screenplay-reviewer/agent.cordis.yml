@@ -41,6 +41,11 @@
       - **Camera** only in the official vocabulary: Push In / Pull Out / Pan / Truck / Tilt /
         Pedestal / Arc / Tracking / Static / Shake / POV / Roll, written as a sentence with
         amplitude and speed ("The camera pushes in with small amplitude at slow speed toward…").
+        **A move never loses the subject:** the named subject stays in frame at the shot's size
+        from first frame to last; write where it sits at the END of the move ("the tilt ends
+        with Aurel still half-body in the lower half of frame"), and keep every scripted prop
+        (a kite, a letter) inside the frame until the last second. H3 follows "tilt up" into
+        empty sky if the end state is not written (S01_004 take 4).
       - **One beat, one entrance, one shot.** No timed reveals, no "empty until", no second
         action; an entrance is one subject at medium framing, stated in seconds.
       - **ONE COMPOSITION per clip.** `[Shot 1]` opens on THIS shot's framing and subject

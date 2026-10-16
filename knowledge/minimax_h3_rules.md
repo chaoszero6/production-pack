@@ -27,7 +27,9 @@ What the local H3 actually is (sources: `comfy_extras/nodes_minimax_h3.py`,
 - **Camera vocabulary (official).** Push In / Pull Out, Pan Left/Right, Truck Left/Right,
   Tilt Up/Down, Pedestal Up/Down, Arc Shot, Tracking Shot, Static Shot, Shake Slightly/Strongly,
   POV, Roll — as a sentence: "The camera pushes in with small amplitude at slow speed toward …".
-  Nothing else ("monotone 1.00→1.15 cumulative scale, no pull-back") is understood.
+  Nothing else ("monotone 1.00→1.15 cumulative scale, no pull-back") is understood. A move
+  must name its END state with the subject still framed at the shot's size — "slow tilt up"
+  alone drifted S01_004 into four seconds of empty sky with the kite gone by 3 s.
 
 ### 0.1 What the Cinderquay run proved (run_20261011_130959 — S01_001 ×10 takes, S01_002 ×6, 0 passes)
 

@@ -1590,16 +1590,16 @@ shot_id = '$SHOT_ID'
 try:
     shots = json.load(open('$RUN_DIR/shot_list.json'))['shots']
     shot = next(s for s in shots if s.get('shot_id') == shot_id)
-    if shot.get('audio', {}).get('dialogue'):
-        print('yes')
-        sys.exit(0)
+    print('yes' if shot.get('audio', {}).get('dialogue') else 'no')   # shot list is authoritative
+    sys.exit(0)
 except Exception:
     pass
-# 2) reviewed_prompt JSON final_prompt / h3_mode
+# 2) shot missing from the list: fall back to the FINAL PROMPT only (never the JSON envelope,
+#    whose changes_made notes say "no <d> tags" and used to trigger a doomed Orpheus call)
 try:
     d = json.load(open('$CLIP_DIR/reviewed_prompt.json'))
     p = d.get('final_prompt') or ''
-    if '<d>' in p or 'Audio' in (d.get('h3_mode') or '') or '<Audio' in p:
+    if '<d>' in p or '<Audio' in p:
         print('yes')
         sys.exit(0)
 except Exception:
