@@ -339,6 +339,7 @@ is (node source, model card, official prompt guides) and what the run proved are
 | "exactly ten figures", four montage beats in one shot, three characters with one copy-pasted action, a whale with a hand_position | shot list outside the envelope | `pipeline/shot_list_lint.py` (step 1b-lint, Director fix rounds): one beat per shot, ≤ 3 named characters, own action per character, extras uncounted |
 | gate demanded all 11 categories ≥ 0.85 incl. "figure ≤ 12 % of frame height", "luma ± 10 %" | inspector invented pixel gates; gate trusted them | **the inspector scores, `normalise_qa_verdict.py` decides**: structural categories (hands_limbs, face_expression, character_identity, duplication, motion_quality, composition, continuity) ≥ 0.70 each and overall ≥ 0.75 → PASS; soft categories go to `assembly_fixes.json` |
 | a retry can score lower than the take it replaced | last take always kept | failed takes archived under `clips/<id>/takes/`; `pipeline/best_take.py` restores the best at escalation; `MAX_RETRY=3` |
+| an escalated clip was carried forward unreviewed | the loop moved on after the escalation post | the run **halts** (exit 3) and writes `HALT_FOR_REVIEW.json`; the operator decides with `clips/<SID>/MANUAL_PASS` or `RETRY_AGAIN`, then `./launch_resume.sh`. `./stop.sh` stops a run and the monitors cleanly |
 
 Keyframe engines: `FRAME_ENGINE=qwen` (default, Qwen Image 2.1 + sheets) or `FRAME_ENGINE=ideogram4`
 (`pipeline/ideogram_frames.py`: Ideogram 4 bbox layout pass, then a Qwen identity pass — Ideogram 4 is

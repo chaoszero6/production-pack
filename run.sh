@@ -1273,6 +1273,55 @@ CURRENT=0
 REACHED_FROM_CLIP=true
 [ -n "$FROM_CLIP" ] && REACHED_FROM_CLIP=false
 
+# ── Manual-review halt ────────────────────────────────────────────────────────
+# A clip that fails QA after every retry writes $RUN_DIR/HALT_FOR_REVIEW.json and the
+# run EXITS (exit 3) so the operator can look at the takes. The run resumes only after
+# one of these markers exists in that clip's directory:
+#   clips/<SID>/MANUAL_PASS   accept the clip as it is (best take restored by best_take.py)
+#   clips/<SID>/RETRY_AGAIN   re-render it (retry counter reset; edit the shot list /
+#                             reviewed_prompt.json first if the fix lives there)
+HALT_FILE="$RUN_DIR/HALT_FOR_REVIEW.json"
+if [ -f "$HALT_FILE" ]; then
+    HALT_SID=$(python3 -c "import json; print(json.load(open('$HALT_FILE')).get('shot_id',''))" 2>/dev/null || echo "")
+    if [ -n "$HALT_SID" ] && [ -f "$RUN_DIR/clips/$HALT_SID/MANUAL_PASS" ]; then
+        log "[$HALT_SID] MANUAL_PASS found — operator accepted the clip; clearing the halt"
+        python3 - "$RUN_DIR/clips/$HALT_SID/qa_verdict.json" <<'PYEOF'
+import json, os, sys, time
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+d["verdict"] = "PASS"
+d["manual_pass"] = True
+d["_manual_pass_note"] = "accepted by the operator after escalation (" + time.strftime("%Y-%m-%d %H:%M:%S") + ")"
+tmp = p + ".tmp"
+json.dump(d, open(tmp, "w"), indent=2)
+os.replace(tmp, p)
+PYEOF
+        rm -f "$HALT_FILE"
+    elif [ -n "$HALT_SID" ] && [ -f "$RUN_DIR/clips/$HALT_SID/RETRY_AGAIN" ]; then
+        log "[$HALT_SID] RETRY_AGAIN found — operator asked for a fresh set of takes; clearing the halt"
+        python3 - "$RUN_DIR/clips/$HALT_SID/qa_verdict.json" <<'PYEOF'
+import json, os, sys
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+d["retry_count"] = 0
+d["verdict"] = "FAIL"
+d.pop("escalated_best_take", None)
+tmp = p + ".tmp"
+json.dump(d, open(tmp, "w"), indent=2)
+os.replace(tmp, p)
+PYEOF
+        rm -f "$RUN_DIR/clips/$HALT_SID/RETRY_AGAIN" "$HALT_FILE"
+    else
+        die "run is halted for manual review of ${HALT_SID:-?} (see $HALT_FILE). Decide first: touch $RUN_DIR/clips/${HALT_SID:-<SID>}/MANUAL_PASS to accept it, or touch $RUN_DIR/clips/${HALT_SID:-<SID>}/RETRY_AGAIN to re-render it, then ./launch_resume.sh $RUN_DIR"
+    fi
+fi
+
 for SHOT_ID in $SHOT_IDS; do
     CURRENT=$((CURRENT + 1))
     CLIP_DIR="$RUN_DIR/clips/$SHOT_ID"
@@ -1899,8 +1948,32 @@ except: print('')
 
     if [ "$PASSED" = "false" ]; then
         python3 "$PACK_DIR/pipeline/best_take.py" "$CLIP_DIR" 2>&1 | tee -a "$RUN_DIR/pipeline.log" || true
-        log "[$SHOT_ID] ESCALATED after $MAX_RETRY retries"
-        notify "Clip $SHOT_ID ESCALATED — failed $MAX_RETRY attempts\nNeeds manual review or shot redesign" "ESCALATION" "$CLIP_DIR/clip.mp4"
+        log "[$SHOT_ID] ESCALATED after $MAX_RETRY retries — halting the run for manual review"
+        HALT_FILE="$RUN_DIR/HALT_FOR_REVIEW.json"
+        python3 - "$HALT_FILE" "$SHOT_ID" "$CLIP_DIR" "$MAX_RETRY" "$CURRENT" "$TOTAL" <<'PYEOF'
+import json, os, sys, time
+halt, sid, clip_dir, max_retry, cur, total = sys.argv[1:7]
+reason = ""
+try:
+    v = json.load(open(os.path.join(clip_dir, "qa_verdict.json")))
+    reason = v.get("_re_render_reason") or v.get("summary") or ""
+except Exception:
+    pass
+d = {"shot_id": sid, "clip": cur + "/" + total, "halted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+     "reason": f"QA FAIL after {max_retry} takes: " + str(reason)[:600],
+     "takes": os.path.join(clip_dir, "takes"), "clip": os.path.join(clip_dir, "clip.mp4"),
+     "to_accept": "touch " + os.path.join(clip_dir, "MANUAL_PASS"),
+     "to_rerender": "touch " + os.path.join(clip_dir, "RETRY_AGAIN") + "  (edit shot_list.json / reviewed_prompt.json first if needed)",
+     "then": "./launch_resume.sh " + os.path.dirname(os.path.dirname(clip_dir))}
+tmp = halt + ".tmp"
+json.dump(d, open(tmp, "w"), indent=2)
+os.replace(tmp, halt)
+PYEOF
+        notify "Clip $CURRENT/$TOTAL ($SHOT_ID) ESCALATED — failed $MAX_RETRY takes.\nRUN HALTED for manual review.\nTakes: $CLIP_DIR/takes/\nAccept: touch $CLIP_DIR/MANUAL_PASS\nRe-render: touch $CLIP_DIR/RETRY_AGAIN\nThen: ./launch_resume.sh $RUN_DIR" "ESCALATION — RUN HALTED" "$CLIP_DIR/clip.mp4"
+        log "[$SHOT_ID] halt record: $HALT_FILE — accept with MANUAL_PASS or re-render with RETRY_AGAIN, then ./launch_resume.sh $RUN_DIR"
+        sleep 3   # let the notify post before the process tree goes away
+        rm -f "$OUTPUT_DIR/.gen_phase_active" "$OUTPUT_DIR/.audio_phase_active"
+        exit 3
     fi
 
     # ── 2g. Upscale deferred to batch pass after all clips generated ──

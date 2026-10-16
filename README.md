@@ -45,6 +45,17 @@ Environment overrides: `COMFY_DIR`, `MODEL_DIR`, `HF_TOKEN`, `PP_PROFILE`.
 
 ---
 
+## Stopping, halting and resuming
+
+- `./stop.sh` stops the run, its agent turns, in-flight renders, the pack's watchers and the
+  LLM monitor, and clears the ComfyUI queue (`--keep-monitor` leaves the monitor up,
+  `--gpu llm|none` picks the GPU owner afterwards). Nothing is deleted.
+- A clip that still fails QA after `MAX_RETRY` takes **halts the run** (exit 3) after posting the
+  escalation: `output/<run>/HALT_FOR_REVIEW.json` names the shot and the archived takes under
+  `clips/<SID>/takes/`. Review by hand, then `touch clips/<SID>/MANUAL_PASS` to accept the best
+  take or `touch clips/<SID>/RETRY_AGAIN` to render a fresh set (edit the shot list or
+  `reviewed_prompt.json` first if the fix lives there), and `./launch_resume.sh output/<run>`.
+
 ## How a run works
 
 ```
