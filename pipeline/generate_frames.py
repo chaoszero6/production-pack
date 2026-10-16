@@ -135,6 +135,18 @@ def resolve(path: str, shot_dir: str, run_dir: str) -> str | None:
     for c in cands:
         if os.path.isfile(c):
             return os.path.abspath(c)
+    # A planner-invented variant (harbour_square_prologue.png) falls back to the canonical
+    # file in the same directory, as generate_video_direct._sibling_ref does; without it the
+    # keyframe renders with no plate at all (S01_001 take 3 rendered with "0 refs").
+    for c in cands:
+        d = os.path.dirname(c)
+        if os.path.isdir(d):
+            stem = os.path.basename(d)
+            for name in (f"{stem}.png", f"{stem}_side.png", f"{stem}_three_quarter.png", f"{stem}_front.png"):
+                alt = os.path.join(d, name)
+                if os.path.isfile(alt):
+                    log(f"  reference not found, using sibling: {os.path.basename(c)} -> {name}")
+                    return os.path.abspath(alt)
     return None
 
 

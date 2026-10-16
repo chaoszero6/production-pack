@@ -43,6 +43,27 @@ What the local H3 actually is (sources: `comfy_extras/nodes_minimax_h3.py`,
 | A 10 s shot asked for four montage beats (nets, bell, kite, baby) and an entrance at 9.0 s | a montage was written as one shot | One beat per clip (`shot_list_lint.py` blocks `montage_in_one_shot`). |
 | The QA gate demanded all 11 categories ≥ 0.85 including "figure ≤ 12 % of frame height", "wall gradient energy ≥ 0.75 of plate", "luma within ± 10 %" | the inspector invented pixel gates and the gate trusted them | The inspector scores; `normalise_qa_verdict.py` decides: structural categories ≥ 0.70, overall ≥ 0.75 → PASS. Soft categories go to the assembly ledger. Invented numeric gates are evidence, not rules. |
 
+
+### 0.3 Keyframe engines — where the position and size of a figure come from
+`FRAME_ENGINE=qwen` (default): Qwen Image 2.1 with the design sheets and the plate as references
+(`generate_frames.py`). Identity is good; placement is prompt-only (no boxes).
+`FRAME_ENGINE=ideogram4`: `pipeline/ideogram_frames.py`, two passes. Pass 1 renders the layout
+with the LOCAL Ideogram 4 through ComfyUI's native graph (the official "Ideogram v4: Text to
+Image" template: conditional + unconditional nvfp4 UNETs in a `DualModelGuider` at cfg 7,
+`CFGOverride` 3 for the last 30 %, Qwen3-VL-8B encoder `type ideogram4`, `Ideogram4Scheduler`
+20 steps / mu 0 / std 1.75, Flux2 VAE) from a structured JSON caption whose `elements[].bbox`
+= `[y_min, x_min, y_max, x_max]` in 0–1000 pins every figure's position and height — the one
+control the Qwen path lacks. Pass 2 hands that layout image to Qwen Image 2.1 as `<Picture 1>`
+with the character sheets and asks for the same composition with the sheet identities, because
+Ideogram 4 is text-to-image only (official docs: no reference images, no edit, no character
+reference — its figures are generic). The result goes to H3 as the i2va first frame (or fl2va
+first+last). Models on 207: `/mnt/ChaosWares1/comfyui/models` (registered in
+`extra_model_paths.yaml`): `ideogram4_nvfp4_mixed` + `ideogram4_unconditional_nvfp4_mixed`
+(Comfy-Org/Ideogram-4), `qwen3vl_8b_nvfp4`; VAE `flux2-vae`. Licence: Ideogram 4
+Non-Commercial. The planner (`run.sh` 2c) writes `placements` / `background` / `style` into
+`frame_spec.json` for it; without the models the script exits 4 and `run.sh` falls back to the
+Qwen path.
+
 ### 0.2 Narration
 The official voiceover pattern is `The narrator (S1) says in an off-screen voiceover: <d>…</d>
 while <Subject 1>'s lips remain completely closed.` The pipeline does NOT use it: `run.sh`

@@ -1665,14 +1665,35 @@ except Exception:
             # frame_spec.json; generate_frames.py renders it with the GPU handed
             # to ComfyUI and writes frame_meta.json for the video step.
             write_prompt "$CLIP_DIR/prompt_image.txt" \
-                "Plan the keyframes for $SHOT_ID — DO NOT call ComfyUI (it is down while you run; the pipeline renders your spec). Read $CLIP_DIR/reviewed_prompt.json (h3_mode, final_prompt, reference_assignments), $RUN_DIR/shot_list.json (this shot's camera, characters_in_frame with positions/hand_position/facing, location_id, lighting, edit.cut_in/cut_out, readable_props) and the manifests $RUN_DIR/character_manifest.json / $RUN_DIR/location_manifest.json for reference image paths. Write $CLIP_DIR/frame_spec.json: {\"mode\": \"composited_i2v|first_frame_only|first_last_frame|reference\", \"frames\": [{\"role\": \"first_frame\", \"prompt\": <Qwen Image 2.1 prompt: shot size FIRST and LAST, every character exactly once with position/pose/gaze from edit.cut_in, the location's layout, lighting, readable prop values verbatim>, \"references\": [<abs paths: ONE design sheet per character in frame, the location plate, and continuity frames prev_clip_lastframe.png / scene_establishing_frame.png if present in $CLIP_DIR>], \"width\": 1344, \"height\": 768}, {\"role\": \"last_frame\", ...only for first_last_frame, pose from edit.cut_out}], \"video_references\": [{\"tag\": \"<Subject N>\", \"image\": <abs path>, \"role\": ...}]}. For mode reference write frames: [] (no keyframe needed). Never name an object you want absent (Qwen ignores negatives); describe only what IS in frame."
+                "Plan the keyframes for $SHOT_ID — DO NOT call ComfyUI (it is down while you run; the pipeline renders your spec). Read $CLIP_DIR/reviewed_prompt.json (h3_mode, final_prompt, reference_assignments), $RUN_DIR/shot_list.json (this shot's camera, characters_in_frame with positions/hand_position/facing, location_id, lighting, edit.cut_in/cut_out, readable_props) and the manifests $RUN_DIR/character_manifest.json / $RUN_DIR/location_manifest.json for reference image paths. Write $CLIP_DIR/frame_spec.json: {\"mode\": \"composited_i2v|first_frame_only|first_last_frame|reference\", \"frames\": [{\"role\": \"first_frame\", \"prompt\": <Qwen Image 2.1 prompt: shot size FIRST and LAST, every character exactly once with position/pose/gaze from edit.cut_in, the location's layout, lighting, readable prop values verbatim>, \"references\": [<abs paths: ONE design sheet per character in frame, the location plate, and continuity frames prev_clip_lastframe.png / scene_establishing_frame.png if present in $CLIP_DIR>], \"width\": 1344, \"height\": 768, \"background\": <one sentence: the environment behind the figures, from the location plate>, \"placements\": [{\"character_id\": <id>, \"bbox\": [y_min, x_min, y_max, x_max] in 0-1000 of the frame (where the figure stands and how tall it is for THIS shot size: full-body in a wide = 300-900 tall, medium = 150-1000, close-up = 0-1000), \"desc\": <the figure in one sentence: pose from edit.cut_in, facing, costume colours, hand position>}] one per character in frame, \"style\": {\"aesthetics\": ..., \"lighting\": <from the shot>, \"art_style\": \"Pixar-style 3D animated feature film\", \"medium\": \"3d_render\"}}, {\"role\": \"last_frame\", ...only for first_last_frame, pose from edit.cut_out}], \"video_references\": [{\"tag\": \"<Subject N>\", \"image\": <abs path>, \"role\": ...}]}. For mode reference write frames: [] (no keyframe needed). Never name an object you want absent (Qwen ignores negatives); describe only what IS in frame."
             run_dsh_agent "image-generator" "$CLIP_DIR/prompt_image.txt" "$CLIP_DIR/frame_spec.json"
             touch "$OUTPUT_DIR/.gen_phase_active"
-            if python3 "$PACK_DIR/pipeline/generate_frames.py" --shot-dir "$CLIP_DIR" --run-dir "$RUN_DIR" \
-                    --comfyui-url "$COMFYUI_URL" --keep-gpu >> "$RUN_DIR/pipeline.log" 2>&1; then
-                log "[$SHOT_ID] frames rendered"
-            else
-                log "[$SHOT_ID] WARNING: generate_frames.py failed — video step will use references only"
+            # FRAME_ENGINE=qwen (default): Qwen Image 2.1 with the design sheets as references.
+            # FRAME_ENGINE=ideogram4: Ideogram 4 bbox layout pass + Qwen identity pass
+            # (pipeline/ideogram_frames.py; needs the ideogram4 core package + gated weights —
+            # exit 4 = not installed, falls back to the Qwen path).
+            # A retry MUST re-render the keyframe: the renderers skip when frame_meta.json
+            # already points at a frame, and S01_001 take 2 reused take 1's roped keyframe
+            # that way (QA had asked for a rope-free one).
+            FORCE_FRAMES=""
+            [ "$RETRY" -gt 0 ] && FORCE_FRAMES="--force"
+            FRAMES_OK=false
+            if [ "${FRAME_ENGINE:-qwen}" = "ideogram4" ]; then
+                if python3 "$PACK_DIR/pipeline/ideogram_frames.py" --shot-dir "$CLIP_DIR" --run-dir "$RUN_DIR" \
+                        --comfyui-url "$COMFYUI_URL" --keep-gpu $FORCE_FRAMES >> "$RUN_DIR/pipeline.log" 2>&1; then
+                    FRAMES_OK=true
+                    log "[$SHOT_ID] frames rendered (ideogram4 layout + qwen identity)"
+                else
+                    log "[$SHOT_ID] WARNING: ideogram_frames.py failed — falling back to generate_frames.py"
+                fi
+            fi
+            if [ "$FRAMES_OK" = "false" ]; then
+                if python3 "$PACK_DIR/pipeline/generate_frames.py" --shot-dir "$CLIP_DIR" --run-dir "$RUN_DIR" \
+                        --comfyui-url "$COMFYUI_URL" --keep-gpu $FORCE_FRAMES >> "$RUN_DIR/pipeline.log" 2>&1; then
+                    log "[$SHOT_ID] frames rendered"
+                else
+                    log "[$SHOT_ID] WARNING: generate_frames.py failed — video step will use references only"
+                fi
             fi
             rm -f "$OUTPUT_DIR/.gen_phase_active"
         fi

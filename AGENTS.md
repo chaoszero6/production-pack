@@ -340,6 +340,11 @@ is (node source, model card, official prompt guides) and what the run proved are
 | gate demanded all 11 categories ≥ 0.85 incl. "figure ≤ 12 % of frame height", "luma ± 10 %" | inspector invented pixel gates; gate trusted them | **the inspector scores, `normalise_qa_verdict.py` decides**: structural categories (hands_limbs, face_expression, character_identity, duplication, motion_quality, composition, continuity) ≥ 0.70 each and overall ≥ 0.75 → PASS; soft categories go to `assembly_fixes.json` |
 | a retry can score lower than the take it replaced | last take always kept | failed takes archived under `clips/<id>/takes/`; `pipeline/best_take.py` restores the best at escalation; `MAX_RETRY=3` |
 
+Keyframe engines: `FRAME_ENGINE=qwen` (default, Qwen Image 2.1 + sheets) or `FRAME_ENGINE=ideogram4`
+(`pipeline/ideogram_frames.py`: Ideogram 4 bbox layout pass, then a Qwen identity pass — Ideogram 4 is
+text-only, so it places figures exactly but cannot lock identity; native ComfyUI graph with the
+nvfp4 cond + unconditional UNETs on `/mnt/ChaosWares1/comfyui/models`; see rules §0.3).
+
 Verified 2026-10-16: the local Strata model DOES read images (its `strata-vision` encoder
 described a frame's whale, bell, lantern and counted the figures), so qa-inspector runs
 locally; the OpenRouter route is no longer needed for vision.
