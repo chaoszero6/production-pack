@@ -141,7 +141,7 @@ def main():
     lines.append("5. LIGHTING CONTINUITY: Same time_of_day = same lighting tone across scene clips")
     lines.append("   (no sudden shift from warm morning to cold blue within the same scene unless scripted)")
     lines.append("6. CHARACTER STATE: If a character is sitting, they stay sitting; props in hand stay in hand")
-    lines.append("   (Tobias has porridge bowl → bowl must be visible in all table shots)")
+    lines.append("   (props in hand stay in hand across cuts)")
     lines.append("7. COSTUME/APPEARANCE: Same clothes, accessories, hairstyle across the entire scene")
     lines.append("   (goggles on forehead stay on forehead, apron stays on, etc.)")
     lines.append("8. MATCH CUT/TRANSITION: If prev clip ends with match-cut or dissolve, the first frame")

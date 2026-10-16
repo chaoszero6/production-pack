@@ -30,15 +30,17 @@ Provider names must match registered providers in your DSH profiles.
 Model identifiers must also be registered under that provider.
 Leave blank to use built-in defaults below.
 
-DEFAULT ROUTE (2026-10-11): reasoning AND execution tiers run on the LOCAL
-Qwen 3.8 Flash Next 125B served by Strata (dsh provider "strata-swift",
-model swift-1.5-iq3_xxs, http://127.0.0.1:8321/v1, effort xhigh,
-maxTokens 131072 in the headless profile). It is TEXT ONLY, so the vision
-tier (qa-inspector) stays on OpenRouter gemini-3-flash-preview.
-The unit/port/model constants live in pipeline/local_llm.py — change them there.
+DEFAULT ROUTE: every tier — reasoning, execution and vision (qa-inspector) —
+runs on the LOCAL Qwen 3.8 Flash Next 125B served by Strata (dsh provider
+"strata-swift", model swift-1.5-iq3_xxs, http://127.0.0.1:8321/v1, effort xhigh).
+Strata is MULTIMODAL: the engine now ships the GPU strata-vision encoder
+(engine/strata-vision built from tools/vision; config's "vision" section), so
+qa-inspector reads clip frames locally. The unit/port/model constants live in
+pipeline/local_llm.py — change them there.
 
-FALLBACK: If a cloud provider returns 402/429, the script detects it
-and falls back to the local LLM. Requires CLOUD_ROUTING=0 in run.sh.
+No cloud is used. The unit is started (≈2 min) before every route is written,
+and a state file (output/.cloud_fallback_state) is never consulted for routing —
+the local LLM is the only provider. Requires CLOUD_ROUTING=0 in run.sh.
 
 NOTE: dsh resolves the model from agent-default-model AT LAUNCH, so it
 must be rewritten before every dsh call.
@@ -93,9 +95,10 @@ _DEFAULTS = {
     # ── Local ninfer-qwen36-35b — primary execution & vision provider ────
     ("ninfer-qwen36-35b",  "execution"):  ("qwen3.6-35b-a3b",                "xhigh"),
     ("ninfer-qwen36-35b",  "vision"):     ("qwen3.6-35b-a3b",                "xhigh"),
-    # ── Local Strata Swift (Qwen 3.8 Flash Next 125B) — PRIMARY reasoning+execution ──
+    # ── Local Strata Swift (Qwen 3.8 Flash Next 125B) — PRIMARY reasoning+execution+vision ──
     (local_llm.PROVIDER, "reasoning"): (local_llm.MODEL,                     local_llm.EFFORT),
     (local_llm.PROVIDER, "execution"): (local_llm.MODEL,                     local_llm.EFFORT),
+    (local_llm.PROVIDER, "vision"):    (local_llm.MODEL,                     local_llm.EFFORT),
     # ── Retired local Qwen 3.8 27B (ninfer units are masked on 207) ────────
     ("ninfer",         "reasoning"):  ("qwen3.8-27b",                        "xhigh"),
     ("ninfer",         "execution"):  ("qwen3.8-27b",                        "xhigh"),
@@ -108,8 +111,8 @@ _DEFAULTS = {
 # Read env vars at import time
 _REASONING_LOCAL_DEFAULT = local_llm.PROVIDER  # Strata Swift — Qwen 3.8 Flash Next (local)
 _EXECUTION_LOCAL_DEFAULT = local_llm.PROVIDER  # same model, same xhigh effort
-_VISION_DEFAULT          = "openrouter"        # Strata is text-only; QA needs pixels
-_CLOUD_DEFAULT           = "openrouter"        # fallback base
+_VISION_DEFAULT          = local_llm.PROVIDER  # Stratia Swift is multimodal (vision encoder in pipeline); QA stays local
+_CLOUD_DEFAULT           = "openrouter"        # fallback base (never used under local-only)
 
 REASONING_PROVIDER   = _env("DSH_REASONING_PROVIDER",   _REASONING_LOCAL_DEFAULT)
 REASONING_MODEL_ENV  = _env("DSH_REASONING_MODEL",       None)
@@ -314,22 +317,25 @@ def _fallback_to_local():
     The Strata unit is tried first; if nothing answers it is STARTED here
     (≈2 min) because a route to a dead provider only produces
     "TRANSPORT: Connection error" three retries later."""
+    # Honor an explicit per-tier effort override (e.g. DSH_EXECUTION_EFFORT)
+    # if the caller set one; otherwise use the module default (xhigh).
+    eff = _env("DSH_EXECUTION_EFFORT") or _env("DSH_REASONING_EFFORT") or local_llm.EFFORT
     for name, model, unit, health_url in LOCAL_ALTS:
         try:
             r = requests.get(health_url, timeout=3)
             if r.status_code == 200:
-                return name, model, local_llm.EFFORT
+                return name, model, eff
         except Exception:
             continue
 
     print(f"[set_agent_model] no local LLM healthy — starting {local_llm.UNIT} "
           f"(≈2 min)", file=sys.stderr)
     if local_llm.start():
-        return local_llm.PROVIDER, local_llm.MODEL, local_llm.EFFORT
+        return local_llm.PROVIDER, local_llm.MODEL, eff
     units = ", ".join(u for _, _, u, _ in LOCAL_ALTS)
     print(f"[set_agent_model] WARNING: no local LLM healthy ({units}). "
           "Agent call will likely fail.", file=sys.stderr)
-    return local_llm.PROVIDER, local_llm.MODEL, local_llm.EFFORT
+    return local_llm.PROVIDER, local_llm.MODEL, eff
 
 
 # ── Main entry point ────────────────────────────────────────

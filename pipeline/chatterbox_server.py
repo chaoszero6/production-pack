@@ -88,15 +88,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _generate(self, text, ref_path, exaggeration, cfg):
         try:
-            import torch
-            import torchaudio
+            import numpy as np
+            import soundfile as sf
 
             m = get_model()
             wav = m.generate(text, audio_prompt_path=ref_path,
                              exaggeration=exaggeration, cfg_weight=cfg)
 
+            # torchaudio 2.11's default save backend requires the (uninstalled)
+            # torchcodec package. Write the WAV via soundfile instead — no
+            # torchcodec dependency, and the samplerate matches m.sr.
             buf = io.BytesIO()
-            torchaudio.save(buf, wav.cpu(), m.sr, format="wav")
+            mono = wav.squeeze(0).cpu().float().numpy()
+            sf.write(buf, mono, m.sr, format="wav", subtype="PCM_16")
             wav_bytes = buf.getvalue()
 
             self.send_response(200)

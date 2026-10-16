@@ -22,13 +22,13 @@ import urllib.parse
 COMFYUI = "http://127.0.0.1:8188"
 
 # ── Model paths (relative to ComfyUI model dirs) ─────────────
-UNET_REF2VA = "cicalooo__10Eros-Max-h3-int8-convrot__10Eros_Max_h3_ref2va_beta2_pruned_int8_convrot.safetensors"
-UNET_FL2VA = "cicalooo__10Eros-Max-h3-int8-convrot__10Eros_Max_h3_fl2va_beta2_pruned_int8_convrot_skip_edges.safetensors"
+UNET_REF2VA = "minimax_h3_ref2va_bf16.safetensors"
+UNET_FL2VA = "minimax_h3_fl2va_bf16.safetensors"
 CLIP_ENCODER = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
 AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
 TURBO_LORA_REF2V = "minimax/minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
-TURBO_LORA_FL2V = "minimax/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
+TURBO_LORA_FL2V = "minimax/minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"
 
 OUTPUT_PREFIX = "video/production_pack"
 WIDTH = 1344

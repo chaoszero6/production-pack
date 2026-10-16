@@ -31,7 +31,7 @@ from pathlib import Path
 
 import requests
 
-from story_ref_ids import name_for_id, resolve_id
+from story_ref_ids import name_for_id, reference_ids, resolve_id
 
 COMFYUI = "http://127.0.0.1:8188"
 UNET_NAME = "qwen_image_2.1_bf16.safetensors"
@@ -61,9 +61,94 @@ def build_prompt(body: str) -> str:
     return f"Location reference. {body} {STYLE_SUFFIX}"
 
 
+def _palette_summary(color_palette: list) -> str:
+    if not color_palette:
+        return ""
+    parts = []
+    for entry in color_palette:
+        if isinstance(entry, dict):
+            role = entry.get("role", "")
+            name = entry.get("name", "")
+            hex_val = entry.get("hex", "")
+            if name:
+                part = f"{role} {name}" if role else name
+                if hex_val:
+                    part += f" ({hex_val})"
+                parts.append(part)
+    return "; ".join(parts)
+
+
+def locations_from_story(story_locations: list, run_dir) -> list:
+    """Build LOCATIONS-format entries from story.json location objects.
+
+    Each story.json location has: name, description, color_palette.
+    We derive establishing/medium prompts from the description and palette.
+    """
+    known_ids = reference_ids(run_dir, "locations")
+    result = []
+    for loc in story_locations:
+        if not isinstance(loc, dict):
+            continue
+        name = loc.get("name", "")
+        if not name:
+            continue
+        loc_id = resolve_id(name, loc.get("id", ""), known_ids)
+        description = loc.get("description", "")
+        palette = _palette_summary(loc.get("color_palette", []))
+        medium_focus = _medium_focus(name, description)
+        mood_est = f"Wide establishing shot of {name}. {description}"
+        if palette:
+            mood_est += f" Color palette: {palette}."
+        mood_est += " No people."
+        mood_med = f"Medium shot of {name}, focusing on {medium_focus}. {description}"
+        if palette:
+            mood_med += f" Color palette: {palette}."
+        mood_med += " No people."
+        result.append({
+            "id": loc_id,
+            "medium": medium_focus,
+            "mood_establishing": mood_est,
+            "mood_medium": mood_med,
+            "lighting_establishing": "cinematic, mood-appropriate lighting",
+            "lighting_medium": "cinematic, mood-appropriate lighting",
+        })
+    return result
+
+
+def _medium_focus(name: str, description: str) -> str:
+    """Derive a sub-area focus for the medium shot from the location name."""
+    name_lower = name.lower()
+    if "square" in name_lower:
+        return "the central square"
+    if "harbour" in name_lower or "harbor" in name_lower:
+        return "the harbour edge"
+    if "forge" in name_lower:
+        return "the main workbench"
+    if "hall" in name_lower:
+        return "the main display wall"
+    if "spire" in name_lower or "tower" in name_lower:
+        return "the upper platform"
+    if "house" in name_lower or "home" in name_lower:
+        return "the main room"
+    if "roof" in name_lower:
+        return "the rooftop"
+    if "sea" in name_lower or "ocean" in name_lower:
+        return "the water's edge"
+    if "eye" in name_lower:
+        return "the inner chamber"
+    if "dam" in name_lower:
+        return "the dam structure"
+    if "cliff" in name_lower:
+        return "the cliff face"
+    return "the main area"
+
+
 # One entry per story.json location id. `medium` is the sub-area focus for the
 # medium shot (filename suffix {location_id}_{medium}.png), matching the
 # reference paths used in shot_list.json where applicable (e.g. nana_repair_shop_workroom).
+# NOTE: This hardcoded list is from the Clockwork Moth story. It is only used
+# when story.json locations match these ids. For any other story, locations
+# are derived dynamically via locations_from_story().
 LOCATIONS = [
     {
         "id": "tobias_bedroom",
@@ -223,22 +308,38 @@ def main() -> int:
     story_path = Path(args.story) if args.story else run_dir / "story.json"
     # story.json may omit the canonical location ids the script's LOCATIONS
     # table (and shot_list.json) use — recover them from the names.
-    known_ids = {loc["id"] for loc in LOCATIONS}
+    hardcoded_ids = {loc["id"] for loc in LOCATIONS}
     try:
-        story_locations = json.loads(story_path.read_text()).get("locations", [])
+        story_data = json.loads(story_path.read_text())
+        story_locations = story_data.get("locations", [])
     except (OSError, json.JSONDecodeError):
         story_locations = []
+
+    # Determine which location set to use:
+    # - If story.json locations match the hardcoded Clockwork Moth ids, use those.
+    # - Otherwise, derive locations dynamically from story.json.
     story_ids = {
-        loc.get("id") or resolve_id(loc.get("name", ""), "", known_ids)
+        loc.get("id") or resolve_id(loc.get("name", ""), "", hardcoded_ids)
         for loc in story_locations
     }
-    missing = [l["id"] for l in LOCATIONS if l["id"] not in story_ids]
-    if missing:
-        log(f"WARNING: locations in script not in story.json: {missing}")
+    if story_ids & hardcoded_ids:
+        # Story matches the hardcoded set — use curated prompts
+        active_locations = LOCATIONS
+        missing = [l["id"] for l in LOCATIONS if l["id"] not in story_ids]
+        if missing:
+            log(f"WARNING: locations in script not in story.json: {missing}")
+    else:
+        # Different story — derive locations from story.json
+        active_locations = locations_from_story(story_locations, run_dir)
+        hardcoded_set = {loc["id"] for loc in active_locations}
+        missing = [l["id"] for l in LOCATIONS if l["id"] not in hardcoded_set]
+        if missing:
+            log(f"NOTE: hardcoded LOCATIONS not in this story (expected): {missing}")
+        log(f"Using {len(active_locations)} locations derived from story.json")
 
     # ── Plan jobs ────────────────────────────────────────────────────
     jobs = []  # (loc, shot_key, prompt, seed, dest, prefix, lighting)
-    for li, loc in enumerate(LOCATIONS):
+    for li, loc in enumerate(active_locations):
         loc_dir = run_dir / "locations" / loc["id"]
         plan = [
             ("establishing", f"{loc['id']}.png", loc["mood_establishing"], loc["lighting_establishing"]),
@@ -353,7 +454,7 @@ def main() -> int:
         "files": [],
     }
     all_ok = True
-    for loc in LOCATIONS:
+    for loc in active_locations:
         loc_dir = run_dir / "locations" / loc["id"]
         shots = {}
         for shot, fname in (("establishing", f"{loc['id']}.png"),

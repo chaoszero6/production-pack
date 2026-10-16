@@ -326,6 +326,18 @@ _run_dsh_agent_internal() {
 
     # all agents are cloud-hosted: point agent-default-model at the right model
     # (pro for the reasoning agents, flash for everything else) before launch
+    #
+    # audio-producer robustness: its voice-casting turn (effort xhigh) has
+    # repeatedly looped ("finalizing / preparing to write JSON") and been killed
+    # by the empty-artifact watcher without writing voice_config.json. Curb the
+    # loop by running ONLY this preset at reduced effort; every other agent keeps
+    # xhigh. set_agent_model.py now honors DSH_EXECUTION_EFFORT through its local
+    # fallback, so the route and the dsh child inherit this value.
+    _AP_SAVED_EFFORT=""
+    if [ "$preset" = "audio-producer" ]; then
+        _AP_SAVED_EFFORT="${DSH_EXECUTION_EFFORT:-}"
+        export DSH_EXECUTION_EFFORT="${_AP_SAVED_EFFORT:-high}"
+    fi
     set_agent_model "$preset"
 
     local agent_exit=0
@@ -334,6 +346,11 @@ _run_dsh_agent_internal() {
         "$prompt_text" \
         > "$raw_output" \
         2> "$err_output" || agent_exit=$?
+
+    # Restore/clear the audio-producer effort override now the agent call is done.
+    if [ "$preset" = "audio-producer" ]; then
+        if [ -n "$_AP_SAVED_EFFORT" ]; then export DSH_EXECUTION_EFFORT="$_AP_SAVED_EFFORT"; else unset DSH_EXECUTION_EFFORT; fi
+    fi
 
     # Append stderr to pipeline.log for post-mortem
     if [[ -s "$err_output" ]]; then
@@ -1179,9 +1196,23 @@ if ! skip_if_done "$RUN_DIR/audio/voices/voice_config.json" "Voice Design"; then
     swap_to_27b
     write_prompt "$RUN_DIR/prompt_voices.txt" \
         "Read $RUN_DIR/story.json and CAST the voices per the voice-casting skill. Every role incl. 'narrator' gets a voice class (child/teen/adult-female/adult-male/elderly-female/elderly-male/creature); the narrator uses a class NO character uses. Orpheus (voices tara/leah/jess/leo/dan/mia/zac/zoe) has ADULT voices only — children and elderly roles use Chatterbox cloning from an age-matched reference WAV (look under $RUN_DIR/audio/voices/refs/ and /root/production_pack/output/voices/refs/; pick the closest) or Orpheus with post_fx (pitch_semitones -2..+3, tempo 0.9..1.1); never an adult voice with affectation. CosyVoice is NOT available (no REST endpoint). DO NOT call any TTS port — the TTS engines are down while you run; the pipeline renders and measures the line-up afterwards. Write ONLY $RUN_DIR/audio/voices/voice_config.json: {\"<role>\": {\"voice_class\": ..., \"engine\": \"orpheus|chatterbox|kokoro\", \"voice\": ... or \"reference_audio\": <abs path>, \"post_fx\": {...} optional, \"notes\": ...}, ...} with one entry per speaking character (ids from story.json) plus 'narrator'."
-    run_dsh_agent "audio-producer" "$RUN_DIR/prompt_voices.txt" "$RUN_DIR/audio/voices/voice_config.json"
-
-    # The TTS engines cannot run beside the LLM, so the agent only CAST; the
+    # The audio-producer reasoning turn can degenerate into a loop and time out
+    # without writing voice_config.json (empty artifact → run abort). Retry the
+    # initial cast a few times on an absent/empty artifact so one bad turn does
+    # not kill the whole production.
+    _CAST_ATTEMPT=1
+    while [ "$_CAST_ATTEMPT" -le 3 ]; do
+        if run_dsh_agent "audio-producer" "$RUN_DIR/prompt_voices.txt" "$RUN_DIR/audio/voices/voice_config.json"; then
+            [ -s "$RUN_DIR/audio/voices/voice_config.json" ] && break
+        fi
+        log "voice_config.json empty after cast attempt $_CAST_ATTEMPT — retrying"
+        _CAST_ATTEMPT=$((_CAST_ATTEMPT + 1))
+        rm -f "$RUN_DIR/audio/voices/voice_config.json"
+        sleep 5
+    done
+    if [ ! -s "$RUN_DIR/audio/voices/voice_config.json" ]; then
+        die "audio-producer failed to write voice_config.json after $_CAST_ATTEMPT attempts (check $RUN_DIR/pipeline.log)"
+    fi
     # pipeline renders the line-up with the GPU handed to the TTS cluster and
     # measures the separation. CAST_FAIL sends the agent back with the report.
     CAST_ROUNDS=0
