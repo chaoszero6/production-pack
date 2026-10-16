@@ -29,7 +29,11 @@ What the local H3 actually is (sources: `comfy_extras/nodes_minimax_h3.py`,
   POV, Roll — as a sentence: "The camera pushes in with small amplitude at slow speed toward …".
   Nothing else ("monotone 1.00→1.15 cumulative scale, no pull-back") is understood. A move
   must name its END state with the subject still framed at the shot's size — "slow tilt up"
-  alone drifted S01_004 into four seconds of empty sky with the kite gone by 3 s.
+  alone drifted S01_004 into four seconds of empty sky with the kite gone by 3 s. A MOVING prop
+  (kite, bird, thrown object) leaves the frame within 2–3 s whatever the prompt says — take 5 had
+  "the kite stays in the top of frame from first frame to last", the end state and the negatives,
+  and still lost it at 2 s. Keep such a prop "holding station" under a static camera, or do not
+  require it; never make its exit the cut point.
 
 ### 0.1 What the Cinderquay run proved (run_20261011_130959 — S01_001 ×10 takes, S01_002 ×6, 0 passes)
 

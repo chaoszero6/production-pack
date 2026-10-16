@@ -45,7 +45,11 @@
         from first frame to last; write where it sits at the END of the move ("the tilt ends
         with Aurel still half-body in the lower half of frame"), and keep every scripted prop
         (a kite, a letter) inside the frame until the last second. H3 follows "tilt up" into
-        empty sky if the end state is not written (S01_004 take 4).
+        empty sky if the end state is not written (S01_004 take 4). A MOVING prop (kite, bird,
+        thrown object) cannot be held at the frame edge: it leaves within 2–3 s whatever the
+        prompt says (S01_004 take 5 had every constraint and still lost the kite at 2 s). Write
+        it "holding station" at a fixed place in frame under a static camera, or REJECT the
+        shot to the Director if the shot list makes its exit the cut point.
       - **One beat, one entrance, one shot.** No timed reveals, no "empty until", no second
         action; an entrance is one subject at medium framing, stated in seconds.
       - **ONE COMPOSITION per clip.** `[Shot 1]` opens on THIS shot's framing and subject

@@ -127,6 +127,12 @@
         plate (ref2va drifts away from a plate's framing); scene openings with characters
         are `composited_i2v`; mid-scene coverage is `reference`; `first_last_frame` only for
         continuous action across the cut.
+      - **A moving prop is never the thing the frame must hold.** A kite, bird, ball or thrown
+        object drifts out of an H3 frame within 2–3 s whatever the prompt says (S01_004 ×5: the
+        kite left by 2 s every take and five seconds of a man hauling a bare line followed).
+        If the prop must be seen: static camera, the prop "holds station" at a fixed place
+        in frame, or the shot is wide enough to contain its travel. Never script a prop's
+        exit as `edit.cut_out` — cut on the character's look or hands instead.
       - **The picture illustrates the narration line** laid over it (S01_002 showed a whale
         hunt under a line about a kite and a laughing baby).
       - **References** are the canonical files the designers will produce:

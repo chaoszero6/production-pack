@@ -1316,6 +1316,14 @@ tmp = p + ".tmp"
 json.dump(d, open(tmp, "w"), indent=2)
 os.replace(tmp, p)
 PYEOF
+        # every stage must re-run: park the escalated take's artifacts (resume would otherwise
+        # see reviewed_prompt.json / clip.mp4 and skip straight to QA of the same clip)
+        _ARCH="$RUN_DIR/clips/$HALT_SID/takes/escalated_$(date +%Y%m%d_%H%M%S)"
+        mkdir -p "$_ARCH"
+        for f in reviewed_prompt.json frame_spec.json frame_meta.json first_frame.png last_frame.png composited_frame.png clip.mp4 generation_log.json comfyui_workflow.json qa_report.json prompt_review.txt prompt_image.txt prompt_qa.txt; do
+            [ -e "$RUN_DIR/clips/$HALT_SID/$f" ] && mv -f "$RUN_DIR/clips/$HALT_SID/$f" "$_ARCH/" 2>/dev/null || true
+        done
+        log "[$HALT_SID] escalated take parked in $_ARCH — review, frames and video will re-run"
         rm -f "$RUN_DIR/clips/$HALT_SID/RETRY_AGAIN" "$HALT_FILE"
     else
         die "run is halted for manual review of ${HALT_SID:-?} (see $HALT_FILE). Decide first: touch $RUN_DIR/clips/${HALT_SID:-<SID>}/MANUAL_PASS to accept it, or touch $RUN_DIR/clips/${HALT_SID:-<SID>}/RETRY_AGAIN to re-render it, then ./launch_resume.sh $RUN_DIR"
@@ -1983,8 +1991,11 @@ except: print('')
             # Keep every take: a retry can score LOWER than the take it replaces
             # (S01_005: hands 0.87 -> 0.74). best_take.py restores the best at escalation.
             mkdir -p "$CLIP_DIR/takes"
-            cp -f "$CLIP_DIR/clip.mp4" "$CLIP_DIR/takes/take_${RETRY}.mp4" 2>/dev/null || true
-            cp -f "$CLIP_DIR/qa_verdict.json" "$CLIP_DIR/takes/take_${RETRY}_verdict.json" 2>/dev/null || true
+            TAKE_N=$RETRY
+            while [ -e "$CLIP_DIR/takes/take_${TAKE_N}.mp4" ]; do TAKE_N=$((TAKE_N + 1)); done   # never overwrite an earlier take
+            cp -f "$CLIP_DIR/clip.mp4" "$CLIP_DIR/takes/take_${TAKE_N}.mp4" 2>/dev/null || true
+            cp -f "$CLIP_DIR/qa_verdict.json" "$CLIP_DIR/takes/take_${TAKE_N}_verdict.json" 2>/dev/null || true
+            [ -f "$CLIP_DIR/first_frame.png" ] && cp -f "$CLIP_DIR/first_frame.png" "$CLIP_DIR/takes/take_${TAKE_N}_first_frame.png" 2>/dev/null || true
             # Build failure summary for Discord
             QA_ISSUES=$(python3 -c "
 import json

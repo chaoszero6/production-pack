@@ -143,6 +143,12 @@ def lint(shots, run_dir, fix):
                 add(sid, "counted_crowd", False,
                     f"{field} counts a crowd ('{m.group(0)}') — H3 cannot count; say 'a few' / 'several'")
                 break
+        exit_re = re.compile(r"\b(climbs|flies|sails|drifts|exits?|leaves|goes)\s+(out|off)\b|out of (the )?frame|out of shot", re.IGNORECASE)
+        co = str((s.get("edit") or {}).get("cut_out") or "")
+        if exit_re.search(co):
+            add(sid, "exit_as_cut_point", False,
+                f"cut_out scripts something leaving the frame ('{co[:70]}') — H3 cannot time an exit; "
+                "cut on the character's look or hands instead, keep moving props holding station")
         if shot_type == "extreme-wide" and chars:
             add(sid, "wide_with_faces", False,
                 f"extreme-wide shot with {len(chars)} named character(s) — at 768p faces and hands "
