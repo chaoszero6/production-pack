@@ -1992,6 +1992,20 @@ except: print('')
         else
             RETRY=$((RETRY + 1))
             log "[$SHOT_ID] QA FAILED (attempt $RETRY/$MAX_RETRY)"
+            # Record the count AFTER the increment: a resume reads it back as RETRY, and 0 would
+            # mean "never failed" — every stage skipped and the same clip re-judged (S01_004 x2).
+            python3 - "$CLIP_DIR/qa_verdict.json" "$RETRY" <<'PYEOF'
+import json, os, sys
+p, n = sys.argv[1], int(sys.argv[2])
+try:
+    d = json.load(open(p))
+    d["retry_count"] = n
+    tmp = p + ".tmp"
+    json.dump(d, open(tmp, "w"), indent=2)
+    os.replace(tmp, p)
+except Exception:
+    pass
+PYEOF
             # Keep every take: a retry can score LOWER than the take it replaces
             # (S01_005: hands 0.87 -> 0.74). best_take.py restores the best at escalation.
             mkdir -p "$CLIP_DIR/takes"
