@@ -1850,6 +1850,9 @@ except Exception:
                 --shot-id "$SHOT_ID" \
                 2>> "$RUN_DIR/pipeline.log" || GEN_EXIT=$?
             rm -f "$OUTPUT_DIR/.gen_phase_active"
+            # The i2va graph writes video only: give the clip its stem as the audio track at
+            # anchor_s so previews, QA and assembly carry the same approved audio.
+            python3 "$PACK_DIR/pipeline/mux_stem.py" "$CLIP_DIR" 2>&1 | while IFS= read -r line; do log "  $line"; done
 
             if [ $GEN_EXIT -ne 0 ]; then
                 log "[$SHOT_ID] WARNING: generate_clip.py exited $GEN_EXIT"
@@ -2215,7 +2218,7 @@ write_prompt "$RUN_DIR/prompt_assembly.txt" \
 - FIRST apply every entry of $RUN_DIR/assembly_fixes.json (blocking checklist)
 - Read $RUN_DIR/final/edit_report.json and look at $RUN_DIR/final/edit_boundaries.jpg: for every boundary choose the cut inside the handles (a_out_s / b_in_s) so it lands on action or on a look; boundaries below 0.80 get a trim, an approved reaction/insert clip between them, or a re-render request — never a dissolve. Record each decision in $RUN_DIR/final/edit_decisions.json
 - Video: trim each $RUN_DIR/clips/<SID>/clip_4k60.mp4 frame-accurately (-frames:v) to the chosen in/out, then concat with the demuxer and -c:v copy in shot order. STRAIGHT CUTS ONLY — no xfade unless transition_to_next.type says dissolve/fade. Write $RUN_DIR/final/concat.txt (it is the cut list for any later full-film pass). Never run RIFE/minterpolate on the assembled film
-- Dialogue: strip the native H3 track; mux the APPROVED stem clips/<SID>/dialogue.wav at the QA-recorded offset, trimmed with the same in/out as the picture
+- Dialogue: clips/<SID>/clip.mp4 already carries the APPROVED stem clips/<SID>/dialogue.wav muxed at dialogue_meta.json anchor_s (muxed_into_clip true) — keep that track, trimmed with the same in/out as the picture; only if muxed_into_clip is absent strip the native H3 track and mux the stem at anchor_s yourself
 - Overlay: narration from $RUN_DIR/audio/narration/ (no lip sync, sidechain-ducked under any line)
 - Layer: music + SFX from $RUN_DIR/music/ (music and ambience may cross-fade over cuts; picture never does)
 - Subtitles: burn ASS from $RUN_DIR/final/*.ass; loudnorm two-pass
