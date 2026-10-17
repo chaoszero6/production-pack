@@ -14,3 +14,6 @@ REDDIT_POSTS.md
 patreon_collection.txt
 reddit_posts/
 *.zip
+
+# per-site Wake-on-LAN target written by switch-off.sh (LAN MAC/IP — not public)
+config/server.env

@@ -55,7 +55,12 @@ if [ "$DRY" = "true" ]; then
 fi
 [ -x "$PACK_DIR/pipeline/notify.sh" ] && bash "$PACK_DIR/pipeline/notify.sh" "Render server switching off (switch-off.sh)" "Power" >/dev/null 2>&1
 sleep 2
-if command -v upsmon >/dev/null 2>&1; then
+# The operator's own power-off script (/root/desktop/switch-off.sh = `upsmon -c fsd`) is the
+# authority when present; the same UPS forced-shutdown is issued directly otherwise.
+if [ -x /root/desktop/switch-off.sh ] || [ -f /root/desktop/switch-off.sh ]; then
+    log "powering off via /root/desktop/switch-off.sh"
+    bash /root/desktop/switch-off.sh
+elif command -v upsmon >/dev/null 2>&1; then
     log "powering off via upsmon -c fsd"
     upsmon -c fsd
 else
