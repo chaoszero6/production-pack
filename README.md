@@ -47,6 +47,11 @@ Environment overrides: `COMFY_DIR`, `MODEL_DIR`, `HF_TOKEN`, `PP_PROFILE`.
 
 ## Stopping, halting and resuming
 
+- `./switch-off.sh` (on the server) parks every service, records the NIC MAC into
+  `config/server.env`, enables Wake-on-LAN on the NIC and powers the box off through the UPS
+  monitor (`upsmon -c fsd`). `./wake.sh` (from the workstation) sends the magic packet and
+  waits for ssh; pass a MAC explicitly if `config/server.env` does not exist yet.
+
 - `./stop.sh` stops the run, its agent turns, in-flight renders, the pack's watchers and the
   LLM monitor, and clears the ComfyUI queue (`--keep-monitor` leaves the monitor up,
   `--gpu llm|none` picks the GPU owner afterwards). Nothing is deleted.
