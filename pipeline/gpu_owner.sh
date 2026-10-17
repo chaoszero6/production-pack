@@ -52,6 +52,16 @@ gpu_owner_llm() {
     llm_start "${1:-$LLM_START_TIMEOUT}"
 }
 
+# The operator's second LLM (OrcaRouter, strata-orca-iq3-xxs, :8322) is not in the systemd
+# Conflicts= set of the TTS cluster and ComfyUI: on 2026-10-17 it held 10 GB while the TTS
+# cluster started and Chatterbox died with CUDA out-of-memory. Park it like the main LLM.
+_gpu_stop_other_llms() {
+    if systemctl is-active --quiet strata-orca-iq3-xxs.service 2>/dev/null; then
+        _gpu_log "parking strata-orca-iq3-xxs.service (OrcaRouter) — the GPU has one owner"
+        systemctl stop strata-orca-iq3-xxs.service 2>/dev/null || true
+    fi
+}
+
 gpu_owner_comfyui() {
     _gpu_park_llm comfyui
     if comfyui_healthy && ! llm_active; then
@@ -59,6 +69,7 @@ gpu_owner_comfyui() {
     fi
     systemctl stop tts-cluster.service 2>/dev/null || true
     llm_stop
+    _gpu_stop_other_llms
     _gpu_log "starting comfyui.service"
     systemctl reset-failed comfyui.service 2>/dev/null || true
     systemctl start comfyui.service 2>/dev/null || true
@@ -78,6 +89,7 @@ gpu_owner_tts() {
     _gpu_park_llm tts
     systemctl stop comfyui.service 2>/dev/null || true
     llm_stop
+    _gpu_stop_other_llms
     bash "$_GPU_OWNER_DIR/tts_cluster.sh" start "${1:-240}"
 }
 
@@ -85,6 +97,7 @@ gpu_owner_none() {
     _gpu_park_llm none
     systemctl stop tts-cluster.service comfyui.service 2>/dev/null || true
     llm_stop
+    _gpu_stop_other_llms
 }
 
 gpu_owner() {
