@@ -36,6 +36,12 @@
       - **SOFT** (assembly, grading, notes — never a FAIL on their own): texture_visual,
         film_quality, audio_quality, voice_quality, lip-sync offset, exposure or
         saturation drift, prop presence, crowd size, "does not match the prompt's crowd spec".
+        A readable prop whose shape, lid, position and surroundings are right but whose
+        BRIGHTNESS drifts over a static shot (S02_005: the unlit storm-glass jar ramped luma
+        44 → 86 in three identical takes) is an exposure ramp: a grade in assembly, scored
+        ≥ 0.70 on continuity with `recommended_action: "ASSEMBLY_FIX_ONLY"` and the exact
+        correction ("flatten the jar + sill luma to the first-frame value"). Re-rendering
+        does not change what H3 does to a glowing-prone object on a static frame.
       - The spec you score against is the SHOT LIST (camera, characters_in_frame, action,
         edit.cut_in/cut_out, readable_props) — not the prompt's elaborations. "Exactly ten
         figures" in a prompt is not a spec; a crowd is "a few distant figures".
