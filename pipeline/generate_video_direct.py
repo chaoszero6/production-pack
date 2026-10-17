@@ -403,11 +403,12 @@ def build_fl2va_workflow(prompt_text, first_frame, last_frame, duration_s, dialo
     return wf
 
 
-def build_i2va_workflow(prompt_text, image_name, duration_s, dialogue_wav=None):
+def build_i2va_workflow(prompt_text, image_name, duration_s, dialogue_wav=None, anchor_s=0.0):
     """Build ComfyUI API workflow for i2va (image-to-video) mode.
 
-    Uses MiniMaxH3ImageToVideo with first_frame only (composited scene).
-    No audio_vae — audio overlaid in post.
+    Uses MiniMaxH3ImageToVideo with first_frame only (composited scene). A dialogue stem is
+    anchored at its offset with MiniMaxH3AddGuide (the AV latent carries the audio, so the
+    mouth follows the stem); the native track is still replaced by the stem in assembly.
     """
     length = h3_frame_count(duration_s)
     seed = random.randint(0, 2**53)
@@ -438,10 +439,21 @@ def build_i2va_workflow(prompt_text, image_name, duration_s, dialogue_wav=None):
         },
     }
 
+    cond = ["10", 0]
+    if dialogue_wav:
+        frame_idx = max(0, min(length - 5, int(round(float(anchor_s or 0.0) * FPS))))
+        log(f"  dialogue stem anchored at {anchor_s:.2f}s (frame {frame_idx}) via MiniMaxH3AddGuide")
+        wf["5"] = {"class_type": "VAELoader", "inputs": {"vae_name": AUDIO_VAE}}
+        wf["50"] = {"class_type": "LoadAudio", "inputs": {"audio": dialogue_wav}}
+        wf["51"] = {"class_type": "MiniMaxH3AddGuide",
+                    "inputs": {"positive": ["10", 0], "audio_vae": ["5", 0], "latent": ["10", 1],
+                               "audio": ["50", 0], "frame_idx": frame_idx}}
+        cond = ["51", 0]
+
     wf["11"] = {"class_type": "BasicScheduler", "inputs": {"model": ["2", 0], "scheduler": "beta", "steps": steps, "denoise": 1.0}}
     wf["12"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "ddim"}}
     wf["13"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}}
-    wf["14"] = {"class_type": "BasicGuider", "inputs": {"model": ["2", 0], "conditioning": ["10", 0]}}
+    wf["14"] = {"class_type": "BasicGuider", "inputs": {"model": ["2", 0], "conditioning": cond}}
     wf["15"] = {
         "class_type": "SamplerCustomAdvanced",
         "inputs": {
@@ -733,7 +745,12 @@ def main():
             log("ERROR: failed to upload image for i2va")
             return 1
 
-        workflow = build_i2va_workflow(prompt_text, img_name, duration_s, dialogue_name)
+        anchor_s = 0.0
+        try:
+            anchor_s = float(json.load(open(os.path.join(shot_dir, "dialogue_meta.json"))).get("anchor_s") or 0.0)
+        except Exception:
+            pass
+        workflow = build_i2va_workflow(prompt_text, img_name, duration_s, dialogue_name, anchor_s)
 
     else:
         log(f"ERROR: unsupported h3_mode: {h3_mode}")

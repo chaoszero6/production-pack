@@ -1606,7 +1606,8 @@ try:
 except Exception:
     pass
 # 2) shot missing from the list: fall back to the FINAL PROMPT only (never the JSON envelope,
-#    whose changes_made notes say "no <d> tags" and used to trigger a doomed Orpheus call)
+#    whose changes_made notes mention the d-tags and used to trigger a doomed Orpheus call).
+#    NO double quotes in this python: it lives inside a bash double-quoted string.
 try:
     d = json.load(open('$CLIP_DIR/reviewed_prompt.json'))
     p = d.get('final_prompt') or ''
@@ -1664,18 +1665,20 @@ sys.exit(1 if (d.get('failed') or str(d.get('status','')).lower() in ('failed','
             # stops NInfer, starts Orpheus, generates audio, stops Orpheus).
             # Avoids the VRAM conflict where NInfer-US (28GB) + Orpheus (5GB) > 32GB.
             if [[ "${CLOUD_ROUTING:-1}" == "0" ]]; then
-                log "[$SHOT_ID] Direct Orpheus audio generation (local VRAM dance)..."
-                # Signal the idle-monitor that TTS services are expected up now,
-                # so it reclaims VRAM to NInfer if one goes stuck mid-generation.
+                log "[$SHOT_ID] Rendering the dialogue stem from voice_config.json (TTS cluster takes the GPU)..."
                 touch "$OUTPUT_DIR/.audio_phase_active"
-                python3 "$PACK_DIR/pipeline/generate_dialogue_audio.py" \
-                    "$RUN_DIR/shot_list.json" "$SHOT_ID" "$CLIP_DIR" 2>&1 | \
+                # --keep-gpu: the TTS cluster stays up; the keyframe step hands the GPU to ComfyUI
+                # next, so the 2-minute LLM reload is skipped.
+                python3 "$PACK_DIR/pipeline/dialogue_stem.py" \
+                    "$RUN_DIR/shot_list.json" "$SHOT_ID" "$CLIP_DIR" --run-dir "$RUN_DIR" --keep-gpu 2>&1 | \
                     while IFS= read -r line; do log "  $line"; done
                 rm -f "$OUTPUT_DIR/.audio_phase_active"
                 if [ -s "$CLIP_DIR/dialogue.wav" ]; then
-                    log "[$SHOT_ID] Dialogue audio ready"
+                    log "[$SHOT_ID] Dialogue stem ready: $(python3 -c "import json;d=json.load(open('$CLIP_DIR/dialogue_meta.json'));print(d.get('engine_used'),d.get('voice'),d.get('duration_s'),'s at',d.get('anchor_s'),'s')" 2>/dev/null)"
+                elif python3 -c "import json,sys; sys.exit(0 if json.load(open('$CLIP_DIR/dialogue_meta.json')).get('status')=='no_speech' else 1)" 2>/dev/null; then
+                    log "[$SHOT_ID] dialogue line is a silence beat — no stem"
                 else
-                    log "[$SHOT_ID] WARNING: Direct audio generation failed"
+                    log "[$SHOT_ID] WARNING: dialogue stem failed — H3 will animate the mouth from the text only"
                 fi
             else
             swap_to_27b
