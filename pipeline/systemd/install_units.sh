@@ -32,7 +32,7 @@ systemctl enable tts-idle-monitor.service >/dev/null 2>&1 || true
 systemctl restart tts-idle-monitor.service
 echo
 echo "exclusive GPU owners (each Conflicts= the others):"
-for u in comfyui.service strata-swift-iq3-xxs.service tts-cluster.service; do
+for u in comfyui.service tts-cluster.service; do
     printf "  %-30s %-9s conflicts: %s\n" "$u" "$(systemctl is-active "$u" 2>/dev/null)" \
         "$(systemctl show -p Conflicts --value "$u" 2>/dev/null | tr ' ' '\n' | grep -vE 'shutdown|^$' | tr '\n' ' ')"
 done

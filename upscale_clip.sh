@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
-# upscale_clip.sh — re-run ONLY the 4K60 GPU upscale step for a single clip.
+# upscale_clip.sh — re-run ONLY the 4K GPU master step for a single clip.
 #
 # WHY THIS EXISTS
-# run.sh performs the 4K60 upscale *inside* the per-clip loop, so a clip that
-# already has a PASS verdict but is missing its master (or was upscaled with the
-# old CPU path) can be finished without re-entering prompt/image/video/QA.
+# run.sh builds the 4K master (clips/<SID>/clip_4k.mp4, RTX VSR; RIFE only when
+# PP_TARGET_FPS asks for more than the source rate) after the clip loop, so a
+# clip that already has a PASS verdict but is missing its master can be
+# finished without re-entering prompt/image/video/QA.
 #
 # Usage: upscale_clip.sh <run_dir> <SHOT_ID> [--force]
-# Exit codes: 0 = upscaled, 2 = no source clip, 3 = ComfyUI unreachable, 4 = fell back
+# Exit codes: 0 = master written, 2 = no source clip, 3 = ComfyUI unreachable,
+#             4 = GPU upscale failed (no CPU fallback, no low-res copy — fix and re-run)
 set -uo pipefail
 
 PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMFYUI_URL="http://127.0.0.1:8188"
-SVC_COMFYUI="comfyui.service"
-# The GPU is owned by exactly one of {Strata LLM | ComfyUI | TTS cluster}
-# (systemd Conflicts=); gpu_owner.sh switches owner and waits for health.
+# The GPU is owned by exactly one of {ComfyUI | TTS cluster} (systemd Conflicts=);
+# gpu_owner.sh switches owner and waits for health. There is no local LLM.
 # shellcheck source=/dev/null
 source "$PACK_DIR/pipeline/gpu_owner.sh"
 
@@ -27,42 +28,17 @@ log() { echo "[$(date +%H:%M:%S)] UPSCALE-ONLY $SHOT_ID: $*" | tee -a "$RUN_DIR/
 
 [ -f "$CLIP_DIR/clip.mp4" ] || { log "ERROR no clip.mp4 in $CLIP_DIR"; exit 2; }
 
-# Hand the GPU to ComfyUI (parks the 31.8 GB LLM; restored on exit, ≈2 min)
-log "Handing the GPU to ComfyUI for RTX VSR + RIFE..."
-gpu_owner comfyui || log "WARNING: ComfyUI did not report healthy"
-trap 'log "Restoring the local LLM..."; gpu_owner llm >/dev/null 2>&1 || true' EXIT
-
-if ! curl -sf "$COMFYUI_URL/system_stats" >/dev/null; then
-    log "ComfyUI down — starting"
-    systemctl start "$SVC_COMFYUI"
-    for i in $(seq 1 120); do
-        curl -sf "$COMFYUI_URL/system_stats" >/dev/null && break
-        sleep 1
-    done
-fi
+log "Handing the GPU to ComfyUI for RTX VSR..."
+gpu_owner comfyui || { log "ERROR: ComfyUI did not report healthy"; exit 3; }
 curl -sf "$COMFYUI_URL/system_stats" >/dev/null || { log "ERROR ComfyUI unreachable"; exit 3; }
 
 UPS_ARGS=(--shot-dir "$CLIP_DIR" --comfyui-url "$COMFYUI_URL")
 [ "$FORCE" = "--force" ] && UPS_ARGS+=(--force)
 
 if python3 "$PACK_DIR/pipeline/upscale_clip.py" "${UPS_ARGS[@]}" 2>> "$RUN_DIR/pipeline.log"; then
-    log "OK clip_4k60.mp4 $(du -h "$CLIP_DIR/clip_4k60.mp4" | cut -f1) (GPU)"
-    systemctl start "$SVC_27B" 2>/dev/null || true
+    log "OK clip_4k.mp4 $(du -h "$CLIP_DIR/clip_4k.mp4" | cut -f1) (GPU)"
     exit 0
 fi
 
-log "GPU upscale failed — CPU ffmpeg fallback"
-if ffmpeg -y -v error \
-    -i "$CLIP_DIR/clip.mp4" \
-    -vf "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1:me_mode=bidir:me=epzs,format=yuv420p,scale=3840:2160:flags=lanczos" \
-    -c:v libx264 -preset medium -crf 17 -c:a aac \
-    "$CLIP_DIR/clip_4k60.mp4"; then
-    log "OK clip_4k60.mp4 (CPU fallback)"
-    systemctl start "$SVC_27B" 2>/dev/null || true
-    exit 0
-fi
-
-log "FALLBACK_COPY_USED — copying clip.mp4 (LOW-RES master)"
-cp "$CLIP_DIR/clip.mp4" "$CLIP_DIR/clip_4k60.mp4"
-systemctl start "$SVC_27B" 2>/dev/null || true
+log "ERROR GPU upscale failed — no fallback (see pipeline.log; re-run after fixing ComfyUI)"
 exit 4

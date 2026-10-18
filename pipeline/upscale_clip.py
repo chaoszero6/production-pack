@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""GPU 4K60 upscale for one clip via ComfyUI (RTX VSR + RIFE).
+"""GPU 4K master for one clip via ComfyUI (RTX VSR, optional RIFE).
 
 Pipeline per temporal chunk (bounds 32 GB VRAM):
   VHS_LoadVideoPath -> RTXVideoSuperResolution (3840x2160, ULTRA)
-                   -> RIFE VFI (rife47.pth, x5) -> ProRes chunk @ 120 fps
+                   [-> RIFE VFI (rife47.pth)] -> ProRes chunk
 
-Source is 24 fps; RIFE multipliers are integral, so 24 -> 60 is done as
-24 -> 120 (x5) then selecting every second frame (120 -> 60). Chunks overlap
-by one source frame and drop the duplicated first interpolated frame.
+Output: clips/<SID>/clip_4k.mp4 at TARGET_FPS (env PP_TARGET_FPS, default 24).
+
+Frame rate policy (2026-10-18): the delivery frame rate is the SOURCE frame
+rate (24 fps, the animation standard) and RIFE is OFF. Interpolation is only
+used when PP_TARGET_FPS asks for more: an integer multiple of the source
+(48, 96 — RIFE xN, no decimation) or 60 from 24 (RIFE x5 -> 120 then every
+second frame). Chunks overlap by one source frame and drop the duplicated
+first frame.
 
 Usage:
   python3 upscale_clip.py --shot-dir <clips/SHOT_ID> [--comfyui-url URL]
-                          [--force] [--chunk-intervals N]
+                          [--force] [--chunk-intervals N] [--target-fps N]
 
-Exit: 0 ok, 2 no source, 3 ComfyUI unreachable, 4 workflow/run failed.
+Exit: 0 ok, 2 no source, 3 ComfyUI unreachable, 4 workflow/run failed,
+      5 unsupported target fps. No CPU fallback: a failure is a failure.
 """
 from __future__ import annotations
 
@@ -28,10 +34,27 @@ import time
 import requests
 
 WIDTH, HEIGHT = 3840, 2160
-RIFE_MULT = 5
-INTERMEDIATE_FPS_MULT = RIFE_MULT  # src_fps * 5
-TARGET_FPS = 60
+MASTER_NAME = "clip_4k.mp4"
+TARGET_FPS = float(os.environ.get("PP_TARGET_FPS", "24") or 24)
 DEFAULT_CHUNK_INTERVALS = 14
+
+
+def interpolation_plan(src_fps: float, target_fps: float) -> tuple[int, bool]:
+    """(rife_multiplier, decimate_by_two). 1 = no RIFE.
+
+    Supported: target == source (no RIFE); target an integer multiple of the
+    source (RIFE xN); target 60 from ~24 (RIFE x5 then keep every 2nd frame).
+    Anything else raises ValueError — never approximate a frame rate.
+    """
+    if abs(target_fps - src_fps) < 0.05:
+        return 1, False
+    ratio = target_fps / src_fps
+    if abs(ratio - round(ratio)) < 1e-6 and 2 <= round(ratio) <= 8:
+        return int(round(ratio)), False
+    if abs(src_fps - 24.0) < 0.05 and abs(target_fps - 60.0) < 0.05:
+        return 5, True
+    raise ValueError(f"cannot reach {target_fps} fps from {src_fps} fps with RIFE "
+                     "(allowed: same rate, integer multiple, or 24 -> 60)")
 
 
 def log(msg: str) -> None:
@@ -82,8 +105,8 @@ def wait_for(requests_mod, server: str, prompt_id: str, timeout_s: float = 3600.
 
 def build_workflow(source: str, prefix: str, start: int, intervals: int,
                    chunk_idx: int, intermediate_fps: float,
-                   temp_format: str = "video/ProRes") -> dict:
-    """Build the VSR+RIFE graph writing an intermediate at intermediate_fps.
+                   temp_format: str = "video/ProRes", rife_mult: int = 1) -> dict:
+    """Build the VSR(+RIFE when rife_mult > 1) graph writing an intermediate at intermediate_fps.
 
     temp_format selects the intermediate codec. KEEP 'video/ProRes'.
 
@@ -102,7 +125,8 @@ def build_workflow(source: str, prefix: str, start: int, intervals: int,
     after each chunk transcode, so peak disk stays ~6GB regardless.
     """
     first = chunk_idx == 0
-    return {
+    frames_src = ["3", 0] if rife_mult > 1 else ["2", 0]
+    graph = {
         "1": {
             "class_type": "VHS_LoadVideoPath",
             "inputs": {
@@ -126,22 +150,10 @@ def build_workflow(source: str, prefix: str, start: int, intervals: int,
                 "quality": "ULTRA",
             },
         },
-        "3": {
-            "class_type": "RIFE VFI",
-            "inputs": {
-                "ckpt_name": "rife47.pth",
-                "frames": ["2", 0],
-                "clear_cache_after_n_frames": 10,
-                "multiplier": RIFE_MULT,
-                "fast_mode": True,
-                "ensemble": True,
-                "scale_factor": 1.0,
-            },
-        },
         "4": {
             "class_type": "ImageFromBatch",
             "inputs": {
-                "image": ["3", 0],
+                "image": frames_src,
                 "batch_index": 0 if first else 1,
                 "length": 4096,
             },
@@ -160,6 +172,20 @@ def build_workflow(source: str, prefix: str, start: int, intervals: int,
             },
         },
     }
+    if rife_mult > 1:
+        graph["3"] = {
+            "class_type": "RIFE VFI",
+            "inputs": {
+                "ckpt_name": "rife47.pth",
+                "frames": ["2", 0],
+                "clear_cache_after_n_frames": 10,
+                "multiplier": rife_mult,
+                "fast_mode": True,
+                "ensemble": True,
+                "scale_factor": 1.0,
+            },
+        }
+    return graph
 
 
 def clear_queue(server: str) -> None:
@@ -175,18 +201,21 @@ def main() -> int:
     ap.add_argument("--shot-dir", required=True)
     ap.add_argument("--comfyui-url", default="http://127.0.0.1:8188")
     ap.add_argument("--force", action="store_true",
-                    help="Rebuild even if clip_4k60.mp4 already exists")
+                    help=f"Rebuild even if {MASTER_NAME} already exists")
     ap.add_argument("--chunk-intervals", type=int, default=DEFAULT_CHUNK_INTERVALS)
+    ap.add_argument("--target-fps", type=float, default=TARGET_FPS,
+                    help="delivery frame rate (default PP_TARGET_FPS or 24 = source, no RIFE)")
     args = ap.parse_args()
+    target_fps = float(args.target_fps)
 
     server = args.comfyui_url.rstrip("/")
     clip_dir = args.shot_dir.rstrip("/")
     source = os.path.join(clip_dir, "clip.mp4")
-    final = os.path.join(clip_dir, "clip_4k60.mp4")
+    final = os.path.join(clip_dir, MASTER_NAME)
     shot_id = os.path.basename(clip_dir)
-    work = f"/opt/comfyui/ComfyUI/output/{shot_id}_4k60"
+    work = f"/opt/comfyui/ComfyUI/output/{shot_id}_4k"
     comfy_output = "/opt/comfyui/ComfyUI/output"
-    prefix = f"{shot_id}_4k60/chunk"
+    prefix = f"{shot_id}_4k/chunk"
 
     if not os.path.isfile(source):
         log(f"ERROR no source {source}")
@@ -208,15 +237,22 @@ def main() -> int:
     if intervals < 1:
         log("ERROR source has <2 frames")
         return 4
-    intermediate_fps = src_fps * RIFE_MULT
+    try:
+        rife_mult, decimate = interpolation_plan(src_fps, target_fps)
+    except ValueError as e:
+        log(f"ERROR {e}")
+        return 5
+    intermediate_fps = src_fps * rife_mult
     chunk_intervals = max(1, args.chunk_intervals)
 
-    if abs(src_fps - 24.0) > 0.05:
-        log(f"NOTE source fps={src_fps} (pipeline assumes ~24; RIFE x{RIFE_MULT} "
-            f"-> {intermediate_fps:.2f} intermediate, decimate to {TARGET_FPS})")
-
+    if rife_mult == 1:
+        how = "no interpolation"
+    elif decimate:
+        how = f"RIFE x{rife_mult} -> {intermediate_fps:.0f} then every 2nd frame"
+    else:
+        how = f"RIFE x{rife_mult}"
     log(f"{shot_id}: {src_frames}f @ {src_fps:.2f}fps {meta['width']}x{meta['height']}"
-        f" -> 4K {TARGET_FPS}fps (RIFE x{RIFE_MULT} -> {intermediate_fps:.0f} then /2)")
+        f" -> 4K {target_fps:g}fps ({how})")
     os.makedirs(work, exist_ok=True)
     clear_queue(server)
 
@@ -226,7 +262,7 @@ def main() -> int:
         n = min(chunk_intervals, intervals - start)
         chunk_idx = len(chunk_files)
         first = chunk_idx == 0
-        expected = RIFE_MULT * n + 1 - (0 if first else 1)
+        expected = rife_mult * n + 1 - (0 if first else 1)
         existing = sorted(glob.glob(os.path.join(comfy_output, f"{prefix}_{chunk_idx:03d}_*.mov")))
         reused = False
         if existing and not args.force:
@@ -240,7 +276,8 @@ def main() -> int:
         if reused:
             continue
 
-        workflow = build_workflow(source, prefix, start, n, chunk_idx, intermediate_fps)
+        workflow = build_workflow(source, prefix, start, n, chunk_idx, intermediate_fps,
+                                  rife_mult=rife_mult)
         t0 = time.time()
         try:
             resp = requests.post(f"{server}/api/prompt",
@@ -275,17 +312,19 @@ def main() -> int:
     log(f"All {len(chunk_files)} chunks ready: {total} frames @ {intermediate_fps:.0f} fps")
 
     concat_list = os.path.join(work, "concat.txt")
-    concat_mov = os.path.join(work, "concat_120.mov")
+    concat_mov = os.path.join(work, f"concat_{intermediate_fps:.0f}.mov")
     with open(concat_list, "w") as handle:
         for path in chunk_files:
             handle.write(f"file '{path}'\n")
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
                     "-i", concat_list, "-c", "copy", concat_mov], check=True)
 
-    # 120 fps -> 60 fps (every second frame) and mux original audio.
+    # Final H.264 master (+ the source audio for previews only — assembly never
+    # uses clip audio). Decimate only on the 24 -> 120 -> 60 path.
+    vf = f"[0:v]fps={target_fps:g}[v]" if decimate else "[0:v]null[v]"
     subprocess.run([
         "ffmpeg", "-y", "-v", "warning", "-i", concat_mov, "-i", source,
-        "-filter_complex", f"[0:v]fps={TARGET_FPS}[v]",
+        "-filter_complex", vf,
         "-map", "[v]", "-map", "1:a:0?",
         "-c:v", "libx264", "-preset", "slow", "-crf", "16", "-pix_fmt", "yuv420p",
         "-c:a", "copy", "-shortest", "-movflags", "+faststart", final,
@@ -299,7 +338,9 @@ def main() -> int:
                         "-of", "json", final], capture_output=True, text=True, check=True)
     info = {
         "shot_id": shot_id,
-        "method": "gpu_rtx_vsr_rife",
+        "method": "gpu_rtx_vsr" + (f"_rife_x{rife_mult}" if rife_mult > 1 else ""),
+        "target_fps": target_fps,
+        "master": MASTER_NAME,
         "video": json.loads(v.stdout)["streams"],
         "audio": json.loads(a.stdout).get("streams", []),
         "size_bytes": os.path.getsize(final),

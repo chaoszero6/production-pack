@@ -244,7 +244,7 @@ def needs_stem(shot: dict) -> bool:
         except Exception:
             pass
     if verd == "PASS" and os.path.isfile(
-        os.path.join(RUN_DIR, "clips", sid, "clip_4k60.mp4")
+        os.path.join(RUN_DIR, "clips", sid, "clip_4k.mp4")
     ):
         return False  # already shipped; stem not required
     wav = os.path.join(RUN_DIR, "clips", sid, "dialogue.wav")

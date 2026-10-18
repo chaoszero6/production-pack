@@ -10,7 +10,8 @@ set -uo pipefail
 PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PACK_DIR" || { echo "pack dir missing: $PACK_DIR"; exit 1; }
 
-RUN_DIR_ARG="${1:-$PACK_DIR/output/run_20260921_185227}"
+RUN_DIR_ARG="${1:-$(readlink -f "$PACK_DIR/output/run_latest" 2>/dev/null || ls -td "$PACK_DIR"/output/run_[0-9]* 2>/dev/null | head -1)}"
+[ -n "$RUN_DIR_ARG" ] && [ -d "$RUN_DIR_ARG" ] || { echo "no run dir to resume (pass one explicitly)"; exit 1; }
 
 # keep a copy of the previous console log so the resume is easy to read
 if [ -s output/run_latest_console.log ]; then

@@ -1,454 +1,373 @@
 #!/usr/bin/env python3
-"""Per-agent model routing with automatic cloud→local fallback.
+"""Per-agent model routing — cloud only, no fallbacks.
 
-Single source of truth for "which model does agent <preset> use". Both run.sh
-(via set_agent_model) and pipeline/generate_clip.py call this, so a subprocess
-that launches a dsh agent can never inherit a stale route from the previous
-agent call.
+Single source of truth for "which model does agent <preset> use". run.sh calls
+this before EVERY dsh launch (dsh resolves the model from `agent-default-model`
+at launch), so the route can never be inherited from the previous call.
 
 Usage:
-    set_agent_model.py <preset> [--show]
+    set_agent_model.py <preset>                 write the route, print ROUTE line
+    set_agent_model.py <preset> --show          print the route, touch nothing
+    set_agent_model.py <preset> --probe         also GET /models before writing
+    set_agent_model.py --dry-run-all            print every preset's route
+    set_agent_model.py --probe-all              GET /models on every provider in use
+    set_agent_model.py --list                   tiers, presets, providers
 
-Rewrites the `agent-default-model` section of /root/.dsh/settings.yaml
-atomically (write temp + os.replace) so a killed run can never leave a
-truncated settings.yaml.
+Exit codes (run.sh turns 2 and 3 into a halt, never a reroute):
+    0  route written / printed
+    2  routing error     — unknown preset tier, provider or model, bad env
+    3  provider error    — missing API key, /models probe failed (status in msg)
 
-STARTUP CONFIGURATION — all tiers overridable via environment variables:
-    export DSH_REASONING_PROVIDER=openrouter          # defaults to openrouter
-    export DSH_REASONING_MODEL="deepseek/deepseek-v4-pro"
-    export DSH_REASONING_EFFORT=high
+Tiers (decision of 2026-10-18 — no local LLM, every agent in the cloud):
 
-    export DSH_EXECUTION_PROVIDER=openrouter
-    export DSH_EXECUTION_MODEL="deepseek/deepseek-v4.1-flash"
-    export DSH_EXECUTION_EFFORT=low
+    creative   story-creator, story-editor, director       anthropic / claude-opus-5-5   effort high
+    vision     qa-inspector                                opencode-go-deepseek / gemini-3.8-flash
+    execution  everything else                             opencode-go-deepseek / deepseek-v4.1-flash
+               (dialogue-polish overrides the model to gemini-3.8-flash)
 
-    export DSH_VISION_PROVIDER=strata-swift
-    export DSH_VISION_MODEL="swift-1.5-iq3_xxs"
-    export DSH_VISION_EFFORT=xhigh
+Env overrides (read once per call, the ONLY way to change a route):
+    DSH_CREATIVE_PROVIDER / DSH_CREATIVE_MODEL / DSH_CREATIVE_EFFORT
+    DSH_VISION_PROVIDER   / DSH_VISION_MODEL   / DSH_VISION_EFFORT
+    DSH_EXECUTION_PROVIDER/ DSH_EXECUTION_MODEL/ DSH_EXECUTION_EFFORT
+    DSH_SETTINGS                                 (default /root/.dsh/settings.yaml)
+    DSH_ENV_FILE                                 (default /root/.hermes/.env — API keys)
+    DSH_FORCE_TIER=execution                     (one call: route this preset on that tier)
 
-Provider names must match registered providers in your DSH profiles.
-Model identifiers must also be registered under that provider.
-Leave blank to use built-in defaults below.
+Providers must be registered for dsh in /root/.dsh/profiles/headless/cordis.patch.yml
+(llm-pi-ai → providers). `anthropic` is a built-in pi-ai provider (api
+anthropic-messages, key ANTHROPIC_API_KEY); the OpenCode Go entries are custom
+openai-completions providers keyed by OPENCODE_GO_API_KEY.
 
-DEFAULT ROUTE: every tier — reasoning, execution and vision (qa-inspector) —
-runs on the LOCAL Qwen 3.8 Flash Next 125B served by Strata (dsh provider
-"strata-swift", model swift-1.5-iq3_xxs, http://127.0.0.1:8321/v1, effort xhigh).
-Strata is MULTIMODAL: the engine now ships the GPU strata-vision encoder
-(engine/strata-vision built from tools/vision; config's "vision" section), so
-qa-inspector reads clip frames locally. The unit/port/model constants live in
-pipeline/local_llm.py — change them there.
-
-No cloud is used. The unit is started (≈2 min) before every route is written,
-and a state file (output/.cloud_fallback_state) is never consulted for routing —
-the local LLM is the only provider. Requires CLOUD_ROUTING=0 in run.sh.
-
-NOTE: dsh resolves the model from agent-default-model AT LAUNCH, so it
-must be rewritten before every dsh call.
+Opus 5.5 notes: thinking is always on (never send budget_tokens / disabled);
+effort is the only depth control and must be explicit — default here is high.
 """
 import os
-import re
 import shutil
-import subprocess
 import sys
 import tempfile
-import time
+import urllib.error
+import urllib.request
 
 try:
     import yaml
-except ImportError:
+except ImportError:  # pragma: no cover
+    import subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pyyaml"],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     import yaml
 
-try:
-    import requests
-except ImportError:
-    requests = None
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import local_llm  # noqa: E402  (single source of truth for the local LLM)
-
 SETTINGS = os.environ.get("DSH_SETTINGS", "/root/.dsh/settings.yaml")
+ENV_FILE = os.environ.get("DSH_ENV_FILE", "/root/.hermes/.env")
+
+EXIT_ROUTING = 2
+EXIT_PROVIDER = 3
 
 
-# ── Startup Configuration helpers ────────────────────────────
+class RoutingError(Exception):
+    """Unknown preset tier / provider / model or a malformed override."""
+
+
+class ProviderError(Exception):
+    """Key missing or the provider's /models probe failed."""
+
+
+# ── Tier table ───────────────────────────────────────────────────────────────
+CREATIVE_PRESETS = {"story-creator", "story-editor", "director"}
+VISION_PRESETS = {"qa-inspector"}
+# Per-preset model override inside its tier (provider stays the tier's).
+PRESET_MODEL_OVERRIDE = {
+    "dialogue-polish": "gemini-3.8-flash",
+}
+
+TIER_DEFAULTS = {
+    # tier:       (provider,               model,                 effort)
+    "creative":  ("anthropic",            "claude-opus-5-5",     "high"),
+    "vision":    ("opencode-go-deepseek", "gemini-3.8-flash",    "high"),
+    "execution": ("opencode-go-deepseek", "deepseek-v4.1-flash", "high"),
+}
+
+VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+
+# Providers this pack knows how to probe. Anything else is a routing error:
+# a typo must never resolve to "whatever comes first".
+PROVIDERS = {
+    "anthropic": {
+        "models_url": "https://api.anthropic.com/v1/models",
+        "key_env": "ANTHROPIC_API_KEY",
+        "headers": lambda key: {"x-api-key": key, "anthropic-version": "2023-06-01"},
+    },
+    "opencode-go-deepseek": {
+        "models_url": "https://opencode.ai/zen/go/v1/models",
+        "key_env": "OPENCODE_GO_API_KEY",
+        "headers": lambda key: {"Authorization": f"Bearer {key}"},
+    },
+    "opencode-go-deepseek-pro": {
+        "models_url": "https://opencode.ai/zen/go/v1/models",
+        "key_env": "OPENCODE_GO_API_KEY",
+        "headers": lambda key: {"Authorization": f"Bearer {key}"},
+    },
+    "opencode-go": {
+        "models_url": "https://opencode.ai/zen/go/v1/models",
+        "key_env": "OPENCODE_GO_API_KEY",
+        "headers": lambda key: {"Authorization": f"Bearer {key}"},
+    },
+    "openrouter": {
+        "models_url": "https://openrouter.ai/api/v1/models",
+        "key_env": "OPENROUTER_API_KEY",
+        "headers": lambda key: {"Authorization": f"Bearer {key}"},
+    },
+}
+
+# Models the pack has verified per provider (a route to an unlisted model is a
+# routing error — add it here AND to cordis.patch.yml after verifying it).
+KNOWN_MODELS = {
+    "anthropic": {"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"},
+    "opencode-go-deepseek": {"deepseek-v4.1-flash", "gemini-3.8-flash", "deepseek-v4-flash-vision-exp"},
+    "opencode-go-deepseek-pro": {"deepseek-v4-pro"},
+    "opencode-go": {"deepseek-v4.1-flash", "gemini-3.8-flash", "deepseek-v4-pro"},
+    "openrouter": None,  # open catalogue — not validated here
+}
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 def _env(name, default=None):
-    """Read an env var; return default if unset or empty."""
     val = os.environ.get(name)
-    return val.strip() if val else default
+    return val.strip() if val and val.strip() else default
 
 
-# ── Defaults per (provider, tier) → (model_id, effort)
-_DEFAULTS = {
-    # ── Token Harbor (cloud) — primary reasoning provider ────────────────
-    ("tokenharbor",    "reasoning"):  ("deepseek-v4-pro",                    "high"),
-    ("tokenharbor",    "execution"):  ("deepseek-v4.1-flash",                "low"),
-    ("tokenharbor",    "vision"):     ("gemini-3.8-flash",                   "high"),
-    # ── OpenRouter — cloud fallback ──────────────────────────────────────
-    ("openrouter",     "reasoning"):  ("deepseek/deepseek-v4-pro",           "high"),
-    ("openrouter",     "execution"):  ("qwen/qwen3.6-plus",          "low"),
-    ("openrouter",     "vision"):     ("google/gemini-3-flash-preview",      "high"),
-    # ── OpenCode Go — deepseek fallback ─────────────────────────────────
-    ("opencode-go-deepseek-pro", "reasoning"):  ("deepseek-v4-pro",          "max"),
-    ("opencode-go-deepseek",     "execution"):  ("deepseek-v4.1-flash",      "max"),
-    ("opencode-go-deepseek",     "vision"):     ("gemini-3.8-flash",         "high"),
-    # ── Local ninfer-qwen36-35b — primary execution & vision provider ────
-    ("ninfer-qwen36-35b",  "execution"):  ("qwen3.6-35b-a3b",                "xhigh"),
-    ("ninfer-qwen36-35b",  "vision"):     ("qwen3.6-35b-a3b",                "xhigh"),
-    # ── Local Strata Swift (Qwen 3.8 Flash Next 125B) — PRIMARY reasoning+execution+vision ──
-    (local_llm.PROVIDER, "reasoning"): (local_llm.MODEL,                     local_llm.EFFORT),
-    (local_llm.PROVIDER, "execution"): (local_llm.MODEL,                     local_llm.EFFORT),
-    (local_llm.PROVIDER, "vision"):    (local_llm.MODEL,                     local_llm.EFFORT),
-    # ── Retired local Qwen 3.8 27B (ninfer units are masked on 207) ────────
-    ("ninfer",         "reasoning"):  ("qwen3.8-27b",                        "xhigh"),
-    ("ninfer",         "execution"):  ("qwen3.8-27b",                        "xhigh"),
-    ("ninfer",         "vision"):     ("qwen3.8-27b",                        "xhigh"),
-    ("ninfer-us",      "reasoning"):  ("qwen38-huihui-abliterated-ninfer-nvfp4", "xhigh"),
-    ("ninfer-us",      "execution"):  ("qwen38-huihui-abliterated-ninfer-nvfp4", "xhigh"),
-}
+_DOTENV_CACHE = None
 
 
-# Read env vars at import time
-_REASONING_LOCAL_DEFAULT = local_llm.PROVIDER  # Strata Swift — Qwen 3.8 Flash Next (local)
-_EXECUTION_LOCAL_DEFAULT = local_llm.PROVIDER  # same model, same xhigh effort
-_VISION_DEFAULT          = local_llm.PROVIDER  # Stratia Swift is multimodal (vision encoder in pipeline); QA stays local
-_CLOUD_DEFAULT           = "openrouter"        # fallback base (never used under local-only)
-
-REASONING_PROVIDER   = _env("DSH_REASONING_PROVIDER",   _REASONING_LOCAL_DEFAULT)
-REASONING_MODEL_ENV  = _env("DSH_REASONING_MODEL",       None)
-REASONING_EFFORT_ENV = _env("DSH_REASONING_EFFORT",      None)
-
-EXECUTION_PROVIDER   = _env("DSH_EXECUTION_PROVIDER",   _EXECUTION_LOCAL_DEFAULT)
-EXECUTION_MODEL_ENV  = _env("DSH_EXECUTION_MODEL",       None)
-EXECUTION_EFFORT_ENV = _env("DSH_EXECUTION_EFFORT",      None)
-
-VISION_PROVIDER      = _env("DSH_VISION_PROVIDER",      _VISION_DEFAULT)
-VISION_MODEL_ENV     = _env("DSH_VISION_MODEL",          None)
-VISION_EFFORT_ENV    = _env("DSH_VISION_EFFORT",         None)
-
-VISION_MODEL_BUDGET = _env("DSH_VISION_BUDGET_MODEL",    None)
-
-# Map each tier to its module-level provider variable (used when no env var overrides)
-_DEFAULT_TIER_DEFAULTS = {
-    "reasoning":  REASONING_PROVIDER,
-    "execution":  EXECUTION_PROVIDER,
-    "vision":     VISION_PROVIDER,
-}
-
-
-def _lookup(tier, provider_env_var=None, model_env_var=None, effort_env_var=None):
-    """Resolve (provider_name, model_id, effort) for a given tier.
-
-    Priority:
-      1. Explicit *_MODEL env var  → use that model with resolved provider
-      2. Default table lookup      → use provider default for this tier
-      3. Fallback                  → find any default for this tier
-    """
-    explicit_model = _env(model_env_var) if model_env_var else None
-    explicit_effort = _env(effort_env_var) if effort_env_var else None
-    effective_provider = _env(provider_env_var) if provider_env_var else None
-    # If no env var is set, fall back to the module-level configured provider
-    if effective_provider is None and _DEFAULT_TIER_DEFAULTS.get(tier):
-        effective_provider = _DEFAULT_TIER_DEFAULTS[tier]
-
-    # Case 1: explicit model overrides everything
-    if explicit_model:
-        return effective_provider or _CLOUD_DEFAULT, explicit_model, explicit_effort or _guess_default_effort(tier)
-
-    # Case 2: look up in defaults table using configured provider
-    key = (effective_provider, tier)
-    if key in _DEFAULTS:
-        model, default_effort = _DEFAULTS[key]
-        return effective_provider, model, explicit_effort or default_effort
-
-    # Case 3: find any default for this tier
-    for (pkey, t), (m, eff) in _DEFAULTS.items():
-        if t == tier:
-            return pkey, m, explicit_effort or eff
-
-    raise ValueError(f"No routing configured for tier={tier}, no defaults found. "
-                     f"Set DSH_{tier.upper()}_PROVIDER and/or DSH_{tier.upper()}_MODEL.")
-
-
-def _guess_default_effort(tier):
-    """Fallback effort guess when no env var or default exists."""
-    if tier == "reasoning":
-        return "high"
-    elif tier == "execution":
-        return "low"
-    elif tier == "vision":
-        return "high"
-    return "high"
-
-
-def route_for(preset):
-    """Return (provider, model, effort) for the given preset."""
-    if preset in PRO_PRESETS:
-        return _lookup(
-            "reasoning", "DSH_REASONING_PROVIDER",
-            "DSH_REASONING_MODEL", "DSH_REASONING_EFFORT"
-        )
-    if preset in VISION_PRESETS:
-        return _lookup(
-            "vision", "DSH_VISION_PROVIDER",
-            "DSH_VISION_MODEL", "DSH_VISION_EFFORT"
-        )
-    return _lookup(
-        "execution", "DSH_EXECUTION_PROVIDER",
-        "DSH_EXECUTION_MODEL", "DSH_EXECUTION_EFFORT"
-    )
-
-
-# ── Preset groups ────────────────────────────────────────────
-PRO_PRESETS = {
-    "story-creator",
-    "director",
-    "screenplay-reviewer",
-    "character-designer",
-    "location-designer",
-}
-VISION_PRESETS = {
-    "qa-inspector",
-}
-
-# Local fallback tier — the Strata unit first, retired NInfer units after it
-LOCAL_ALTS = (
-    (local_llm.PROVIDER, local_llm.MODEL, local_llm.UNIT, local_llm.HEALTH_URL),
-    ("ninfer", "qwen3.8-27b", "ninfer.service", "http://127.0.0.1:8080/health"),
-    (
-        "ninfer-us",
-        "qwen38-huihui-abliterated-ninfer-nvfp4",
-        "ninfer-us.service",
-        "http://127.0.0.1:8081/health",
-    ),
-    ("local-qwen-q6k", "qwen3.8-27b", "qwen3.8-27b-q6k-cuda.service", "http://127.0.0.1:8085/health"),
-)
-
-# State file to track fallback mode across calls
-FALLBACK_STATE = os.path.join(
-    os.environ.get("PACK_DIR")
-    or os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "output",
-    ".cloud_fallback_state",
-)
-
-
-def _is_cloud_exhausted():
-    """Check if we've already detected cloud exhaustion this session."""
-    if os.path.exists(FALLBACK_STATE):
-        try:
-            mtime = os.path.getmtime(FALLBACK_STATE)
-            # Persist for 24h — monthly credits don't refill mid-run.
-            if time.time() - mtime < 86400:
-                return True
-        except Exception:
-            pass
-        try:
-            os.remove(FALLBACK_STATE)
-        except Exception:
-            pass
-    return False
-
-
-def _mark_cloud_exhausted(reason):
-    """Persist cloud exhaustion state so future calls skip cloud immediately."""
+def _load_dotenv():
+    """Parse ENV_FILE (KEY=VALUE lines) once; never overrides real env vars."""
+    global _DOTENV_CACHE
+    if _DOTENV_CACHE is not None:
+        return _DOTENV_CACHE
+    vals = {}
     try:
-        os.makedirs(os.path.dirname(FALLBACK_STATE), exist_ok=True)
-        with open(FALLBACK_STATE, "w") as fh:
-            fh.write(f"{time.time()}\n{reason}\n")
-    except Exception:
+        with open(ENV_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                if k.startswith("export "):
+                    k = k[7:].strip()
+                vals[k] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
         pass
+    _DOTENV_CACHE = vals
+    return vals
 
 
-# ── Try cloud route, fallback on error ───────────────────────
+def api_key_for(provider):
+    spec = PROVIDERS[provider]
+    key = _env(spec["key_env"]) or _load_dotenv().get(spec["key_env"], "").strip()
+    return key or None
 
-def _try_cloud_route(provider, model, effort):
-    """Lightweight cloud route probe. Only runs pre-flight checks
-    for providers that are known to have reachable endpoints.
-    
-    If probing fails (network down, unreachable, etc.), returns
-    the original route without falling back — trusting dsh to
-    surface the actual error to the user.
-    """
-    # Skip pre-flight for opencode-go variants — they need special headers
-    if provider.startswith("opencode-go"):
-        return provider, model, effort
-    
-    # Skip for local providers — their lifecycle is handled by local_llm / run.sh
-    if provider.startswith("ninfer") or provider in ("local-qwen-q6k", local_llm.PROVIDER):
-        return provider, model, effort
-    
-    ok = True
-    err_msg = ""
 
-    # Build a simple HTTP GET to validate connectivity
-    try:
-        if provider == "openrouter":
-            url = "https://openrouter.ai/api/v1/models"
-        elif provider == "tokenharbor":
-            url = "https://tokenharbor.ai/v1/models"
-        else:
-            # Unknown provider — skip probe, trust routing config
-            return provider, model, effort
-        
-        r = requests.get(url, timeout=5)
-        status = r.status_code
-        if status == 429:
-            ok = False; err_msg = "rate-limited"
-        elif status == 402:
-            ok = False; err_msg = "insufficient-balance"
-        elif status >= 400:
-            ok = False; err_msg = f"http-{status}"
-    except Exception as e:
-        ok = False; err_msg = str(e)[:80]
+def tier_of(preset):
+    """Tier of a preset. DSH_FORCE_TIER=<tier> overrides it for ONE call — run.sh
+    uses it to run the Director's mechanical per-scene gate on the execution
+    tier (OpenCode Go) instead of spending Opus on a lint fix."""
+    forced = _env("DSH_FORCE_TIER")
+    if forced:
+        if forced not in TIER_DEFAULTS:
+            raise RoutingError(f"DSH_FORCE_TIER={forced!r} is not a tier ({', '.join(TIER_DEFAULTS)})")
+        return forced
+    if preset in CREATIVE_PRESETS:
+        return "creative"
+    if preset in VISION_PRESETS:
+        return "vision"
+    return "execution"
 
-    if not ok:
-        _mark_cloud_exhausted(err_msg)
-        print(f"[set_agent_model] Cloud probe failed ({err_msg}). Falling back.",
-              file=sys.stderr)
-        return _fallback_to_local()
 
+def resolve_tier(tier):
+    """(provider, model, effort) for a tier after env overrides, validated."""
+    if tier not in TIER_DEFAULTS:
+        raise RoutingError(f"unknown tier {tier!r}")
+    d_provider, d_model, d_effort = TIER_DEFAULTS[tier]
+    up = tier.upper()
+    provider = _env(f"DSH_{up}_PROVIDER", d_provider)
+    model = _env(f"DSH_{up}_MODEL")
+    effort = _env(f"DSH_{up}_EFFORT", d_effort)
+    if provider not in PROVIDERS:
+        raise RoutingError(
+            f"provider {provider!r} for tier {tier} is not registered in "
+            f"set_agent_model.PROVIDERS ({', '.join(sorted(PROVIDERS))}); "
+            f"check DSH_{up}_PROVIDER")
+    if model is None:
+        if provider != d_provider:
+            raise RoutingError(
+                f"DSH_{up}_PROVIDER={provider} set without DSH_{up}_MODEL — "
+                "a provider change must name the model explicitly")
+        model = d_model
+    if effort not in VALID_EFFORTS:
+        raise RoutingError(f"DSH_{up}_EFFORT={effort!r} not in {sorted(VALID_EFFORTS)}")
     return provider, model, effort
 
 
-def _fallback_to_local():
-    """Find the first healthy local LLM service and return its route.
+def route_for(preset):
+    """Return (provider, model, effort, tier) for a preset. Raises RoutingError."""
+    tier = tier_of(preset)
+    provider, model, effort = resolve_tier(tier)
+    override = PRESET_MODEL_OVERRIDE.get(preset)
+    if override and not _env(f"DSH_{tier.upper()}_MODEL"):
+        model = override
+    known = KNOWN_MODELS.get(provider)
+    if known is not None and model not in known:
+        raise RoutingError(
+            f"model {model!r} is not a verified model for provider {provider!r} "
+            f"(known: {', '.join(sorted(known))}); add it to KNOWN_MODELS and "
+            "cordis.patch.yml after verifying it")
+    return provider, model, effort, tier
 
-    The Strata unit is tried first; if nothing answers it is STARTED here
-    (≈2 min) because a route to a dead provider only produces
-    "TRANSPORT: Connection error" three retries later."""
-    # Honor an explicit per-tier effort override (e.g. DSH_EXECUTION_EFFORT)
-    # if the caller set one; otherwise use the module default (xhigh).
-    eff = _env("DSH_EXECUTION_EFFORT") or _env("DSH_REASONING_EFFORT") or local_llm.EFFORT
-    for name, model, unit, health_url in LOCAL_ALTS:
+
+def probe_provider(provider, timeout=8):
+    """GET the provider's /models with its key. Raises ProviderError; no reroute."""
+    spec = PROVIDERS[provider]
+    key = api_key_for(provider)
+    if not key:
+        raise ProviderError(
+            f"{provider}: {spec['key_env']} is not set (env or {ENV_FILE})")
+    req = urllib.request.Request(spec["models_url"], headers=spec["headers"](key))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                raise ProviderError(f"{provider}: HTTP {resp.status} from {spec['models_url']}")
+            body = resp.read(400).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        detail = ""
         try:
-            r = requests.get(health_url, timeout=3)
-            if r.status_code == 200:
-                return name, model, eff
+            detail = e.read(300).decode("utf-8", "replace")
         except Exception:
-            continue
-
-    print(f"[set_agent_model] no local LLM healthy — starting {local_llm.UNIT} "
-          f"(≈2 min)", file=sys.stderr)
-    if local_llm.start():
-        return local_llm.PROVIDER, local_llm.MODEL, eff
-    units = ", ".join(u for _, _, u, _ in LOCAL_ALTS)
-    print(f"[set_agent_model] WARNING: no local LLM healthy ({units}). "
-          "Agent call will likely fail.", file=sys.stderr)
-    return local_llm.PROVIDER, local_llm.MODEL, eff
+            pass
+        raise ProviderError(f"{provider}: HTTP {e.code} from {spec['models_url']} {detail}".strip())
+    except urllib.error.URLError as e:
+        raise ProviderError(f"{provider}: {spec['models_url']} unreachable ({e.reason})")
+    except OSError as e:
+        raise ProviderError(f"{provider}: probe failed ({e})")
+    return body
 
 
-# ── Main entry point ────────────────────────────────────────
+def all_presets():
+    pack = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    d = os.path.join(pack, ".dsh", ".agent-presets")
+    try:
+        return sorted(p for p in os.listdir(d) if os.path.isdir(os.path.join(d, p)))
+    except FileNotFoundError:
+        return sorted(CREATIVE_PRESETS | VISION_PRESETS | set(PRESET_MODEL_OVERRIDE))
 
-def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <preset> [--show]", file=sys.stderr)
-        sys.exit(1)
 
-    preset = sys.argv[1]
-    show_only = "--show" in sys.argv
+def providers_in_use():
+    seen = []
+    for preset in all_presets():
+        provider = route_for(preset)[0]
+        if provider not in seen:
+            seen.append(provider)
+    return seen
 
-    # run.sh calls `set_agent_model.py --mark-exhausted "<reason>"` on a runtime
-    # 402/429 so the next route skips the cloud without re-probing it.
-    if preset == "--mark-exhausted":
-        _mark_cloud_exhausted(" ".join(sys.argv[2:]) or "runtime error")
-        print("[set_agent_model] cloud marked exhausted", file=sys.stderr)
-        return 0
 
-    # Determine which provider to use based on preset type
-    if preset in PRO_PRESETS:
-        provider, model, effort = _lookup(
-            "reasoning", "DSH_REASONING_PROVIDER",
-            "DSH_REASONING_MODEL", "DSH_REASONING_EFFORT"
-        )
-    elif preset in VISION_PRESETS:
-        provider, model, effort = _lookup(
-            "vision", "DSH_VISION_PROVIDER",
-            "DSH_VISION_MODEL", "DSH_VISION_EFFORT"
-        )
-    else:
-        provider, model, effort = _lookup(
-            "execution", "DSH_EXECUTION_PROVIDER",
-            "DSH_EXECUTION_MODEL", "DSH_EXECUTION_EFFORT"
-        )
-
-    # With --show, just print the route — skip all network calls
-    if show_only:
-        print(f"{preset} -> {provider}/{model} (effort={effort})")
-        return 0
-
-    # A local route is only useful if the service answers — start it (≈2 min) if not.
-    if provider == local_llm.PROVIDER and not local_llm.healthy():
-        print(f"[set_agent_model] {local_llm.UNIT} not serving — starting it before routing",
-              file=sys.stderr)
-        if not local_llm.start():
-            print(f"[set_agent_model] WARNING: {local_llm.UNIT} did not come up; "
-                  "the agent call will fail with a transport error", file=sys.stderr)
-
-    # Check if cloud is exhausted — auto-fallback
-    if _is_cloud_exhausted():
-        print("[set_agent_model] Cloud is exhausted — using local route.",
-              file=sys.stderr)
-        provider, model, effort = _fallback_to_local()
-    else:
-        # Test the cloud route before committing
-        try:
-            provider, model, effort = _try_cloud_route(provider, model, effort)
-        except Exception as e:
-            print(f"[set_agent_model] Cloud check failed ({e}), using local.",
-                  file=sys.stderr)
-            provider, model, effort = _fallback_to_local()
-
-    # Write atomically to settings.yaml
-    settings_path = SETTINGS
-    # The dsh CLI renames settings.yaml -> settings.yaml.imported on some launches
-    # (first-run import behaviour). If it's gone, restore from .imported (or seed
-    # a minimal file) so we always have a base to read-modify-write.
-    if not os.path.exists(settings_path):
-        imported = settings_path + ".imported"
+# ── settings.yaml writer ─────────────────────────────────────────────────────
+def write_route(provider, model, effort):
+    """Atomically update agent-default-model in settings.yaml."""
+    path = SETTINGS
+    if not os.path.exists(path):
+        imported = path + ".imported"
         if os.path.exists(imported):
-            shutil.copyfile(imported, settings_path)
-            print(f"[set_agent_model] Restored {settings_path} from .imported",
-                  file=sys.stderr)
+            shutil.copyfile(imported, path)
+            print(f"[set_agent_model] restored {path} from .imported", file=sys.stderr)
         else:
-            with open(settings_path, "w") as fh:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
                 yaml.dump({"agent-default-model": {}}, fh, default_flow_style=False)
-            print(f"[set_agent_model] Seeded empty {settings_path}",
-                  file=sys.stderr)
-    with open(settings_path) as fh:
+    with open(path, encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or {}
-
-    if "agent-default-model" not in data:
-        data["agent-default-model"] = {}
+    data.setdefault("agent-default-model", {})
     data["agent-default-model"].update({
         "provider": provider,
         "model": model,
         "reasoningEffort": effort,
     })
-
-    # Write atomically — temp file + rename
-    dir_path = os.path.dirname(settings_path) or "."
-    fd, tmp_path = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
+    dir_path = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as tmp_fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_fh:
             yaml.dump(data, tmp_fh, default_flow_style=False)
-        os.replace(tmp_path, settings_path)
+        os.replace(tmp, path)
     except Exception:
         try:
-            os.unlink(tmp_path)
+            os.unlink(tmp)
         except OSError:
             pass
         raise
 
-    if show_only:
-        print(f"{preset} -> {provider}/{model} (effort={effort})")
-    else:
-        print(f"Routed: {preset} -> {provider}/{model} (effort={effort})")
 
-    # Debug: log number of known providers
-    nprov = len(data.get("llm-pi-ai", {}).get("providers", {}))
-    print(f"[{nprov}] providers available")
+def route_line(preset, provider, model, effort, tier):
+    return f"ROUTE preset={preset} provider={provider} model={model} effort={effort} tier={tier}"
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd = argv[0]
+
+    try:
+        if cmd == "--list":
+            print("tiers:")
+            for tier, (p, m, e) in TIER_DEFAULTS.items():
+                p2, m2, e2 = resolve_tier(tier)
+                flag = "" if (p, m, e) == (p2, m2, e2) else "   (env override)"
+                print(f"  {tier:10s} {p2}/{m2} effort={e2}{flag}")
+            print(f"creative presets: {', '.join(sorted(CREATIVE_PRESETS))}")
+            print(f"vision presets:   {', '.join(sorted(VISION_PRESETS))}")
+            print(f"model overrides:  {PRESET_MODEL_OVERRIDE}")
+            return 0
+
+        if cmd == "--dry-run-all":
+            for preset in all_presets():
+                p, m, e, t = route_for(preset)
+                print(route_line(preset, p, m, e, t))
+            return 0
+
+        if cmd == "--probe-all":
+            failed = False
+            for provider in providers_in_use():
+                try:
+                    probe_provider(provider)
+                    print(f"PROBE {provider} ok")
+                except ProviderError as e:
+                    failed = True
+                    print(f"PROBE {provider} FAIL {e}")
+            return EXIT_PROVIDER if failed else 0
+
+        preset = cmd
+        show_only = "--show" in argv
+        probe = "--probe" in argv
+        provider, model, effort, tier = route_for(preset)
+        if show_only:
+            print(route_line(preset, provider, model, effort, tier))
+            return 0
+        if not api_key_for(provider):
+            raise ProviderError(
+                f"{provider}: {PROVIDERS[provider]['key_env']} is not set (env or {ENV_FILE})")
+        if probe:
+            probe_provider(provider)
+        write_route(provider, model, effort)
+        print(f"Routed: {preset} -> {provider}/{model} (effort={effort}, tier={tier})")
+        print(route_line(preset, provider, model, effort, tier))
+        return 0
+
+    except RoutingError as e:
+        print(f"ROUTING ERROR: {e}", file=sys.stderr)
+        return EXIT_ROUTING
+    except ProviderError as e:
+        print(f"PROVIDER ERROR: {e}", file=sys.stderr)
+        return EXIT_PROVIDER
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv[1:]))

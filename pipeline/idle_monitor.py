@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Idle Monitor — watch a TTS/generation service; if it stays idle past a
-threshold, hand VRAM back to the local LLM and ask the agent to continue debugging.
+threshold, stop it to free VRAM and leave a handoff note for the next run.
 
 Designed to run as a one-shot from a systemd oneshot unit (or in a loop):
   1. Probe the watched service's health endpoint.
   2. If it is DOWN or has produced no activity for IDLE_SECONDS, consider it
      "stuck / idle".
-  3. On idle: stop the watched service, start the local LLM, and write a handoff note
+  3. On idle: stop the watched service and write a handoff note
      to output/agent_handoff.log so the next agent run picks up debugging.
 
 Reclamation is deliberately conservative — three guards must ALL pass before a
@@ -25,7 +25,7 @@ Usage:
 
 Exit codes:
   0  service healthy / active — nothing done
-  1  service idle/stuck — local LLM restarted, handoff written
+  1  service idle/stuck — service stopped, handoff written
   2  probe error (treated as down)
 """
 import argparse
@@ -40,8 +40,6 @@ import urllib.request
 PACK_DIR = os.environ.get("PACK_DIR") or os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))
 )
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import local_llm  # noqa: E402  (Strata Swift — the LLM the VRAM is handed back to)
 
 
 def log(msg, log_path):
@@ -183,7 +181,7 @@ def main():
     # Reclaim: active, booted, and unresponsive for a sustained window.
     reason = f"active-but-unresponsive for {elapsed:.0f}s, uptime {uptime:.0f}s"
     log(f"{unit} appears idle/stuck ({reason}, probe={detail}) — "
-        f"handing VRAM back to the local LLM.", args.log)
+        f"stopping it to free VRAM.", args.log)
     if os.path.exists(state_path):
         os.remove(state_path)
 
@@ -191,15 +189,8 @@ def main():
     systemctl("stop", unit)
     time.sleep(2)
 
-    # Bring the local LLM back up (about 2 min) unless a pipeline script parked
-    # it on purpose (.llm_parked) — then llm_monitor restarts it when unparked.
-    if os.path.exists(os.path.join(PACK_DIR, "output", ".llm_parked")):
-        n_ok = local_llm.healthy()
-        log("LLM is parked by a pipeline script — leaving its restart to llm_monitor", args.log)
-    else:
-        n_ok = local_llm.start()
-    log(f"{local_llm.UNIT} {'up' if n_ok else 'FAILED to start'} on :{local_llm.PORT}", args.log)
-
+    # No local LLM (2026-10-18): the GPU simply becomes free; the next pipeline
+    # step hands it to ComfyUI or the TTS cluster itself.
     # Write a handoff note for the next agent run to continue debugging
     phase_label = "audio (TTS)" if args.phase == "audio" else "image/video generation (ComfyUI)"
     handoff = {
@@ -207,10 +198,10 @@ def main():
         "service": unit,
         "phase": args.phase,
         "reason": reason,
-        "action_taken": f"stopped {unit}, started {local_llm.UNIT}",
+        "action_taken": f"stopped {unit}",
         "instruction": (
             f"The {args.service} service went idle/stuck during the {phase_label} phase and was "
-            f"stopped to free VRAM. The local LLM is running again. Continue debugging why {args.service} "
+            f"stopped to free VRAM. Continue debugging why {args.service} "
             f"did not serve (check journalctl -u {unit}). Once fixed, restart it during the "
             f"{args.phase} phase."
         ),

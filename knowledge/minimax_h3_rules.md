@@ -461,11 +461,15 @@ CosyVoice 3 instructions — never an adult voice with affectation (`.dsh/skills
 - "To make someone talk, have them stop what they are doing and look at the camera /
   listener: if they eat while talking, H3 prioritizes eating."
 - No text in renders (models invent letters) — titles and subtitles go in post.
-- Music is post only: H3 "re-sings" or restarts music per clip.
+- Music is post only: H3 "re-sings" or restarts music per clip. In this pack ALL audio —
+  dialogue stems, narration, music, beds, SFX — is mixed on the film timeline by
+  `pipeline/assemble.py`; H3's native track is discarded (clips contribute picture only).
 - Keep every take; corrections are new takes (`_t2`, `_t3`), approved files never overwritten.
-- Frame-exact cutting: `frames = round(duration * fps)`, trim video with `-frames:v` and
-  audio with `atrim` to the same seconds; concat demuxer with `-c copy`; no transitions.
-- Upscaler writes video only; mux the original audio back. Blend filters (glow, screen)
-  run in RGB (`format=gbrp`); in YUV they tint magenta.
+- Frame-exact cutting: `frames = round(duration * fps)`; `assemble.py` trims the masters by
+  frame count from the editor's decisions and concatenates with the demuxer; no transitions.
+  Stems are never trimmed — they are placed at `film_start + anchor_s − src_in`.
+- Upscaler writes video only (`clip_4k.mp4`); the audio is laid in at assembly, never muxed
+  back from the clip. Blend filters (glow, screen) run in RGB (`format=gbrp`); in YUV they
+  tint magenta.
 - "'Verified' means measured. A bad number is a reason to look at the frames, not to
   discard a take blindly." QC reports separate passed / failed / not verified.

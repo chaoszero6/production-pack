@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tts_render.py — render a batch of TTS jobs with the GPU handed to the TTS cluster.
 
-Why a job file: the local LLM (Strata, 31.8 GB) and the TTS engines are
+Why a job file: agents run in the cloud and never call a TTS port; the TTS engines are
 exclusive GPU owners (systemd Conflicts=). An agent turn therefore CANNOT call a
 TTS API — the engines are down while the agent runs. The agent writes a job
 file instead, and the pipeline renders it here with the LLM parked, then hands
@@ -187,8 +187,9 @@ def main() -> int:
     finally:
         json.dump({"jobs": len(jobs), "ok": ok, "results": results}, open(results_path, "w", encoding="utf-8"), indent=1)
         if not args.no_gpu_switch and not args.keep_gpu:
-            log("handing the GPU back to the LLM (≈2 min)")
-            gpu("llm")
+            # No local LLM: ComfyUI is the resting owner of the GPU.
+            log("handing the GPU back to ComfyUI")
+            gpu("comfyui")
     log(f"{ok}/{len(jobs)} rendered -> {results_path}")
     return 0 if ok == len(jobs) else 1
 

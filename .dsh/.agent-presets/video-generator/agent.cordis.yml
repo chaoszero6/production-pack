@@ -1,9 +1,3 @@
-# Engine: Qwen 3.8 27B (fast execution, tool use, multimodal)
-- id: engine
-  name: '@yuki-takuya-kun/dsh-engine-switch'
-  config:
-    engine: "qwen3.8-27b"
-
 # Video Generator Agent - MiniMax H3 via ComfyUI
 # Generates video clips from frames and prompts
 
@@ -48,7 +42,7 @@
       - Node: MiniMaxH3CombinedImageAndReferenceToVideo
 
       ## ComfyUI Workflow Steps
-      1. Wait for Pipeline Orchestrator signal (Qwen stopped, VRAM available)
+      1. The pipeline hands the GPU to ComfyUI before any render (no local LLM to stop)
       2. Upload first frame via POST /upload/image
       3. Upload last frame if FLF2V mode
       4. Upload reference images if Ref2V mode
@@ -62,24 +56,28 @@
       ## Dialogue vs Narration Audio Handling
 
       ### Clips WITH dialogue (lip sync required):
-      - Audio Producer has ALREADY generated dialogue audio before this step
-      - Upload dialogue audio WAV as an input to the ref2va workflow
+      - The approved stem (`clips/<SID>/dialogue.wav`) was rendered BEFORE this step
+      - The stem is the LIP-SYNC GUIDE only: it is fed to H3 through
+        `MiniMaxH3AddGuide` / `<Audio 1>` so the mouth is animated to it
       - The Screenplay Reviewer's prompt includes `<Audio N>` ref + `<d>` tags
-      - H3 will animate lip movement matching the dialogue audio
-      - The dialogue audio is BAKED INTO the clip — not overlaid in post
+      - The clip's own audio track (H3's native take, or the stem muxed back by
+        `mux_stem.py` for previews/QA) is NEVER used in the film. `pipeline/assemble.py`
+        places `dialogue.wav` once on the film timeline at `anchor_s`
+        (`dialogue_meta.json`); clip files contribute picture only
 
       ### Clips with narration ONLY (NO lip sync):
       - Do NOT upload any audio reference
       - The prompt has NO `<Audio>` refs, NO `<d>` tags
       - Characters on screen will have natural closed-mouth expressions
-      - Narration audio is added later by Post-Production Editor
-      - H3 may still generate ambient sound — this is fine
+      - Narration audio is placed later by `pipeline/assemble.py` (post only)
+      - H3 may still generate ambient sound — it is stripped at assembly
+        (`KEEP_NATIVE_AMBIENCE=1` keeps it as a bed only when no speech is detected)
 
       ### Clips with BOTH dialogue AND narration:
       - Upload ONLY the dialogue audio (not narration)
       - Prompt has `<d>` tags ONLY for dialogue portions
       - Character lips sync to dialogue, stay closed during narration timing
-      - Narration overlaid in post
+      - Narration is placed on the film timeline by `assemble.py`, never in the clip
 
       ## Generation Parameters — TURBO LoRA
       Use turbo LoRAs for faster generation. Apply the LoRA BEFORE the sampler.
@@ -116,11 +114,11 @@
         spike, new angle), it is a failed take — do not hand it to QA as a candidate.
       - ComfyUI version: 0.30.0+ required for H3 nodes
 
-      ## Error Handling
-      - If ComfyUI crashes during generation: notify Pipeline Orchestrator
-      - If generation produces black frames: retry with slightly modified prompt
-      - If VRAM OOM: reduce resolution or steps, retry
-      - Track all attempts in generation log
+      ## Error Handling (no fallbacks, no retries — decision 2026-10-18)
+      - A failed render (ComfyUI crash, VRAM OOM, black frames, missing clip.mp4)
+        HALTS the run (HALT_FOR_REVIEW.json + Discord); the operator fixes the cause
+        and resumes. Never retry with a modified prompt or reduced steps on your own.
+      - Track every attempt in the generation log.
 
       ## Output
       Save to: `output/clips/{shot_id}/`

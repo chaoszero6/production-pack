@@ -7,7 +7,8 @@
 # animated movie with dialogue (lip-synced), narration, BGM,
 # subtitles, upscaled to 4K 60fps.
 #
-# Server: RTX 5090 32GB, single LLM at a time (port 8085)
+# Server: RTX 5090 32GB — ComfyUI | TTS cluster own the GPU; every agent is in the cloud.
+# Any error halts the run (HALT_FOR_REVIEW.json + Discord); ./launch_resume.sh resumes it.
 # ═══════════════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -42,73 +43,84 @@ COMFYUI_DIR="/opt/comfyui"
 OUTPUT_DIR="$PACK_DIR/output"
 COMFYUI_URL="http://127.0.0.1:8188"
 
-# ── The GPU has exactly ONE owner at a time: Strata LLM | ComfyUI | TTS cluster ──
-# systemd Conflicts= (pipeline/systemd/) enforce it; these helpers switch owner
-# and wait for the new one's API. The local LLM is Qwen 3.8 Flash Next via
-# Strata Swift (unit/port/model in pipeline/local_llm.sh — ~2 min to start).
-# shellcheck source=/dev/null
-source "$PACK_DIR/pipeline/local_llm.sh"
+# ── The GPU has exactly TWO owners: ComfyUI | TTS cluster (no local LLM since 2026-10-18) ──
+# systemd Conflicts= (pipeline/systemd/) enforce it; gpu_owner.sh switches owner
+# and waits for the new one's API. Every agent runs in the cloud.
 # shellcheck source=/dev/null
 source "$PACK_DIR/pipeline/gpu_owner.sh"
-LLM_URL="$LLM_BASE_URL"
 
-# LLM routing: all providers are configurable at startup via environment variables.
-# Default is OpenRouter for all tiers. Override any tier independently:
-#
-#   DSH_REASONING_PROVIDER=openrouter         # reasoning agents (director, story-creator, etc.)
-#   DSH_REASONING_MODEL="deepseek/deepseek-v4-pro"  # model name on that provider
-#   DSH_REASONING_EFFORT=high                 # off|low|medium|high|max|xhigh
-#
-#   DSH_EXECUTION_PROVIDER=openrouter         # execution agents (image-gen, video-gen, audio-producer)
-#   DSH_EXECUTION_MODEL="deepseek/deepseek-v4.1-flash"
-#   DSH_EXECUTION_EFFORT=low
-#
-#   DSH_VISION_PROVIDER=openrouter            # qa-inspector (needs pixel vision)
-#   DSH_VISION_MODEL="google/gemini-3-flash-preview"
-#   DSH_VISION_EFFORT=high
-#
-# Examples:
-#   DSH_REASONING_PROVIDER=tokenharbor DSH_EXECUTION_PROVIDER=tokenharbor ./run.sh story.md
-#   DSH_REASONING_PROVIDER=opencode-go-deepseek-pro ./run.sh --resume
-#   export DSH_*=tokenharbor  # use Token Harbor for everything
+# LLM routing (pipeline/set_agent_model.py — the single source of truth):
+#   creative   story-creator, story-editor, director   → anthropic / claude-opus-5-5 (effort high)
+#   vision     qa-inspector                            → opencode-go-deepseek / gemini-3.8-flash
+#   execution  everything else                         → opencode-go-deepseek / deepseek-v4.1-flash
+#                                                        (dialogue-polish: gemini-3.8-flash)
+# Override per tier with DSH_CREATIVE_* / DSH_VISION_* / DSH_EXECUTION_* (PROVIDER/MODEL/EFFORT).
+# NO FALLBACKS: a routing or provider error halts the run (halt_run), never reroutes.
 DSH_SETTINGS="/root/.dsh/settings.yaml"
-# Still copy .env for any cloud fallback tools the agents might use
+# API keys live in /root/.hermes/.env: dsh reads its copy, the pipeline's own
+# probes and ledger read the exported variables.
 if [ -f /root/.hermes/.env ]; then
     cp /root/.hermes/.env "$DSH_DIR/.env" 2>/dev/null || true
+    set -a
+    # shellcheck source=/dev/null
+    . /root/.hermes/.env 2>/dev/null || true
+    set +a
 fi
 
-SVC_122B="llama-qwen35-122b.service"
-SVC_27B="qwen3.8-27b-q6k-cuda.service"
-SVC_COMFYUI="comfyui.service"
-SVC_HERMES="hermes-stack.service"
-
-WAIT_122B=60
-WAIT_27B=30
+# Delivery frame rate of the per-clip 4K masters: 24 = source rate, no RIFE
+# (default); 48/96 = RIFE xN; 60 = RIFE x5 then every 2nd frame.
+export PP_TARGET_FPS="${PP_TARGET_FPS:-24}"
+# Cloud spend caps (pipeline/cloud_ledger.py) — reaching one halts the run.
+export CLOUD_MAX_CALLS_ANTHROPIC="${CLOUD_MAX_CALLS_ANTHROPIC:-12}"
+export CLOUD_MAX_USD_EST_ANTHROPIC="${CLOUD_MAX_USD_EST_ANTHROPIC:-9}"
+export CLOUD_MAX_CALLS_OPENCODE="${CLOUD_MAX_CALLS_OPENCODE:-1500}"
 
 DISCORD_CHANNEL="discord:#film-maker"
 NOTIFY="$PACK_DIR/pipeline/notify.sh"
 
-# ── Phase-based Service Management ──────────────────────────
-# Sourced by pipeline runs. Provides:
-#   svc_transition <phase>  — atomic stop-all/start-phase-services
-#   svc_is_healthy <svc>    — health check
-# All older stop/ensure functions below delegate to these.
-source "$PACK_DIR/pipeline/services.sh" 2>/dev/null || true
-
-VRAM_MONITOR="${PACK_DIR}/pipeline/vram_monitor.sh"
-# vram_report / vram_check_now are DEFINED here, not called — without sourcing,
-# every agent call logged "command not found" at run.sh:716/724.
-# The file has an entry-point guard, so sourcing only declares functions/vars.
-if [[ -f "$VRAM_MONITOR" ]]; then
-    # shellcheck source=/dev/null
-    source "$VRAM_MONITOR" 2>/dev/null || true
-fi
-
 # ── Helpers ─────────────────────────────────────────────────
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
-die()  { log "ERROR: $*"; notify "ERROR: $*"; exit 1; }
-step() { echo; echo "════════════════════════════════════════"; log "STEP: $*"; echo "════════════════════════════════════════"; }
+CURRENT_STEP="start"
+step() { CURRENT_STEP="$*"; echo; echo "════════════════════════════════════════"; log "STEP: $*"; echo "════════════════════════════════════════"; }
 notify() { bash "$NOTIFY" "$1" "${2:-}" "${3:-}" 2>/dev/null & }
+
+# ── Halt on error (decision 2026-10-18: no fallbacks, no retries, no reroutes) ──
+# Every failure of the machinery — an agent call, a render script, a missing
+# key, a spend cap — writes $RUN_DIR/HALT_FOR_REVIEW.json, posts to Discord and
+# exits 3. ./launch_resume.sh <run_dir> re-runs the halted step (skip_if_done
+# markers skip everything that already succeeded). Quality verdicts — QA FAIL,
+# lint findings, CAST_FAIL — are NOT errors: their bounded loops stay.
+halt_run() {
+    local step="$1" reason="$2" artifact="${3:-}"
+    log "HALT: [$step] $reason"
+    if [ -n "${RUN_DIR:-}" ] && [ -d "$RUN_DIR" ]; then
+        python3 - "$RUN_DIR/HALT_FOR_REVIEW.json" "$step" "$reason" "$RUN_DIR" "${HALT_PRESET:-}" "${HALT_STDERR:-}" <<'PYEOF'
+import json, os, sys, time
+halt, step, reason, run_dir, preset, errfile = sys.argv[1:7]
+tail = ""
+if errfile and os.path.isfile(errfile):
+    try:
+        with open(errfile, encoding="utf-8", errors="replace") as fh:
+            tail = "".join(fh.readlines()[-40:])[-4000:]
+    except OSError:
+        pass
+d = {"kind": "error", "step": step, "reason": reason, "preset": preset or None,
+     "stderr_tail": tail, "halted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+     "resume": "./launch_resume.sh " + run_dir,
+     "note": "no automatic retry or fallback by design — fix the cause, then resume"}
+tmp = halt + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(d, fh, indent=2)
+os.replace(tmp, halt)
+PYEOF
+        echo "[$(date '+%H:%M:%S')] HALT [$step] $reason" >> "$RUN_DIR/pipeline.log" 2>/dev/null || true
+    fi
+    notify "RUN HALTED at: $step\n$reason\nResume: ./launch_resume.sh ${RUN_DIR:-<run_dir>}" "RUN HALTED" "$artifact"
+    sleep 3   # let the Discord post leave before the process tree goes away
+    rm -f "$OUTPUT_DIR/.gen_phase_active" "$OUTPUT_DIR/.audio_phase_active" 2>/dev/null || true
+    exit 3
+}
+die()  { halt_run "${CURRENT_STEP:-run}" "$*"; }
 
 wait_for_health() {
     local url="$1" timeout="$2" name="$3"
@@ -138,15 +150,7 @@ _wait_url() {
     return 1
 }
 
-# ── Local LLM lifecycle for agent turns ─────────────────────
-# Every dsh agent is served by the local NInfer model, so an agent turn must
-# ALWAYS have an LLM up. What it must never do is stop ComfyUI: ComfyUI idles
-# at ~0.6 GB (models unload via POST /free), and killing it mid-turn is what
-# made `wait_for_health ComfyUI` time out and kill a run. Heavy GPU work
-# (ComfyUI renders, TTS synthesis) is serialized outside agent turns by the
-# wrapper scripts in pipeline/, not by stopping the LLM the agent is using.
-# llm_healthy / llm_start / llm_stop come from pipeline/local_llm.sh.
-
+# ── GPU helpers ─────────────────────────────────────────────
 # Drop ComfyUI's loaded models (Qwen Image 2.1 ~10 GB / H3 ~12-14 GB) without
 # touching the server process. Safe to call when ComfyUI is down.
 comfyui_release_models() {
@@ -155,131 +159,60 @@ comfyui_release_models() {
         -d '{"unload_models":true,"free_memory":true}' > /dev/null 2>&1 || true
 }
 
-ensure_agent_llm() {
-    if [[ "${CLOUD_ROUTING:-1}" == "1" ]]; then
-        return 0
-    fi
-    if llm_healthy; then
-        return 0
-    fi
-    # Hand the GPU to the LLM: Conflicts= stop ComfyUI / the TTS cluster, the
-    # Strata engine loads 40 GB of experts (~2 min), gpu_owner waits for /v1/models.
-    log "Local LLM not serving — handing the GPU to $LLM_UNIT (≈2 min)..."
-    local attempt
-    for attempt in 1 2; do
-        if gpu_owner llm; then
-            return 0
-        fi
-        log "$LLM_UNIT not healthy (attempt $attempt/2) — resetting and retrying"
-        systemctl reset-failed "$LLM_UNIT" 2>/dev/null || true
-        sleep 5
-    done
-    die "No local LLM could be started for agent turn ($LLM_UNIT :$LLM_PORT unhealthy — journalctl -u $LLM_UNIT)"
-}
-
-# ── Phase-aware service management (wrappers for run.sh compatibility) ──
-# These preserve the original function signatures used throughout run.sh
-# but delegate to the centralized phase-based service manager.
-#
-# Under CLOUD_ROUTING=1 (default): all local-service functions are no-ops
-# because agents use OpenRouter cloud. Only ComfyUI management applies.
-#
-# Under CLOUD_ROUTING=0: full VRAM-aware lifecycle via svc_transition.
-
-ensure_local_llm_running() {
-    # Under CLOUD_ROUTING=0 the agent is served by NInfer, so this must make
-    # the LLM healthy WITHOUT disturbing ComfyUI — the old body called
-    # svc_transition "thinking", which stops ComfyUI right before steps that
-    # need it (image generation, QA frame extraction).
-    ensure_agent_llm
-}
-
-_legacy_start_llm() {
-    gpu_owner llm || die "No local LLM started within timeout"
-}
-
-stop_all_llms() {
-    if [[ "${CLOUD_ROUTING:-1}" == "1" ]]; then
-        return 0
-    fi
-    # Park the LLM (marks output/.llm_parked so llm_monitor leaves it down).
-    _gpu_park_llm run.sh
-    llm_stop
-}
-
-_legacy_stop_all_llms() {
-    _gpu_park_llm run.sh
-    llm_stop
-    systemctl stop orpheus-tts.service 2>/dev/null || true
-    systemctl stop orpheus-backend.service 2>/dev/null || true
-}
-
-swap_to_122b()  { ensure_local_llm_running; }
-swap_to_27b()   { ensure_local_llm_running; }
-
-stop_all_llms_for_generation() {
-    if [[ "${CLOUD_ROUTING:-1}" == "1" ]]; then
-        ensure_comfyui
-        return 0
-    fi
-    log "Handing the GPU to ComfyUI (parks the LLM)..."
-    ensure_comfyui
-}
-
 ensure_comfyui() {
-    # ComfyUI and the LLM are exclusive GPU owners: starting ComfyUI stops the
-    # LLM (Conflicts=). Never call this inside an agent turn — the agent is
-    # served by that LLM. gpu_owner marks the LLM parked and waits for :8188.
-    local attempt
-    if curl -sf --max-time 5 "$COMFYUI_URL/api/system_stats" > /dev/null 2>&1 && ! llm_active; then
+    # ComfyUI is the resting GPU owner. gpu_owner stops the TTS cluster (and any
+    # stale LLM unit) and waits for :8188. No retries: a dead ComfyUI halts.
+    if curl -sf --max-time 5 "$COMFYUI_URL/api/system_stats" > /dev/null 2>&1 \
+       && ! systemctl is-active --quiet tts-cluster.service 2>/dev/null; then
         return 0
     fi
-    for attempt in 1 2 3; do
-        log "Handing the GPU to ComfyUI (attempt $attempt/3)..."
-        if gpu_owner comfyui; then
-            return 0
-        fi
-        systemctl restart "$SVC_COMFYUI" 2>/dev/null || true
-        sleep 3
-    done
-    die "ComfyUI failed to start within $((COMFYUI_START_TIMEOUT * 3))s — check: journalctl -u $SVC_COMFYUI -n 50"
+    log "Handing the GPU to ComfyUI..."
+    gpu_owner comfyui || halt_run "${CURRENT_STEP:-gpu}" "ComfyUI did not become healthy within ${COMFYUI_START_TIMEOUT}s — journalctl -u comfyui.service -n 50"
 }
 
-stop_hermes() {
-    # Stop Hermes stack if running (it uses the same LLM port)
-    systemctl stop "$SVC_HERMES" 2>/dev/null || true
-    # Also stop the user-level gateway
-    XDG_RUNTIME_DIR="/run/user/0" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/0/bus" \
-        systemctl --user stop hermes-gateway 2>/dev/null || true
-}
-
-start_hermes() {
-    # Restart Hermes with qwen3.8-27b after production
-    log "Starting Hermes stack..."
-    systemctl start "$SVC_HERMES" 2>/dev/null || true
-}
-
-# ── Routing: reasoning + execution on the LOCAL Strata LLM, vision on cloud ──
-# All text agents run on Qwen 3.8 Flash Next (strata-swift / swift-1.5-iq3_xxs,
-# effort xhigh, maxTokens 131072). Only qa-inspector goes to OpenRouter
-# (gemini-3-flash-preview) because Strata is text-only. Per-agent table lives
-# in pipeline/set_agent_model.py; GPU ownership in pipeline/gpu_owner.sh.
-export CLOUD_ROUTING="0"
-
-LOCAL_MODEL_PROVIDER="$LLM_PROVIDER"
-LOCAL_MODEL_ID="$LLM_MODEL"
-LOCAL_MODEL_EFFORT="$LLM_EFFORT"
-
+# ── Routing: every agent in the cloud, resolved per call, never rerouted ──
+ROUTE_PROVIDER=""; ROUTE_MODEL=""; ROUTE_EFFORT=""; ROUTE_TIER=""
 set_agent_model() {
-    local preset="$1"
-    # Always use set_agent_model.py — it dynamically picks the healthy provider
-    # (cloud or local) and writes the route atomically. The old CLOUD_ROUTING=0
-    # path hardcoded LOCAL_MODEL_PROVIDER which didn't match the running service.
-    local route
-    route=$(python3 "$PACK_DIR/pipeline/set_agent_model.py" "$preset") || {
-        die "set_agent_model failed for preset '$preset'"
-    }
-    log "Model route: $route"
+    local preset="$1" out rc=0 line
+    out=$(python3 "$PACK_DIR/pipeline/set_agent_model.py" "$preset" 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        halt_run "${CURRENT_STEP:-route}" "set_agent_model.py exit $rc for preset '$preset': $(echo "$out" | tail -2 | tr '\n' ' ')"
+    fi
+    line=$(echo "$out" | grep -m1 '^ROUTE ' || true)
+    ROUTE_PROVIDER=$(echo "$line" | sed -n 's/.*provider=\([^ ]*\).*/\1/p')
+    ROUTE_MODEL=$(echo "$line" | sed -n 's/.*model=\([^ ]*\).*/\1/p')
+    ROUTE_EFFORT=$(echo "$line" | sed -n 's/.*effort=\([^ ]*\).*/\1/p')
+    ROUTE_TIER=$(echo "$line" | sed -n 's/.*tier=\([^ ]*\).*/\1/p')
+    [ -n "$ROUTE_PROVIDER" ] || halt_run "${CURRENT_STEP:-route}" "set_agent_model.py printed no ROUTE line for '$preset': $(echo "$out" | tail -2 | tr '\n' ' ')"
+    log "Model route: $preset -> $ROUTE_PROVIDER/$ROUTE_MODEL (effort=$ROUTE_EFFORT, tier=$ROUTE_TIER)"
+}
+
+# Discord note once at 50 % and 80 % of a provider's spend cap.
+_ledger_progress() {
+    local provider="$1" pct marker
+    pct=$(python3 - "$RUN_DIR/cloud_usage.json" "$provider" <<'PYEOF' 2>/dev/null || echo 0
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    cap = d.get("caps", {}).get(sys.argv[2], {})
+    used = d.get("totals", {}).get("by_provider", {}).get(sys.argv[2], {})
+    r = 0.0
+    for k in ("calls", "usd_est"):
+        if cap.get(k):
+            r = max(r, float(used.get(k, 0)) / float(cap[k]))
+    print(int(r * 100))
+except Exception:
+    print(0)
+PYEOF
+)
+    for t in 80 50; do
+        marker="$RUN_DIR/.ledger_notified_${provider}_${t}"
+        if [ "${pct:-0}" -ge "$t" ] && [ ! -f "$marker" ]; then
+            touch "$marker"
+            notify "Cloud spend on $provider is at ${pct}% of its cap ($(python3 "$PACK_DIR/pipeline/cloud_ledger.py" summary "$RUN_DIR" 2>/dev/null | grep "$provider" | head -1))" "Cloud Spend"
+            break
+        fi
+    done
 }
 
 # Last-resort fallback when an agent emitted no parseable JSON: keep its raw
@@ -315,8 +248,6 @@ store_raw_artifact() {
 _run_dsh_agent_internal() {
     local preset="$1" prompt_file="$2" output_file="$3"
     log "Running agent: $preset"
-    local prompt_text
-    prompt_text=$(cat "$prompt_file")
 
     cd "$DSH_DIR"
     # dsh headless: takes task as positional arg, prints final answer to stdout
@@ -324,76 +255,36 @@ _run_dsh_agent_internal() {
     local raw_output="$RUN_DIR/${preset}_raw.txt"
     local err_output="$RUN_DIR/${preset}_stderr.log"
 
-    # all agents are cloud-hosted: point agent-default-model at the right model
-    # (pro for the reasoning agents, flash for everything else) before launch
-    #
-    # audio-producer robustness: its voice-casting turn (effort xhigh) has
-    # repeatedly looped ("finalizing / preparing to write JSON") and been killed
-    # by the empty-artifact watcher without writing voice_config.json. Curb the
-    # loop by running ONLY this preset at reduced effort; every other agent keeps
-    # xhigh. set_agent_model.py now honors DSH_EXECUTION_EFFORT through its local
-    # fallback, so the route and the dsh child inherit this value.
-    _AP_SAVED_EFFORT=""
-    if [ "$preset" = "audio-producer" ]; then
-        _AP_SAVED_EFFORT="${DSH_EXECUTION_EFFORT:-}"
-        export DSH_EXECUTION_EFFORT="${_AP_SAVED_EFFORT:-high}"
-    fi
     set_agent_model "$preset"
-
-    local agent_exit=0
+    # Spend ledger: cap check before, record after (pipeline/cloud_ledger.py).
+    if ! python3 "$PACK_DIR/pipeline/cloud_ledger.py" check "$RUN_DIR" --provider "$ROUTE_PROVIDER" >> "$RUN_DIR/pipeline.log" 2>&1; then
+        halt_run "${CURRENT_STEP:-agent}" "cloud spend cap reached for $ROUTE_PROVIDER before $preset — see $RUN_DIR/cloud_usage.json (raise CLOUD_MAX_* to continue)"
+    fi
+    local agent_exit=0 t0 t1
+    t0=$(date +%s)
+    # The task is piped on stdin (`-`): inlined skills + story can exceed the
+    # 128 KB single-argument limit of the kernel.
     pnpm dsh --profile headless \
         --patch "$PACK_DIR/.dsh/.agent-presets/$preset/agent.cordis.yml" \
-        "$prompt_text" \
+        - < "$prompt_file" \
         > "$raw_output" \
         2> "$err_output" || agent_exit=$?
-
-    # Restore/clear the audio-producer effort override now the agent call is done.
-    if [ "$preset" = "audio-producer" ]; then
-        if [ -n "$_AP_SAVED_EFFORT" ]; then export DSH_EXECUTION_EFFORT="$_AP_SAVED_EFFORT"; else unset DSH_EXECUTION_EFFORT; fi
-    fi
+    t1=$(date +%s)
 
     # Append stderr to pipeline.log for post-mortem
     if [[ -s "$err_output" ]]; then
         cat "$err_output" >> "$RUN_DIR/pipeline.log"
     fi
+    python3 "$PACK_DIR/pipeline/cloud_ledger.py" record "$RUN_DIR" --preset "$preset" --provider "$ROUTE_PROVIDER" \
+        --model "$ROUTE_MODEL" --effort "$ROUTE_EFFORT" --step "${CURRENT_STEP:-}" --prompt-file "$prompt_file" \
+        --raw-file "$raw_output" --stderr-file "$err_output" --exit "$agent_exit" --seconds "$((t1 - t0))" \
+        >> "$RUN_DIR/pipeline.log" 2>&1 || true
+    _ledger_progress "$ROUTE_PROVIDER"
 
-    # ── Runtime cloud-exhaustion catch ──
-    # The pre-launch probe in set_agent_model.py checks the key's monthly
-    # limit, but OpenRouter can still 402 when account credits can't cover
-    # max_tokens ("can only afford N tokens"). dsh surfaces that as
-    # `PI_AI_ERROR: 402` on stderr and exits non-zero — without this block
-    # the run just retries the same broken cloud route forever.
-    if [[ $agent_exit -ne 0 ]] && grep -qE 'PI_AI_ERROR:\s*(402|429|401)' "$err_output" 2>/dev/null; then
-        local http_code
-        http_code=$(grep -oE 'PI_AI_ERROR:\s*(402|429|401)' "$err_output" | head -1 | grep -oE '(402|429|401)')
-        log "Cloud API $http_code for $preset — marking exhausted and falling back to local Qwen"
-        # Mark exhausted (writes .cloud_fallback_state + .use_local_llm).
-        # Call route_for via the Python CLI WITHOUT --show so it also runs
-        # _ensure_local_llm (starts the service, waits for health) and
-        # rewrites settings.yaml to the local provider — the bash
-        # CLOUD_ROUTING=0 path only rewrites YAML and would leave the LLM down.
-        python3 "$PACK_DIR/pipeline/set_agent_model.py" --mark-exhausted "runtime $http_code from $preset"
-        export CLOUD_ROUTING="0"
-        local fallback_route
-        fallback_route=$(python3 "$PACK_DIR/pipeline/set_agent_model.py" "$preset") || {
-            log "ERROR: local fallback route failed for $preset"
-        }
-        log "Model route (fallback): $fallback_route"
-        # Retry once on local
-        agent_exit=0
-        pnpm dsh --profile headless \
-            --patch "$PACK_DIR/.dsh/.agent-presets/$preset/agent.cordis.yml" \
-            "$prompt_text" \
-            > "$raw_output" \
-            2> "$err_output" || agent_exit=$?
-        if [[ -s "$err_output" ]]; then
-            cat "$err_output" >> "$RUN_DIR/pipeline.log"
-        fi
-    fi
-
-    if [[ $agent_exit -ne 0 ]]; then
-        log "WARNING: Agent $preset exited non-zero (exit $agent_exit). Check $RUN_DIR/pipeline.log"
-        # Save raw output even on failure for resume
+    # Any failure of the call halts — no retry, no second provider (decision 2026-10-18).
+    if [[ $agent_exit -ne 0 ]] || grep -qE 'PI_AI_ERROR|TRANSPORT: Connection error|expired while waiting for admission' "$err_output" 2>/dev/null; then
+        HALT_PRESET="$preset" HALT_STDERR="$err_output" \
+            halt_run "${CURRENT_STEP:-agent}" "agent $preset failed (exit $agent_exit) on $ROUTE_PROVIDER/$ROUTE_MODEL: $(grep -m1 -oE 'PI_AI_ERROR.{0,160}|TRANSPORT.{0,120}' "$err_output" 2>/dev/null || tail -c 300 "$err_output" | tr '\n' ' ')"
     fi
 
     # Post-process: for story-creator, extract JSON block
@@ -519,9 +410,8 @@ print(f"story.json written ({len(json.dumps(chosen))} chars, "
 PYEOF
         local rc=$?
         if [[ $rc -ne 0 ]]; then
-            log "ERROR: story-creator JSON extraction failed (exit $rc)"
-            # Don't copy raw output — it's incomplete; let resume retry
-            return 1
+            HALT_PRESET="$preset" HALT_STDERR="$err_output" \
+                halt_run "${CURRENT_STEP:-agent}" "story-creator returned no parseable story JSON (extraction exit $rc) — see $raw_output"
         fi
     else
         # Agents on local models often write files via tools to paths they choose
@@ -604,11 +494,18 @@ PYEOF
             # body at process start, so this only takes effect after a pipeline restart.
             # For the reviewer, skip Search 1 entirely; extract_json / prose-wrap below
             # (which prefers prompts/<shot>_*.md) is the correct path.
-            if [ -z "$found_json" ] && [[ "$preset" != "screenplay-reviewer" ]]; then
+            # Tool-less presets answer on stdout only: never scan the run dir for them
+            # (the spend ledger cloud_usage.json is always newer than their prompt).
+            case "$preset" in
+                screenplay-reviewer|story-editor|dialogue-polish|director|music-composer) ;;
+                *)
+            if [ -z "$found_json" ]; then
                 found_json=$(find "$RUN_DIR" "$DSH_DIR" -maxdepth 4 -name "*.json" -newer "$prompt_file" -mmin -10 \
                     -exec python3 -c 'import json,sys; json.load(open(sys.argv[1])); print(sys.argv[1])' {} \; 2>/dev/null \
-                    | grep -v "pipeline.log\|run_latest\|settings.yaml\|watchdog" | head -1 || true)
+                    | grep -v "pipeline.log\|run_latest\|settings.yaml\|watchdog\|cloud_usage\|story_review\|story_check\|HALT_FOR_REVIEW\|narration_check\|timeline.json\|_report.json\|assembly_log\|render_log\|\.ledger_" | head -1 || true)
             fi
+                ;;
+            esac
 
             # Search 2: shot-specific files in prompts/ directory (agent may have written here)
             if [ -z "$found_json" ]; then
@@ -708,161 +605,21 @@ PYEOF
         fi
     fi
 
-    # Mid-run failure watcher: an empty artifact means the agent call itself
-    # failed (API/transport), which would otherwise silently cascade into
-    # downstream steps. Log + push to Discord so the run is never silently wrong.
+    # An empty artifact means the call itself failed or the agent answered in prose.
     if [[ ! -s "$output_file" ]]; then
-        log "ERROR: agent $preset produced an empty artifact: $output_file"
-        notify "Agent $preset produced EMPTY output during run $(basename "$RUN_DIR") — see pipeline.log" "Pipeline Warning"
-        return 1
+        HALT_PRESET="$preset" HALT_STDERR="$err_output" \
+            halt_run "${CURRENT_STEP:-agent}" "agent $preset produced no usable artifact: $output_file (raw stdout kept at $raw_output)"
     fi
     log "Agent $preset done -> $output_file"
     return 0
 }
 
-# ── Phase-Aware Agent Runner ─────────────────────────────────
-# Predecessor to run_dsh_agent that handles service phase transitions.
-# Call this instead of run_dsh_agent for all pipeline agents.
-# Under cloud routing (default), it's a thin pass-through.
-# Under local mode, it ensures the correct services are running.
-
-# Preset → phase mapping (mirrors run_dsh_agent.sh but inline here)
-declare -A _AGENT_PHASE=(
-    ["story-creator"]="thinking" ["director"]="thinking" ["screenplay-reviewer"]="thinking"
-    ["character-designer"]="video_gen" ["location-designer"]="video_gen"
-    ["image-generator"]="video_gen" ["storyboard-artist"]="video_gen"
-    ["video-generator"]="video_gen"
-    ["audio-producer"]="audio_gen" ["music-composer"]="audio_gen"
-    ["qa-inspector"]="thinking"
-    ["subtitle-generator"]="monitoring" ["post-production-editor"]="monitoring"
-    ["pipeline-orchestrator"]="monitoring"
-)
-
-_agent_phase_of() {
-    echo "${_AGENT_PHASE[$1]:-thinking}"
-}
-
-_run_dsh_agent_with_phase() {
-    local preset="$1"
-    shift
-    # After shift: "$@" = (prompt_file, output_file) — matches _run_dsh_agent_internal's args
-    local phase
-    phase=$(_agent_phase_of "$preset")
-
-    # Cloud routing: skip all service management
-    if [[ "${CLOUD_ROUTING:-1}" == "1" ]]; then
-        # Ensure ComfyUI is up if this agent uses it
-        case "$phase" in
-            video_gen) ensure_comfyui ;;
-        esac
-        _run_dsh_agent_internal "$preset" "$@"
-        return $?
-    fi
-
-    # Local routing. The agent ITSELF is served by the local LLM, so every
-    # phase must leave an LLM healthy — the old body stopped it first
-    # (svc_transition video_gen / stop_all_llms_for_generation), which is why
-    # character-designer, location-designer, image-generator and
-    # audio-producer all died with "dsh: TRANSPORT: Connection error" and
-    # wrote 47-byte [ELIFECYCLE] artifacts. Generation work that truly needs
-    # exclusive VRAM runs in pipeline/*.sh with the LLM parked, never inside
-    # an agent turn.
-    # Every phase: the agent is served by the local LLM, which is the GPU's
-    # sole owner while the turn runs (ComfyUI and the TTS cluster are
-    # Conflicts= with it). Agents therefore never call ComfyUI or a TTS port:
-    # they write job files (frame_spec.json, tts_jobs.json, reviewed_prompt.json)
-    # and the pipeline renders them afterwards with the LLM parked
-    # (generate_frames.py, tts_render.py, generate_clip.py, …).
-    ensure_agent_llm
-
-    # Optional VRAM pre-check
-    if [[ -f "$VRAM_MONITOR" ]]; then
-        vram_check_now >> "$RUN_DIR/pipeline.log" 2>&1 || true
-    fi
-
-    _run_dsh_agent_internal "$preset" "$@"
-    local rc=$?
-
-    # Post-agent VRAM report
-    if [[ -f "$VRAM_MONITOR" ]]; then
-        vram_report >> "$RUN_DIR/pipeline.log" 2>&1 || true
-    fi
-
-    return $rc
-}
-
-restart_comfyui_clean() {
-    systemctl restart comfyui.service 2>/dev/null || true
-}
-
-# Wait for the local LLM's "I am back" announcement: output/.llm_ready written
-# by pipeline/llm_ready_notify.sh (ExecStartPost of the Strata unit) newer than
-# the failure, or the API answering directly. If the unit is not even starting
-# (parked by a render that is still running), kick it: llm_monitor.py would do
-# the same on its next pass, but the agent turn is waiting right now.
-_wait_llm_ready() {
-    local timeout="${1:-330}" since waited=0 ready="$OUTPUT_DIR/.llm_ready"
-    local health="${LLM_HEALTH_URL:-http://127.0.0.1:8321/v1/models}"
-    local unit="${LLM_UNIT:-strata-swift-iq3-xxs.service}"
-    since=$(date +%s)
-    while [ "$waited" -lt "$timeout" ]; do
-        if [ -f "$ready" ] && [ "$(stat -c %Y "$ready" 2>/dev/null || echo 0)" -ge "$since" ]; then
-            log "LLM announced it is back ($(cat "$ready" 2>/dev/null | head -c 160)) — resuming"
-            return 0
-        fi
-        if curl -sf --max-time 4 "$health" > /dev/null 2>&1; then
-            log "LLM answering again after ${waited}s — resuming"
-            return 0
-        fi
-        if [ "$waited" -ge 20 ] && [ ! -f "$OUTPUT_DIR/.llm_parked" ] && \
-           [ "$(systemctl is-active "$unit" 2>/dev/null)" != "active" ] && \
-           [ "$(systemctl is-active "$unit" 2>/dev/null)" != "activating" ]; then
-            log "LLM unit is $(systemctl is-active "$unit" 2>/dev/null) and not parked — starting it (≈2 min)"
-            systemctl reset-failed "$unit" 2>/dev/null || true
-            systemctl start "$unit" 2>/dev/null || true
-        fi
-        sleep 5
-        waited=$((waited + 5))
-    done
-    log "WARNING: LLM did not come back within ${timeout}s — retrying the turn anyway"
-    return 1
-}
-
 # ── Public Agent Launcher ─────────────────────────────────────
-# This is the function called throughout run.sh by every pipeline step.
-# It delegates to _run_dsh_agent_with_phase for VRAM-safe transitions,
-# which then calls _run_dsh_agent_internal for the actual dsh execution.
- run_dsh_agent() {
-    local preset="$1"
-    shift
-    # Retry up to 3 times on transient dsh transport errors (the local ninfer
-    # occasionally drops long sessions with "TRANSPORT: Connection error" or
-    # "inference request expired while waiting for admission"). A clean success
-    # returns immediately; only transport/admission failures trigger a retry.
-    local attempt=1
-    while [[ $attempt -le 3 ]]; do
-        _run_dsh_agent_with_phase "$preset" "$@"
-        local rc=$?
-        if [[ $rc -eq 0 ]]; then
-            return 0
-        fi
-        # Detect a transient transport/admission failure from the stderr log
-        local errfile="${RUN_DIR}/${preset}_stderr.log"
-        if grep -qE 'TRANSPORT: Connection error|expired while waiting for admission|PI_AI_ERROR' "$errfile" 2>/dev/null; then
-            # The usual cause: ComfyUI/TTS took the GPU and the Strata unit was
-            # stopped mid-turn. Its ExecStartPost (pipeline/llm_ready_notify.sh)
-            # writes output/.llm_ready once the API answers again — wait for
-            # that announcement (≤ 330 s, ≈2 min typical) and then re-issue the
-            # SAME prompt file; agent turns are idempotent (every output is a file).
-            log "[$preset] transient transport error (attempt $attempt/3) — waiting for the LLM to announce it is back"
-            _wait_llm_ready 330
-            attempt=$((attempt+1))
-            continue
-        fi
-        # Non-transient failure — don't retry
-        return $rc
-    done
-    return $rc
+# One attempt per call. Any failure halts the run inside _run_dsh_agent_internal
+# (halt_run); ./launch_resume.sh re-runs the step. No transport retries, no phase
+# juggling: the GPU is not involved in an agent turn (every agent is in the cloud).
+run_dsh_agent() {
+    _run_dsh_agent_internal "$@"
 }
 
 write_prompt() {
@@ -931,6 +688,11 @@ if [ "$RESUME" = "true" ]; then
     [ -f "$RUN_DIR/input_story.md" ] || die "No story found in $RUN_DIR"
     log "=== RESUMING PRODUCTION ==="
     log "Run: $RUN_DIR"
+    if [ -f "$RUN_DIR/HALT_FOR_REVIEW.json" ] && \
+       python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("kind")=="error" else 1)' "$RUN_DIR/HALT_FOR_REVIEW.json" 2>/dev/null; then
+        log "previous run halted on an error: $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("step",""), "-", str(d.get("reason",""))[:200])' "$RUN_DIR/HALT_FOR_REVIEW.json" 2>/dev/null) — clearing the halt, the step re-runs"
+        rm -f "$RUN_DIR/HALT_FOR_REVIEW.json"
+    fi
     [ -n "$FROM_CLIP" ] && log "From clip: $FROM_CLIP"
     [ -n "$ONLY_CLIP" ] && log "Only clip: $ONLY_CLIP"
     notify "Resuming production$([ -n "$FROM_CLIP" ] && echo " from $FROM_CLIP")$([ -n "$ONLY_CLIP" ] && echo " (only $ONLY_CLIP)")\nRun: $RUN_DIR" "Production Pack Resume"
@@ -1001,58 +763,159 @@ should_process_clip() {
 # ═══════════════════════════════════════════════════════════
 
 step "PHASE 1: PRE-PRODUCTION"
-notify "Phase 1: Pre-production starting (DeepSeek V4 Pro via OpenCode Go)" "Pre-Production"
+notify "Phase 1: Pre-production starting (story + director on Claude Opus 5.5, the rest on OpenCode Go)" "Pre-Production"
 
-# ── Agent handoff from the idle-monitor ─────────────────────
-# If a TTS service went stuck and the monitor reclaimed VRAM to NInfer, it left
-# a handoff note. Surface it so this run's agents continue the debugging.
-HANDOFF="$OUTPUT_DIR/agent_handoff.json"
-if [ -s "$HANDOFF" ]; then
-    log "Agent handoff detected — continuing prior debugging:"
-    python3 -c "import json,sys; d=json.load(open('$HANDOFF')); print('  ', d.get('instruction',''))" 2>/dev/null
-    # Append the instruction to the story prompt context so the first agent sees it
-    HANDOFF_NOTE=$(python3 -c "import json; print(json.load(open('$HANDOFF')).get('instruction',''))" 2>/dev/null)
-    if [ -n "$HANDOFF_NOTE" ]; then
-        echo "" >> "$RUN_DIR/input_story.md" 2>/dev/null || true
-        echo "" >> "$RUN_DIR/input_story.md" 2>/dev/null || true
-        echo "[DEBUG HANDOFF FROM IDLE-MONITOR] $HANDOFF_NOTE" >> "$RUN_DIR/input_story.md" 2>/dev/null || true
-        log "Handoff instruction appended to input context."
+# ── Cloud preflight: every provider in use must answer /models with its key ──
+# No reroute: a missing key or a failed probe halts before any GPU work starts.
+step "0. Cloud preflight"
+PROBE_OUT=$(python3 "$PACK_DIR/pipeline/set_agent_model.py" --probe-all 2>&1) || \
+    halt_run "0. Cloud preflight" "provider probe failed: $(echo "$PROBE_OUT" | grep -E 'FAIL|ERROR' | head -3 | tr '\n' ' ')"
+log "$PROBE_OUT"
+python3 "$PACK_DIR/pipeline/set_agent_model.py" --dry-run-all >> "$RUN_DIR/pipeline.log" 2>&1 || true
+log "4K master frame rate: ${PP_TARGET_FPS} fps; cloud caps: anthropic ${CLOUD_MAX_CALLS_ANTHROPIC} calls / \$${CLOUD_MAX_USD_EST_ANTHROPIC}, opencode ${CLOUD_MAX_CALLS_OPENCODE} calls"
+
+# 1a. Story Creator — Claude Opus 5.5 REWRITES the draft into a screenplay-grade
+# story. The agent has no tools: the schema and the craft skill are inlined. One
+# attempt; any failure halts (run_dsh_agent). The draft is the premise, not the script.
+if ! skip_if_done "$RUN_DIR/story.json" "Story Creator"; then
+    step "1a. Story Creator — writing the story"
+    write_prompt "$RUN_DIR/prompt_story.txt" \
+        "Rewrite the draft below into a complete, screenplay-grade story for a Pixar-style animated short, following the story-schema and story-craft skills reproduced here. Keep the draft's premise, named characters and ending unless a craft rule forces a change. Walk the self-check in story-craft section 12 before answering. Output ONLY the JSON document — raw, no code fences, no prose — starting with {.
+
+--- STORY-SCHEMA SKILL ---
+$(cat "$PACK_DIR/.dsh/skills/story-schema.md")
+
+--- STORY-CRAFT SKILL ---
+$(cat "$PACK_DIR/.dsh/skills/story-craft.md")
+
+--- THE DRAFT ---
+$(cat "$RUN_DIR/input_story.md")"
+    run_dsh_agent "story-creator" "$RUN_DIR/prompt_story.txt" "$RUN_DIR/story.json"
+    if python3 "$PACK_DIR/pipeline/story_check.py" --story "$RUN_DIR/story.json" --out "$RUN_DIR/story_check.json" >> "$RUN_DIR/pipeline.log" 2>&1; then
+        log "story_check: ok after 1a"
+    else
+        log "story_check: issues after 1a (the story editor pass fixes them): $(python3 -c "import json; d=json.load(open('$RUN_DIR/story_check.json')); print('; '.join(d.get('blocking',[]))[:300])" 2>/dev/null)"
     fi
 fi
 
-# 1a. Story Creator
-if ! skip_if_done "$RUN_DIR/story.json" "Story Creator"; then
-    step "1a. Story Creator — structuring story"
-    write_prompt "$RUN_DIR/prompt_story.txt" \
-        "Read the story below and structure it into the production JSON format (see story-schema skill).
+# 1a-edit. Story Editor — ONE Opus call: critique (scores 1-10, concrete rewrites)
+# followed by the revised story. The envelope is split into story_review.json and
+# story.json. If story_check still blocks, the editor gets exactly one fix round;
+# a story that still fails after that halts the run (the operator decides).
+_split_story_envelope() {   # $1 envelope  $2 review_out  $3 story_out
+    python3 - "$1" "$2" "$3" <<'PYEOF'
+import json, os, sys
+env_path, review_out, story_out = sys.argv[1:4]
+d = json.load(open(env_path, encoding="utf-8"))
+if not isinstance(d, dict) or "story" not in d or "review" not in d:
+    print("envelope lacks 'review'/'story' keys: " + ", ".join(list(d)[:8] if isinstance(d, dict) else []), file=sys.stderr)
+    sys.exit(1)
+story = d["story"]
+req = ["title", "logline", "characters", "locations", "acts", "scenes"]
+missing = [k for k in req if k not in story]
+if missing:
+    print("revised story misses required keys: " + ", ".join(missing), file=sys.stderr)
+    sys.exit(1)
+for path, obj in ((review_out, d["review"]), (story_out, story)):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+sc = d["review"].get("scores", {}) if isinstance(d["review"], dict) else {}
+print("review scores: " + ", ".join(f"{k}={v}" for k, v in sc.items()) + f"; overall={d['review'].get('overall','?')}")
+PYEOF
+}
 
-OUTPUT: a single valid JSON object with EXACTLY these top-level keys (all required):
-  title, logline, theme, characters, locations, acts, scenes
-- characters: array of {name, description, identity_anchors}
-- locations: array of {name, description, color_palette}
-- acts: array of act objects
-- scenes: array of {scene_id, title, dialogue[], narration[], emotional_beat, visual_mood}
-Do NOT omit any of the top-level keys above. Do not wrap the JSON in prose or code fences — output raw JSON only.
+if ! skip_if_done "$RUN_DIR/story_review.json" "Story Editor"; then
+    step "1a-edit. Story Editor — critique and revision"
+    [ -f "$RUN_DIR/story_v1.json" ] || cp "$RUN_DIR/story.json" "$RUN_DIR/story_v1.json"
+    EDIT_NOTES=""
+    if [ -s "$RUN_DIR/story_check.json" ]; then
+        EDIT_NOTES="The pipeline's automatic story_check reported: $(python3 -c "import json; d=json.load(open('$RUN_DIR/story_check.json')); print('; '.join(d.get('blocking',[])+d.get('warnings',[]))[:1500])" 2>/dev/null). Fix every blocking item in the revision."
+    fi
+    write_prompt "$RUN_DIR/prompt_story_edit.txt" \
+        "Act as the story editor for the story below: score it, list concrete rewrites, then deliver the FULL revised story. Output ONLY the JSON envelope {\"review\": {\"scores\": {...}, \"overall\": n, \"notes\": [...], \"rewrites\": [...]}, \"story\": {...}} — raw, starting with {. The revised story follows the story-schema exactly and keeps every character, the ending and all readable_props values. $EDIT_NOTES
 
---- STORY ---
-$(cat "$RUN_DIR/input_story.md")"
-    # Retry up to 3 times: local ninfer can drop long requests with
-    # "inference request expired while waiting for admission" under load.
-    attempt=1
-    while [[ $attempt -le 3 ]]; do
-        if run_dsh_agent "story-creator" "$RUN_DIR/prompt_story.txt" "$RUN_DIR/story.json"; then
-            [ -s "$RUN_DIR/story.json" ] && break
-            log "story.json empty after attempt $attempt — retrying"
-        else
-            log "story-creator attempt $attempt failed — checking for transient admission timeout"
-        fi
-        if grep -qE 'expired while waiting for admission|PI_AI_ERROR' "$RUN_DIR/story-creator_stderr.log" 2>/dev/null; then
-            log "Transient LLM admission timeout on attempt $attempt — backing off and retrying"
-            sleep 5
-        fi
-        attempt=$((attempt+1))
-    done
-    [ -s "$RUN_DIR/story.json" ] || die "story-creator failed after 3 attempts — no story.json (check $RUN_DIR/pipeline.log)"
+--- STORY-CRAFT SKILL (the rubric) ---
+$(cat "$PACK_DIR/.dsh/skills/story-craft.md")
+
+--- STORY-SCHEMA SKILL ---
+$(cat "$PACK_DIR/.dsh/skills/story-schema.md")
+
+--- STORY v1 ---
+$(cat "$RUN_DIR/story_v1.json")"
+    run_dsh_agent "story-editor" "$RUN_DIR/prompt_story_edit.txt" "$RUN_DIR/story_edit_envelope.json"
+    SPLIT_MSG=$(_split_story_envelope "$RUN_DIR/story_edit_envelope.json" "$RUN_DIR/story_review.json" "$RUN_DIR/story.json" 2>&1) \
+        || halt_run "$CURRENT_STEP" "story-editor envelope unusable: $SPLIT_MSG (see $RUN_DIR/story_edit_envelope.json)"
+    log "$SPLIT_MSG"
+    if ! python3 "$PACK_DIR/pipeline/story_check.py" --story "$RUN_DIR/story.json" --out "$RUN_DIR/story_check.json" >> "$RUN_DIR/pipeline.log" 2>&1; then
+        FIX_NOTES=$(python3 -c "import json; d=json.load(open('$RUN_DIR/story_check.json')); print('; '.join(d.get('blocking',[]))[:1500])" 2>/dev/null)
+        log "story_check still blocks after the editor pass — one fix round: $FIX_NOTES"
+        write_prompt "$RUN_DIR/prompt_story_edit_fix.txt" \
+            "Your revised story still fails the pipeline's story_check: $FIX_NOTES. Fix EVERY item (keep everything else) and return the same JSON envelope {\"review\": {...}, \"story\": {...}} — raw, starting with {.
+
+--- STORY-SCHEMA SKILL ---
+$(cat "$PACK_DIR/.dsh/skills/story-schema.md")
+
+--- STORY-CRAFT SKILL ---
+$(cat "$PACK_DIR/.dsh/skills/story-craft.md")
+
+--- YOUR REVISED STORY ---
+$(cat "$RUN_DIR/story.json")"
+        rm -f "$RUN_DIR/story_edit_envelope.json"
+        run_dsh_agent "story-editor" "$RUN_DIR/prompt_story_edit_fix.txt" "$RUN_DIR/story_edit_envelope.json"
+        SPLIT_MSG=$(_split_story_envelope "$RUN_DIR/story_edit_envelope.json" "$RUN_DIR/story_review.json" "$RUN_DIR/story.json" 2>&1) \
+            || halt_run "$CURRENT_STEP" "story-editor fix envelope unusable: $SPLIT_MSG"
+        log "$SPLIT_MSG"
+        python3 "$PACK_DIR/pipeline/story_check.py" --story "$RUN_DIR/story.json" --out "$RUN_DIR/story_check.json" >> "$RUN_DIR/pipeline.log" 2>&1 \
+            || halt_run "$CURRENT_STEP" "story still fails story_check after the editor's fix round: $(python3 -c "import json; d=json.load(open('$RUN_DIR/story_check.json')); print('; '.join(d.get('blocking',[]))[:400])" 2>/dev/null) — edit $RUN_DIR/story.json by hand (or the draft) and resume"
+    fi
+    notify "Story editor pass done — $SPLIT_MSG" "Story Editor"
+fi
+
+# 1a-dialogue. Dialogue Polish — Gemini (OpenCode Go) rewrites ONLY the dialogue
+# lines for subtext, within the H3 limits. dialogue_patch.py validates and applies;
+# after this step the dialogue is LOCKED (the Director copies lines verbatim).
+if ! skip_if_done "$RUN_DIR/story_dialogue_patch.json" "Dialogue Polish"; then
+    step "1a-dialogue. Dialogue Polish (Gemini)"
+    DIALOGUE_INPUT=$(python3 - "$RUN_DIR/story.json" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+chars = []
+for c in d.get("characters", []):
+    chars.append({k: c.get(k) for k in ("id", "name", "personality", "verbal_signature", "voice_style") if c.get(k)})
+scenes = []
+for sc in d.get("scenes", []):
+    lines = []
+    for i, ln in enumerate(sc.get("dialogue") or []):
+        lines.append({"index": i, "character_id": ln.get("character_id"), "line": ln.get("line"), "emotion": ln.get("emotion")})
+    if not lines:
+        continue
+    scenes.append({"id": sc.get("id") or sc.get("scene_id"), "scene_goal": sc.get("scene_goal"), "turn": sc.get("turn"),
+                   "pov_character": sc.get("pov_character"), "emotional_beat": sc.get("emotional_beat"),
+                   "action_description": sc.get("action_description"), "readable_props": sc.get("readable_props"),
+                   "dialogue": lines})
+out = {"title": d.get("title"), "logline": d.get("logline"), "theme": d.get("theme"), "want": d.get("want"),
+       "need": d.get("need"), "characters": chars, "scenes": scenes}
+print(json.dumps(out, ensure_ascii=False, indent=1))
+PYEOF
+)
+    write_prompt "$RUN_DIR/prompt_dialogue.txt" \
+        "Polish the dialogue of this story for subtext and character voice. Rewrite ONLY lines that improve; keep speaker, order and count; <= 130 characters and <= 30 words per line; one speaker per beat; never explain the plot or name a feeling; keep every readable-prop value verbatim. Output ONLY {\"lines\": [{\"scene_id\", \"index\", \"character_id\", \"line\", \"emotion\"}], \"notes\": [...]} with the CHANGED lines (index is 0-based) — raw JSON starting with {.
+
+$DIALOGUE_INPUT"
+    run_dsh_agent "dialogue-polish" "$RUN_DIR/prompt_dialogue.txt" "$RUN_DIR/story_dialogue_patch.json"
+    PATCH_RC=0
+    python3 "$PACK_DIR/pipeline/dialogue_patch.py" "$RUN_DIR/story.json" "$RUN_DIR/story_dialogue_patch.json" \
+        --backup --diff "$RUN_DIR/story_dialogue_diff.txt" >> "$RUN_DIR/pipeline.log" 2>&1 || PATCH_RC=$?
+    case "$PATCH_RC" in
+        0) log "dialogue polish applied — diff in $RUN_DIR/story_dialogue_diff.txt" ;;
+        1) log "dialogue polish: no line could be applied (all entries rejected) — keeping the editor's lines" ;;
+        *) halt_run "$CURRENT_STEP" "dialogue_patch.py exit $PATCH_RC — the dialogue-polish output is not a valid patch (see $RUN_DIR/story_dialogue_patch.json)" ;;
+    esac
+    python3 "$PACK_DIR/pipeline/story_check.py" --story "$RUN_DIR/story.json" --out "$RUN_DIR/story_check.json" >> "$RUN_DIR/pipeline.log" 2>&1 \
+        || halt_run "$CURRENT_STEP" "story fails story_check after the dialogue polish: $(python3 -c "import json; d=json.load(open('$RUN_DIR/story_check.json')); print('; '.join(d.get('blocking',[]))[:400])" 2>/dev/null)"
+    notify "Dialogue polished (locked from here)\n$(head -c 900 "$RUN_DIR/story_dialogue_diff.txt" 2>/dev/null)" "Dialogue Polish"
 fi
 
 # Post story summary to Discord before continuing
@@ -1090,15 +953,29 @@ fi
 # 1b. Director
 if ! skip_if_done "$RUN_DIR/shot_list.json" "Director"; then
     step "1b. Director — creating shot list"
+    DIRECTOR_CRAFT=$(sed -n '/^## Director excerpt/,/^## End director excerpt/p' "$PACK_DIR/.dsh/skills/story-craft.md")
     write_prompt "$RUN_DIR/prompt_director.txt" \
-        "Read the structured story at $RUN_DIR/story.json. Create a complete shot list following the shot-list-schema skill. For each scene, plan shots:
+        "Create the complete shot list for the story below, following the shot-list-schema and editing-grammar skills reproduced here. Output ONLY the shot list JSON — raw, starting with {. Plan shots per scene:
 - Duration: 5-8 seconds per clip (10 s max unless dialogue needs it; H3 minimum 5.2 s)
 - Mode: reference (mid-scene coverage), composited_i2v (scene openings with characters), first_frame_only (0-character establishing shots from the plate), first_last_frame (continuous action only)
 - H3 ENVELOPE (knowledge/minimax_h3_rules.md section 0, enforced by shot_list_lint.py): ONE beat per shot (a montage = one shot per beat); <= 3 named characters per frame, extras are 'a few distant figures, backs to camera' and never counted; EACH character gets its own action / hand_position / expression (no copy-paste); extreme-wide shots carry no named characters and no faces; faces and hands only at medium or closer; the picture must illustrate the narration line laid over it; reference_images.source only canonical files (characters/<id>/<id>_side.png, locations/<id>/<id>.png)
+- DIALOGUE IS LOCKED: every scenes[].dialogue[].line is copied VERBATIM into exactly one shot's audio.dialogue (split only at a sentence boundary into consecutive shots, both halves kept); never omit, merge or paraphrase a line; narration only from scenes[].narration.text, never invented
+- EMOTION IS THE EDIT: per shot pov_character and audience_feels (from the scene unless the shot changes POV); the scene's linger beat is its own held reaction single (5-6 s, no dialogue, edit.relation_to_prev reaction); per shot audio.music_cue {action start|continue|swell|stop|silence, mood, intensity} derived from the scene's music_cue, start/stop landing on named shots
 - Mark which shots have DIALOGUE (needs lip sync) vs NARRATION (no lip sync)
 - Specify camera, characters, hand positions, identity anchors
 - EDITING (editing-grammar skill, mandatory): consecutive shots in a scene differ by subject, >= 2 shot sizes or >= 30 degrees (no jump cuts); never three shots of the same size in a row; every shot has edit.handle_head_s / edit.handle_tail_s >= 1.0 INCLUDED in duration_seconds, edit.cut_in and edit.cut_out (pose, gaze, prop state, motion phase); every dialogue scene has a reaction single and an insert; readable_props (clock faces, counts) pinned per scene; transition_to_next.type = cut unless a story reason
-- Output valid JSON to be processed shot-by-shot."
+
+--- SHOT-LIST-SCHEMA SKILL ---
+$(cat "$PACK_DIR/.dsh/skills/shot-list-schema.md")
+
+--- EDITING-GRAMMAR SKILL ---
+$(cat "$PACK_DIR/.dsh/skills/editing-grammar.md")
+
+--- STORY-CRAFT (director excerpt) ---
+$DIRECTOR_CRAFT
+
+--- STORY ---
+$(cat "$RUN_DIR/story.json")"
     run_dsh_agent "director" "$RUN_DIR/prompt_director.txt" "$RUN_DIR/shot_list.json" \
         || die "director failed — no shot_list.json (check $RUN_DIR/pipeline.log)"
 
@@ -1109,6 +986,66 @@ if ! skip_if_done "$RUN_DIR/shot_list.json" "Director"; then
     if echo "$TIMING_ISSUES" | grep -q "timing issue"; then
         notify "$TIMING_ISSUES" "Audio Timing Fix"
     fi
+
+    # Director fix rounds run in PATCH mode: the Director returns only the shots
+    # it changes (replace / insert_after / delete) and pipeline/shot_list_patch.py
+    # merges them — ~10x fewer Opus output tokens than rewriting 100 shots, and
+    # dialogue_guard rejects any patch that drops a locked line.
+    PATCH_SCHEMA='{"patch_version": 1, "replace": [<full shot objects, same shot_id>], "insert_after": [{"after": "<shot_id>", "shot": {<full shot object, new shot_id like S01_003a>}}], "delete": ["<shot_id>"], "notes": "one line per fix"}'
+    director_patch_round() {   # $1 kind  $2 report.json  $3 instructions  -> 0 applied, 1 rejected
+        local kind="$1" report="$2" instructions="$3" n patch affected
+        n=$(ls "$RUN_DIR"/shot_list_patch_"$kind"_*.json 2>/dev/null | wc -l)
+        n=$((n + 1))
+        patch="$RUN_DIR/shot_list_patch_${kind}_${n}.json"
+        affected=$(python3 - "$RUN_DIR/shot_list.json" "$report" "$RUN_DIR/story.json" <<'PYEOF'
+import json, re, sys
+shots = json.load(open(sys.argv[1], encoding="utf-8")).get("shots", [])
+ids = [s.get("shot_id") for s in shots]
+rep_text = open(sys.argv[2], encoding="utf-8", errors="replace").read()
+hit = [i for i in ids if i and re.search(r"\b" + re.escape(i) + r"\b", rep_text)]
+want = set()
+for i in hit:
+    k = ids.index(i)
+    for j in (k - 1, k, k + 1):
+        if 0 <= j < len(ids):
+            want.add(ids[j])
+if not hit:          # report names no shot — give the first 12 shots as context
+    want = set(ids[:12])
+sel = [s for s in shots if s.get("shot_id") in want]
+scenes = {s.get("scene_id") for s in sel}
+try:
+    story = json.load(open(sys.argv[3], encoding="utf-8"))
+    story_scenes = [sc for sc in story.get("scenes", []) if (sc.get("id") or sc.get("scene_id")) in scenes]
+except Exception:
+    story_scenes = []
+print(json.dumps({"shots": sel, "story_scenes": story_scenes}, ensure_ascii=False, indent=1))
+PYEOF
+)
+        write_prompt "$RUN_DIR/prompt_director_${kind}_fix_${n}.txt" \
+            "$instructions
+Reply with a PATCH document only — raw JSON starting with { — in exactly this schema: $PATCH_SCHEMA
+Rules: a replaced or inserted shot is a COMPLETE shot object (same schema as the shot list); keep every locked dialogue line verbatim (a patch that drops a line is rejected); keep edit.cut_in/cut_out, handles, readable_props, pov_character, audience_feels, audio.music_cue on every shot you touch; do not renumber (the pipeline renumbers).
+
+--- THE REPORT ---
+$(cat "$report")
+
+--- THE AFFECTED SHOTS (with their neighbours) AND THEIR STORY SCENES ---
+$affected
+
+--- EDITING-GRAMMAR SKILL ---
+$(cat "$PACK_DIR/.dsh/skills/editing-grammar.md")"
+        run_dsh_agent "director" "$RUN_DIR/prompt_director_${kind}_fix_${n}.txt" "$patch"
+        local prc=0
+        python3 "$PACK_DIR/pipeline/shot_list_patch.py" "$RUN_DIR/shot_list.json" "$patch" --renumber --run-dir "$RUN_DIR" \
+            --report "${patch%.json}_report.json" >> "$RUN_DIR/pipeline.log" 2>&1 || prc=$?
+        case "$prc" in
+            0) log "director $kind fix $n applied ($(python3 -c "import json; d=json.load(open('${patch%.json}_report.json')); print('replaced', d.get('replaced'), 'inserted', d.get('inserted'), 'deleted', d.get('deleted'))" 2>/dev/null))"
+               python3 "$PACK_DIR/validate_audio_timing.py" "$RUN_DIR/shot_list.json" --fix >> "$RUN_DIR/pipeline.log" 2>&1 || true
+               return 0 ;;
+            1) halt_run "$CURRENT_STEP" "director $kind fix $n REJECTED by shot_list_patch.py: $(python3 -c "import json; print(json.load(open('${patch%.json}_report.json')).get('error',''))" 2>/dev/null | head -c 300) — the Director dropped a locked line or wrote an invalid shot (see $patch)" ;;
+            *) halt_run "$CURRENT_STEP" "shot_list_patch.py exit $prc on $patch (not a valid patch document)" ;;
+        esac
+    }
 
     # Validate the shot list as an EDIT — jump cuts, handles, cut points, coverage
     # (The Clockwork Moth postmortem: 9 same-subject/same-size consecutive pairs shipped)
@@ -1122,10 +1059,8 @@ if ! skip_if_done "$RUN_DIR/shot_list.json" "Director"; then
             notify "Shot list still has blocking edit issues after $EDIT_ROUNDS fixes — continuing, see shot_list_edit_report.json" "Edit Validation"
             break
         fi
-        write_prompt "$RUN_DIR/prompt_director_edit_fix.txt" \
-            "Your shot list $RUN_DIR/shot_list.json fails the editing-grammar validation. Read $RUN_DIR/shot_list_edit_report.json and fix EVERY 'jump_cut', 'handles' and 'cut_points' issue (and the rhythm/coverage ones): change shot size by >= 2 steps or angle by >= 30 degrees, insert a reaction single or an insert between same-subject shots, add edit.handle_head_s/handle_tail_s >= 1.0 (included in duration_seconds) and edit.cut_in/cut_out to every shot. Rewrite $RUN_DIR/shot_list.json in place, same schema, valid JSON only."
-        run_dsh_agent "director" "$RUN_DIR/prompt_director_edit_fix.txt" "$RUN_DIR/shot_list.json" \
-            || die "director edit-fix failed (check $RUN_DIR/pipeline.log)"
+        director_patch_round "edit" "$RUN_DIR/shot_list_edit_report.json" \
+            "Your shot list fails the editing-grammar validation. Fix EVERY 'jump_cut', 'handles' and 'cut_points' issue in the report (and the rhythm/coverage ones): change shot size by >= 2 steps or angle by >= 30 degrees, insert a reaction single or an insert between same-subject shots, add edit.handle_head_s/handle_tail_s >= 1.0 (included in duration_seconds) and edit.cut_in/cut_out to every shot you touch."
     done
     log "$EDIT_ISSUES"
 
@@ -1142,12 +1077,34 @@ if ! skip_if_done "$RUN_DIR/shot_list.json" "Director"; then
             notify "Shot list still has blocking H3-envelope issues after $LINT_ROUNDS fixes — continuing, see shot_list_lint_report.json" "Shot Lint"
             break
         fi
-        write_prompt "$RUN_DIR/prompt_director_lint_fix.txt" \
-            "Your shot list $RUN_DIR/shot_list.json breaks the MiniMax H3 envelope (knowledge/minimax_h3_rules.md section 0). Read $RUN_DIR/shot_list_lint_report.json and fix EVERY blocking issue: split a montage into one shot per beat (5-8 s each, new shot ids, renumber the scene); no more than 3 named characters in a frame (extras become 'a few distant figures, backs to camera' in action_description, never counted); write each character's OWN action, hand_position and expression (no identical strings between characters); extreme-wide shots carry no named characters and no faces. Keep every editing-grammar rule (handles, cut_in/cut_out, no jump cuts, readable_props). Rewrite $RUN_DIR/shot_list.json in place, same schema, valid JSON only."
-        run_dsh_agent "director" "$RUN_DIR/prompt_director_lint_fix.txt" "$RUN_DIR/shot_list.json" \
-            || die "director lint-fix failed (check $RUN_DIR/pipeline.log)"
+        director_patch_round "lint" "$RUN_DIR/shot_list_lint_report.json" \
+            "Your shot list breaks the MiniMax H3 envelope (knowledge/minimax_h3_rules.md section 0). Fix EVERY blocking issue in the report: split a montage into one shot per beat (5-8 s each, insert_after with new shot ids like S01_003a); no more than 3 named characters in a frame (extras become 'a few distant figures, backs to camera' in action_description, never counted); write each character's OWN action, hand_position and expression (no identical strings between characters); extreme-wide shots carry no named characters and no faces. Keep every editing-grammar rule (handles, cut_in/cut_out, no jump cuts, readable_props)."
     done
     log "$LINT_ISSUES"
+
+    # Locked dialogue + dialogue share: every story line must be in the shot list,
+    # narration must not crowd out dialogue. One dedicated patch round, then a loud
+    # note (MIN_DIALOGUE_SHARE_BLOCK=1 halts instead); a still-missing LINE halts.
+    step "1b-dialogue. Locked dialogue & dialogue share"
+    if ! python3 "$PACK_DIR/pipeline/story_check.py" --story "$RUN_DIR/story.json" --shots "$RUN_DIR/shot_list.json" \
+            --out "$RUN_DIR/story_check_shots.json" >> "$RUN_DIR/pipeline.log" 2>&1; then
+        SC_MSG=$(python3 -c "import json; d=json.load(open('$RUN_DIR/story_check_shots.json')); print('missing lines:', len(d.get('missing_lines',[])), '| share:', d.get('dialogue_share'), '|', '; '.join(d.get('blocking',[]))[:600])" 2>/dev/null)
+        log "story_check (shots): $SC_MSG"
+        director_patch_round "dialogue" "$RUN_DIR/story_check_shots.json" \
+            "The shot list does not carry the locked dialogue correctly. For every entry of missing_lines in the report, put that exact line (verbatim) into the right shot's audio.dialogue (replace the shot, or insert_after a new one, keeping one speaker per clip); if narration was invented or crowds out dialogue (dialogue share below the floor), convert invented narration back to the story's lines. Keep every other shot untouched."
+        if ! python3 "$PACK_DIR/pipeline/story_check.py" --story "$RUN_DIR/story.json" --shots "$RUN_DIR/shot_list.json" \
+                --out "$RUN_DIR/story_check_shots.json" >> "$RUN_DIR/pipeline.log" 2>&1; then
+            SC_MSG=$(python3 -c "import json; d=json.load(open('$RUN_DIR/story_check_shots.json')); print('missing lines:', len(d.get('missing_lines',[])), '| share:', d.get('dialogue_share'), '|', '; '.join(d.get('blocking',[]))[:600])" 2>/dev/null)
+            if python3 -c "import json,sys; sys.exit(0 if json.load(open('$RUN_DIR/story_check_shots.json')).get('missing_lines') else 1)" 2>/dev/null; then
+                halt_run "$CURRENT_STEP" "locked dialogue lines are still missing from the shot list after the Director's fix round — $SC_MSG (see $RUN_DIR/story_check_shots.json)"
+            elif [ "${MIN_DIALOGUE_SHARE_BLOCK:-0}" = "1" ]; then
+                halt_run "$CURRENT_STEP" "dialogue share below the floor after the Director's fix round — $SC_MSG"
+            else
+                notify "Dialogue share still below the floor after the Director's fix round — continuing (set MIN_DIALOGUE_SHARE_BLOCK=1 to halt instead)\n$SC_MSG" "Dialogue Share"
+            fi
+        fi
+    fi
+    log "story_check (shots): $(python3 -c "import json; d=json.load(open('$RUN_DIR/story_check_shots.json')); print('ok' if d.get('ok') else 'warnings', '| dialogue share', d.get('dialogue_share'))" 2>/dev/null)"
 fi
 
 # Post shot plan summary to Discord
@@ -1174,6 +1131,11 @@ try:
     print(f"Modes: {mode_str}")
     print(f"Dialogue clips: {dialogue_count} (lip-synced)")
     print(f"Narration-only clips: {len(shots) - dialogue_count}")
+    try:
+        sc = json.load(open("RUNDIR/story_check_shots.json".replace("RUNDIR", sys.argv[1])))
+        print(f"Dialogue share: {float(sc.get('dialogue_share') or 0) * 100:.0f}% of spoken words; missing story lines: {len(sc.get('missing_lines', []))}")
+    except Exception:
+        pass
 except Exception as e:
     print(f"(could not parse shot list: {e})")
 PYEOF
@@ -1214,26 +1176,11 @@ fi
 # 1e. Voice Design
 if ! skip_if_done "$RUN_DIR/audio/voices/voice_config.json" "Voice Design"; then
     step "1e. Audio Producer — voice design"
-    swap_to_27b
     write_prompt "$RUN_DIR/prompt_voices.txt" \
         "Read $RUN_DIR/story.json and CAST the voices per the voice-casting skill. Every role incl. 'narrator' gets a voice class (child/teen/adult-female/adult-male/elderly-female/elderly-male/creature); the narrator uses a class NO character uses. Orpheus (voices tara/leah/jess/leo/dan/mia/zac/zoe) has ADULT voices only — children and elderly roles use Chatterbox cloning from an age-matched reference WAV (look under $RUN_DIR/audio/voices/refs/ and /root/production_pack/output/voices/refs/; pick the closest) or Orpheus with post_fx (pitch_semitones -2..+3, tempo 0.9..1.1); never an adult voice with affectation. CosyVoice is NOT available (no REST endpoint). DO NOT call any TTS port — the TTS engines are down while you run; the pipeline renders and measures the line-up afterwards. Write ONLY $RUN_DIR/audio/voices/voice_config.json: {\"<role>\": {\"voice_class\": ..., \"engine\": \"orpheus|chatterbox|kokoro\", \"voice\": ... or \"reference_audio\": <abs path>, \"post_fx\": {...} optional, \"notes\": ...}, ...} with one entry per speaking character (ids from story.json) plus 'narrator'."
-    # The audio-producer reasoning turn can degenerate into a loop and time out
-    # without writing voice_config.json (empty artifact → run abort). Retry the
-    # initial cast a few times on an absent/empty artifact so one bad turn does
-    # not kill the whole production.
-    _CAST_ATTEMPT=1
-    while [ "$_CAST_ATTEMPT" -le 3 ]; do
-        if run_dsh_agent "audio-producer" "$RUN_DIR/prompt_voices.txt" "$RUN_DIR/audio/voices/voice_config.json"; then
-            [ -s "$RUN_DIR/audio/voices/voice_config.json" ] && break
-        fi
-        log "voice_config.json empty after cast attempt $_CAST_ATTEMPT — retrying"
-        _CAST_ATTEMPT=$((_CAST_ATTEMPT + 1))
-        rm -f "$RUN_DIR/audio/voices/voice_config.json"
-        sleep 5
-    done
-    if [ ! -s "$RUN_DIR/audio/voices/voice_config.json" ]; then
-        die "audio-producer failed to write voice_config.json after $_CAST_ATTEMPT attempts (check $RUN_DIR/pipeline.log)"
-    fi
+    # One attempt: a failed turn halts (run_dsh_agent); a CAST_FAIL verdict is a
+    # quality loop and gets up to two recasts below.
+    run_dsh_agent "audio-producer" "$RUN_DIR/prompt_voices.txt" "$RUN_DIR/audio/voices/voice_config.json"
     # pipeline renders the line-up with the GPU handed to the TTS cluster and
     # measures the separation. CAST_FAIL sends the agent back with the report.
     CAST_ROUNDS=0
@@ -1367,12 +1314,30 @@ PYEOF
             notify "Scene $scene still has blocking H3-envelope issues after $rounds Director fixes — continuing; QA will judge (see $rep)" "Scene Gate"
             return 0
         fi
-        local ids
+        local ids gate_ctx
         ids=$(python3 -c "import json; print(', '.join(s['shot_id'] for s in json.load(open('$RUN_DIR/shot_list.json'))['shots'] if s.get('scene_id')=='$scene'))")
+        gate_ctx=$(python3 - "$RUN_DIR/shot_list.json" "$RUN_DIR/story.json" "$scene" <<'PYEOF'
+import json, sys
+shots = [s for s in json.load(open(sys.argv[1], encoding="utf-8")).get("shots", []) if s.get("scene_id") == sys.argv[3]]
+try:
+    story = json.load(open(sys.argv[2], encoding="utf-8"))
+    scene = next((sc for sc in story.get("scenes", []) if (sc.get("id") or sc.get("scene_id")) == sys.argv[3]), None)
+except Exception:
+    scene = None
+print(json.dumps({"shots": shots, "story_scene": scene}, ensure_ascii=False, indent=1))
+PYEOF
+)
         write_prompt "$RUN_DIR/prompt_director_gate_${scene}.txt" \
-            "Fix ONLY the shots of $scene ($ids) in $RUN_DIR/shot_list.json. Read $rep (the blocking issues) and $RUN_DIR/story.json for that scene. Keep the SAME shot ids, the same count and order, the same narration/dialogue assignments and the same scene_id. Rules (knowledge/minimax_h3_rules.md section 0): each character in characters_in_frame gets its OWN action, hand_position, expression and facing written for THIS shot (never the same string on two characters; creatures get a body pose, no hands); at most 3 named characters per frame (drop the least important to 'a few distant figures, backs to camera' in action_description); a montage shot keeps its single strongest beat, the other beats are dropped (do NOT add shots); no counted crowds; extreme-wide shots carry no named characters and no faces; faces only at medium or closer; duration 5-8 s (10 s max without dialogue); the picture illustrates the narration line over it; reference_images.source only canonical existing files (locations/<id>/<id>.png, characters/<id>/<id>_side.png). Keep every editing-grammar field (edit.cut_in/cut_out, handles, readable_props). Write ONLY {\"shots\": [...]} for these $(echo "$ids" | tr ',' '\n' | wc -l) shots, same schema, to $fix. Do NOT modify shot_list.json."
+            "Fix ONLY the shots of $scene ($ids). The blocking issues and the shots are inlined below. Keep the SAME shot ids, the same count and order, the same narration/dialogue assignments (every dialogue line verbatim) and the same scene_id. Rules (knowledge/minimax_h3_rules.md section 0): each character in characters_in_frame gets its OWN action, hand_position, expression and facing written for THIS shot (never the same string on two characters; creatures get a body pose, no hands); at most 3 named characters per frame (drop the least important to 'a few distant figures, backs to camera' in action_description); a montage shot keeps its single strongest beat, the other beats are dropped (do NOT add shots); no counted crowds; extreme-wide shots carry no named characters and no faces; faces only at medium or closer; duration 5-8 s (10 s max without dialogue); the picture illustrates the narration line over it; reference_images.source only canonical existing files (locations/<id>/<id>.png, characters/<id>/<id>_side.png). Keep every editing-grammar field (edit.cut_in/cut_out, handles, readable_props, pov_character, audience_feels, audio.music_cue). Reply with ONLY {\"shots\": [...]} for these $(echo "$ids" | tr ',' '\n' | wc -l) shots, same schema — raw JSON starting with {.
+
+--- LINT REPORT ---
+$(cat "$rep")
+
+--- THE SCENE'S SHOTS AND STORY SCENE ---
+$gate_ctx"
         rm -f "$fix"
-        run_dsh_agent "director" "$RUN_DIR/prompt_director_gate_${scene}.txt" "$fix" || true
+        # Mechanical lint fix: run the director preset on the execution tier (OpenCode Go).
+        DSH_FORCE_TIER=execution run_dsh_agent "director" "$RUN_DIR/prompt_director_gate_${scene}.txt" "$fix"
         if [ -s "$fix" ] && python3 "$PACK_DIR/pipeline/splice_scene.py" "$RUN_DIR/shot_list.json" "$scene" "$fix" 2>&1 | tee -a "$RUN_DIR/pipeline.log"; then
             log "[gate $scene] Director fix round $rounds spliced"
         else
@@ -1397,7 +1362,6 @@ for SHOT_ID in $SHOT_IDS; do
     SHOT_SCENE=$(python3 -c "import json; print(next((s.get('scene_id','') for s in json.load(open('$RUN_DIR/shot_list.json'))['shots'] if s.get('shot_id')=='$SHOT_ID'), ''))" 2>/dev/null || echo "")
     if [ -n "$SHOT_SCENE" ] && [ "$SHOT_SCENE" != "${LAST_GATED_SCENE:-}" ]; then
         LAST_GATED_SCENE="$SHOT_SCENE"
-        ensure_local_llm_running
         scene_gate "$SHOT_SCENE"
     fi
 
@@ -1660,108 +1624,21 @@ sys.exit(1 if (d.get('failed') or str(d.get('status','')).lower() in ('failed','
         fi
 
         if [ "$NEED_DIALOGUE" = "true" ]; then
-            log "[$SHOT_ID] Generating dialogue audio (before video for lip sync)..."
-            # Local mode: use direct Orpheus script (handles VRAM dance internally —
-            # stops NInfer, starts Orpheus, generates audio, stops Orpheus).
-            # Avoids the VRAM conflict where NInfer-US (28GB) + Orpheus (5GB) > 32GB.
-            if [[ "${CLOUD_ROUTING:-1}" == "0" ]]; then
-                log "[$SHOT_ID] Rendering the dialogue stem from voice_config.json (TTS cluster takes the GPU)..."
-                touch "$OUTPUT_DIR/.audio_phase_active"
-                # --keep-gpu: the TTS cluster stays up; the keyframe step hands the GPU to ComfyUI
-                # next, so the 2-minute LLM reload is skipped.
-                python3 "$PACK_DIR/pipeline/dialogue_stem.py" \
-                    "$RUN_DIR/shot_list.json" "$SHOT_ID" "$CLIP_DIR" --run-dir "$RUN_DIR" --keep-gpu 2>&1 | \
-                    while IFS= read -r line; do log "  $line"; done
-                rm -f "$OUTPUT_DIR/.audio_phase_active"
-                if [ -s "$CLIP_DIR/dialogue.wav" ]; then
-                    log "[$SHOT_ID] Dialogue stem ready: $(python3 -c "import json;d=json.load(open('$CLIP_DIR/dialogue_meta.json'));print(d.get('engine_used'),d.get('voice'),d.get('duration_s'),'s at',d.get('anchor_s'),'s')" 2>/dev/null)"
-                elif python3 -c "import json,sys; sys.exit(0 if json.load(open('$CLIP_DIR/dialogue_meta.json')).get('status')=='no_speech' else 1)" 2>/dev/null; then
-                    log "[$SHOT_ID] dialogue line is a silence beat — no stem"
-                else
-                    log "[$SHOT_ID] WARNING: dialogue stem failed — H3 will animate the mouth from the text only"
-                fi
+            log "[$SHOT_ID] Rendering the dialogue stem from voice_config.json (TTS cluster takes the GPU)..."
+            touch "$OUTPUT_DIR/.audio_phase_active"
+            # --keep-gpu: the TTS cluster stays up; the keyframe step hands the GPU to ComfyUI next.
+            STEM_RC=0
+            python3 "$PACK_DIR/pipeline/dialogue_stem.py" \
+                "$RUN_DIR/shot_list.json" "$SHOT_ID" "$CLIP_DIR" --run-dir "$RUN_DIR" --keep-gpu \
+                > "$CLIP_DIR/dialogue_stem.log" 2>&1 || STEM_RC=$?
+            while IFS= read -r line; do log "  $line"; done < "$CLIP_DIR/dialogue_stem.log"
+            rm -f "$OUTPUT_DIR/.audio_phase_active"
+            if [ -s "$CLIP_DIR/dialogue.wav" ]; then
+                log "[$SHOT_ID] Dialogue stem ready: $(python3 -c "import json;d=json.load(open('$CLIP_DIR/dialogue_meta.json'));print(d.get('engine_used'),d.get('voice'),d.get('duration_s'),'s at',d.get('anchor_s'),'s')" 2>/dev/null)"
+            elif python3 -c "import json,sys; sys.exit(0 if json.load(open('$CLIP_DIR/dialogue_meta.json')).get('status')=='no_speech' else 1)" 2>/dev/null; then
+                log "[$SHOT_ID] dialogue line is a silence beat — no stem"
             else
-            swap_to_27b
-            # Start Orpheus TTS if not running (primary dialogue engine)
-            if ! curl -sf http://127.0.0.1:9883/v1/audio/voices > /dev/null 2>&1; then
-                log "[$SHOT_ID] Starting Orpheus TTS..."
-                systemctl start orpheus-backend.service 2>/dev/null || true
-                sleep 3
-                systemctl start orpheus-tts.service 2>/dev/null || true
-                for _w in $(seq 1 30); do
-                    curl -sf http://127.0.0.1:9883/v1/audio/voices > /dev/null 2>&1 && break
-                    sleep 1
-                done
-                if curl -sf http://127.0.0.1:9883/v1/audio/voices > /dev/null 2>&1; then
-                    log "[$SHOT_ID] Orpheus TTS ready on :9883"
-                else
-                    log "[$SHOT_ID] WARNING: Orpheus TTS not responding — agent will fall back to Chatterbox"
-                fi
-            fi
-            # Extract emotion info from shot list for the prompt
-            DIALOGUE_INFO=$(python3 -c "
-import json
-with open('$RUN_DIR/shot_list.json') as f:
-    shots = json.load(f)['shots']
-shot = next((s for s in shots if s['shot_id'] == '$SHOT_ID'), None)
-if shot:
-    for d in shot.get('audio',{}).get('dialogue',[]):
-        print(f\"Character: {d.get('character_id','?')}\")
-        print(f\"Line: {d.get('line','')}\")
-        print(f\"Emotion: {d.get('emotion','neutral')}\")
-        print(f\"Start: {d.get('start_time',0)}s  End: {d.get('end_time','?')}s\")
-        print()
-" 2>/dev/null)
-            # Extract emotional beat from shot list
-            EMOTIONAL_BEAT=$(python3 -c "
-import json
-with open('$RUN_DIR/shot_list.json') as f:
-    shots = json.load(f)['shots']
-shot = next((s for s in shots if s['shot_id'] == '$SHOT_ID'), None)
-if shot:
-    print(shot.get('emotional_beat', 'neutral'))
-" 2>/dev/null || echo "neutral")
-
-            write_prompt "$CLIP_DIR/prompt_dialogue.txt" \
-                "Generate dialogue audio for $SHOT_ID. This must sound like a REAL ACTOR performing in a Pixar movie — expressive, natural, alive.
-
-Voice refs: $RUN_DIR/audio/voices/
-Shot data from shot_list.json:
-$DIALOGUE_INFO
-
-Scene emotional beat: $EMOTIONAL_BEAT
-
-ENGINE PRIORITY — USE ORPHEUS 3B (port 9883) AS DEFAULT:
-Orpheus produces the most natural, expressive speech. Use it for ALL dialogue unless unavailable.
-API: POST http://localhost:9883/v1/audio/speech
-Body: {"model":"orpheus","input":"<text>","voice":"<voice>","response_format":"wav"}
-Voices: tara, leah, jess, leo, dan, mia, zac, zoe
-
-1. Orpheus controls emotion through NATURAL PROSODY from text context, NOT emotion-name tags.
-   Write the dialogue with expressive punctuation and word choice.
-   Add inline paralinguistic sounds where natural:
-   - <laugh> — laughter    - <chuckle> — soft chuckle
-   - <sigh> — sigh         - <gasp> — gasp of surprise
-   - <sniffle> — sniffle   - <groan> — groan
-   Example: 'Tobias love <chuckle> you have got a gear in your porridge again!'
-   Example: '<gasp> You found the missing piece!'
-   Example: '<sigh> I suppose you are right about that...'
-
-2. Don't over-tag — one or two sounds per line max. Let the text carry the emotion.
-
-3. If Orpheus (9883) is DOWN, fall back to Chatterbox (9882) with:
-   - exaggeration=0.5 for moderate emotion, 0.7 for strong
-   - Paralinguistic tags: [laugh], [sigh], [gasp] in the text
-
-4. Voice reference: use the character's ref WAV from $RUN_DIR/audio/voices/
-   Assign each character a consistent Orpheus voice (e.g., elderly woman=leah, child=jess).
-
-QUALITY STANDARD: The output must NOT sound robotic, monotone, or flat.
-It should sound like a warm, expressive human performance with natural
-breath patterns, rhythm variation, and emotional coloring matching the scene.
-
-Save to $CLIP_DIR/dialogue.wav and $CLIP_DIR/dialogue_meta.json (include engine_used, voice, character_id)."
-            run_dsh_agent "audio-producer" "$CLIP_DIR/prompt_dialogue.txt" "$CLIP_DIR/dialogue_meta.json"
+                halt_run "$CURRENT_STEP" "dialogue stem for $SHOT_ID was not rendered (dialogue_stem.py exit $STEM_RC) — a dialogue clip never renders without its approved stem (see pipeline.log, TTS cluster: systemctl status tts-cluster)"
             fi
         fi
 
@@ -1784,10 +1661,9 @@ except Exception:
             log "[$SHOT_ID] SKIP (resume): image generation — frames already done or not required"
         else
             log "[$SHOT_ID] Planning frames (agent) ..."
-            ensure_local_llm_running
-            # The agent only PLANS: ComfyUI cannot run beside its LLM. It writes
-            # frame_spec.json; generate_frames.py renders it with the GPU handed
-            # to ComfyUI and writes frame_meta.json for the video step.
+            # The agent only PLANS (agents never touch ComfyUI): it writes
+            # frame_spec.json; generate_frames.py renders it on ComfyUI and
+            # writes frame_meta.json for the video step.
             write_prompt "$CLIP_DIR/prompt_image.txt" \
                 "Plan the keyframes for $SHOT_ID — DO NOT call ComfyUI (it is down while you run; the pipeline renders your spec). Read $CLIP_DIR/reviewed_prompt.json (h3_mode, final_prompt, reference_assignments), $RUN_DIR/shot_list.json (this shot's camera, characters_in_frame with positions/hand_position/facing, location_id, lighting, edit.cut_in/cut_out, readable_props) and the manifests $RUN_DIR/character_manifest.json / $RUN_DIR/location_manifest.json for reference image paths. Write $CLIP_DIR/frame_spec.json: {\"mode\": \"composited_i2v|first_frame_only|first_last_frame|reference\", \"frames\": [{\"role\": \"first_frame\", \"prompt\": <Qwen Image 2.1 prompt: shot size FIRST and LAST, every character exactly once with position/pose/gaze from edit.cut_in, the location's layout, lighting, readable prop values verbatim>, \"references\": [<abs paths: ONE design sheet per character in frame, the location plate, and continuity frames prev_clip_lastframe.png / scene_establishing_frame.png if present in $CLIP_DIR>], \"width\": 1344, \"height\": 768, \"background\": <one sentence: the environment behind the figures, from the location plate>, \"placements\": [{\"character_id\": <id>, \"bbox\": [y_min, x_min, y_max, x_max] in 0-1000 of the frame (where the figure stands and how tall it is for THIS shot size: full-body in a wide = 300-900 tall, medium = 150-1000, close-up = 0-1000), \"desc\": <the figure in one sentence: pose from edit.cut_in, facing, costume colours, hand position>}] one per character in frame, \"style\": {\"aesthetics\": ..., \"lighting\": <from the shot>, \"art_style\": \"Pixar-style 3D animated feature film\", \"medium\": \"3d_render\"}}, {\"role\": \"last_frame\", ...only for first_last_frame, pose from edit.cut_out}], \"video_references\": [{\"tag\": \"<Subject N>\", \"image\": <abs path>, \"role\": ...}]}. For mode reference write frames: [] (no keyframe needed). Never name an object you want absent (Qwen ignores negatives); describe only what IS in frame. A readable prop's ledger STATE is written positively (an 'unlit' jar = 'dark matte translucent cobalt glass lit only by the flat grey sky, no light inside, the sill under it in shadow'), and any reference image that shows the prop in the OTHER state (the location plate's glowing windows for an unlit-jar insert) is left OUT of references — Qwen copies what it sees."
             run_dsh_agent "image-generator" "$CLIP_DIR/prompt_image.txt" "$CLIP_DIR/frame_spec.json"
@@ -1801,25 +1677,20 @@ except Exception:
             # that way (QA had asked for a rope-free one).
             FORCE_FRAMES=""
             [ "$RETRY" -gt 0 ] && FORCE_FRAMES="--force"
-            FRAMES_OK=false
+            FRAME_RC=0
             if [ "${FRAME_ENGINE:-qwen}" = "ideogram4" ]; then
-                if python3 "$PACK_DIR/pipeline/ideogram_frames.py" --shot-dir "$CLIP_DIR" --run-dir "$RUN_DIR" \
-                        --comfyui-url "$COMFYUI_URL" --keep-gpu $FORCE_FRAMES >> "$RUN_DIR/pipeline.log" 2>&1; then
-                    FRAMES_OK=true
-                    log "[$SHOT_ID] frames rendered (ideogram4 layout + qwen identity)"
-                else
-                    log "[$SHOT_ID] WARNING: ideogram_frames.py failed — falling back to generate_frames.py"
-                fi
-            fi
-            if [ "$FRAMES_OK" = "false" ]; then
-                if python3 "$PACK_DIR/pipeline/generate_frames.py" --shot-dir "$CLIP_DIR" --run-dir "$RUN_DIR" \
-                        --comfyui-url "$COMFYUI_URL" --keep-gpu $FORCE_FRAMES >> "$RUN_DIR/pipeline.log" 2>&1; then
-                    log "[$SHOT_ID] frames rendered"
-                else
-                    log "[$SHOT_ID] WARNING: generate_frames.py failed — video step will use references only"
-                fi
+                python3 "$PACK_DIR/pipeline/ideogram_frames.py" --shot-dir "$CLIP_DIR" --run-dir "$RUN_DIR" \
+                    --comfyui-url "$COMFYUI_URL" --keep-gpu $FORCE_FRAMES >> "$RUN_DIR/pipeline.log" 2>&1 || FRAME_RC=$?
+                [ "$FRAME_RC" -eq 0 ] && log "[$SHOT_ID] frames rendered (ideogram4 layout + qwen identity)"
+            else
+                python3 "$PACK_DIR/pipeline/generate_frames.py" --shot-dir "$CLIP_DIR" --run-dir "$RUN_DIR" \
+                    --comfyui-url "$COMFYUI_URL" --keep-gpu $FORCE_FRAMES >> "$RUN_DIR/pipeline.log" 2>&1 || FRAME_RC=$?
+                [ "$FRAME_RC" -eq 0 ] && log "[$SHOT_ID] frames rendered"
             fi
             rm -f "$OUTPUT_DIR/.gen_phase_active"
+            if [ "$FRAME_RC" -ne 0 ]; then
+                halt_run "$CURRENT_STEP" "keyframe render for $SHOT_ID failed (${FRAME_ENGINE:-qwen} engine, exit $FRAME_RC) — no fallback to references-only; see pipeline.log"
+            fi
         fi
 
         # ── 2d. Video Generation — skip if clip.mp4 exists and generation completed ──
@@ -1854,35 +1725,14 @@ except Exception:
             # anchor_s so previews, QA and assembly carry the same approved audio.
             python3 "$PACK_DIR/pipeline/mux_stem.py" "$CLIP_DIR" 2>&1 | while IFS= read -r line; do log "  $line"; done
 
-            if [ $GEN_EXIT -ne 0 ]; then
-                log "[$SHOT_ID] WARNING: generate_clip.py exited $GEN_EXIT"
-                notify "Clip $SHOT_ID generation script failed (exit $GEN_EXIT)" "Generation Warning"
+            if [ $GEN_EXIT -ne 0 ] || [ ! -f "$CLIP_DIR/clip.mp4" ]; then
+                halt_run "$CURRENT_STEP" "video render for $SHOT_ID failed (generate_clip.py exit $GEN_EXIT, clip.mp4 $([ -f "$CLIP_DIR/clip.mp4" ] && echo present || echo missing)) — see $CLIP_DIR/generation_log.json and pipeline.log"
             fi
         fi
 
-        # Monitoring: LLM must be up for QA whether we generated or resumed mid-clip
-        ensure_local_llm_running
-
-        # BUGFIX: never run QA against a clip that was not actually produced.
-        # If the video step failed to write clip.mp4, running the QA inspector
-        # only produces a bogus "no clip to review" FAIL — which the gate below
-        # would consume as a real clip retry (burnt cycles on an unjudged clip,
-        # exactly the S01_001 race). Treat a missing clip as a GENERATION failure:
-        # re-attempt the video render (bounded by MAX_RETRY), never a QA verdict.
+        # A resumed clip whose video step was skipped must still have its clip.
         if [ ! -f "$CLIP_DIR/clip.mp4" ]; then
-            log "[$SHOT_ID] WARNING: clip.mp4 not produced after video step — retrying generation, not QA"
-            # Guard against corrupt/stale qa_verdict that could short-circuit
-            rm -f "$CLIP_DIR/qa_verdict.json" "$CLIP_DIR/qa_report.json" 2>/dev/null || true
-            RETRY=$((RETRY + 1))
-            if [ $RETRY -ge $MAX_RETRY ]; then
-                log "[$SHOT_ID] MAX_RETRY reached with no clip produced — escalating, not a QA verdict"
-                notify "Clip $SHOT_ID generated no clip after $RETRY attempts" "ESCALATION"
-                PASSED=false
-                RETRY=$MAX_RETRY
-                break
-            fi
-            log "[$SHOT_ID] Re-attempting video generation (attempt $RETRY/$MAX_RETRY)..."
-            continue  # back to top of the per-clip while loop → re-run video step
+            halt_run "$CURRENT_STEP" "$SHOT_ID has no clip.mp4 to judge (video step skipped on resume but the file is gone) — delete $CLIP_DIR/generation_log.json and resume to re-render"
         fi
 
         # ── 2e. QA Review ──
@@ -1947,14 +1797,13 @@ VERDICT RULES (calibrated gate — normalise_qa_verdict.py is the final arbiter)
 - Output JSON with verdict PASS/FAIL, scores for all 11 categories under the exact keys hands_limbs, face_expression, character_identity, duplication, motion_quality, lip_sync, texture_visual, composition, continuity, voice_quality, film_quality, overall_score, re_render_recommended, and <= 5 one-sentence corrections if FAIL"
         VERDICT=""
         QA_NORM=""
-        for QA_TRY in 1 2 3; do
-            run_dsh_agent "qa-inspector" "$CLIP_DIR/prompt_qa.txt" "$CLIP_DIR/qa_verdict.json" || true
-            QA_NORM=$(python3 "$PACK_DIR/normalise_qa_verdict.py" "$CLIP_DIR" "$RETRY" 2>&1 || true)
-            if [ -n "$QA_NORM" ]; then
-                log "  $QA_NORM"
-                echo "$QA_NORM" >> "$RUN_DIR/pipeline.log"
-            fi
-            VERDICT=$(python3 -c "
+        run_dsh_agent "qa-inspector" "$CLIP_DIR/prompt_qa.txt" "$CLIP_DIR/qa_verdict.json"
+        QA_NORM=$(python3 "$PACK_DIR/normalise_qa_verdict.py" "$CLIP_DIR" "$RETRY" 2>&1 || true)
+        if [ -n "$QA_NORM" ]; then
+            log "  $QA_NORM"
+            echo "$QA_NORM" >> "$RUN_DIR/pipeline.log"
+        fi
+        VERDICT=$(python3 -c "
 import json
 try:
     with open('$CLIP_DIR/qa_verdict.json') as f:
@@ -1962,19 +1811,10 @@ try:
 except Exception:
     print('')
 " 2>/dev/null)
-            [ -n "$VERDICT" ] && break
-            log "[$SHOT_ID] QA produced no verdict (infra try $QA_TRY/3) — re-running QA only"
-        done
-
-        # Unresolved = inspector never delivered a verdict (crash, prose-only,
-        # stale report filtered). Do NOT map that to FAIL — that is how a prior
-        # take's report (or a dead agent) burns H3 retries on an unjudged clip.
+        # No verdict = the inspector did not judge the clip (crash, prose, stale report).
+        # That is an error of the machinery, never a clip FAIL: halt, do not burn a take.
         if [ -z "$VERDICT" ]; then
-            log "[$SHOT_ID] QA infrastructure failure (no verdict after 3 tries) — escalating, not a clip FAIL"
-            notify "Clip $SHOT_ID QA infrastructure failure (no verdict after 3 tries)" "ESCALATION"
-            PASSED=false
-            RETRY=$MAX_RETRY
-            break
+            halt_run "$CURRENT_STEP" "qa-inspector returned no PASS/FAIL verdict for $SHOT_ID — see $CLIP_DIR/qa_verdict.json / qa_report.json and $RUN_DIR/qa-inspector_raw.txt"
         fi
 
         if [ "$VERDICT" = "PASS" ]; then
@@ -2089,19 +1929,17 @@ done
 # PHASE 2g: BATCH UPSCALE (all passed clips → 4K 60fps)
 # ═══════════════════════════════════════════════════════════
 
-step "PHASE 2g: BATCH UPSCALE TO 4K 60fps"
-notify "All clips generated. Batch upscaling to 4K 60fps..." "Upscale"
-stop_all_llms
+step "PHASE 2g: BATCH 4K MASTERS (${PP_TARGET_FPS} fps)"
+notify "All clips generated. Building the 4K masters at ${PP_TARGET_FPS} fps (RTX VSR$([ "${PP_TARGET_FPS}" != "24" ] && echo ' + RIFE'))..." "Upscale"
 ensure_comfyui
 
 UPS_DONE=0
 UPS_SKIP=0
-UPS_FAIL=0
 for SHOT_ID in $SHOT_IDS; do
     CLIP_DIR="$RUN_DIR/clips/$SHOT_ID"
     [ -f "$CLIP_DIR/clip.mp4" ] || continue
 
-    # Only upscale clips that passed QA
+    # Only clips that passed QA (or were accepted by the operator)
     if [ -f "$CLIP_DIR/qa_verdict.json" ]; then
         UPS_VERDICT=$(python3 -c "import json; print(json.load(open('$CLIP_DIR/qa_verdict.json')).get('verdict',''))" 2>/dev/null)
         [ "$UPS_VERDICT" != "PASS" ] && continue
@@ -2110,122 +1948,183 @@ for SHOT_ID in $SHOT_IDS; do
     fi
 
     # Skip if already up to date
-    if [ -f "$CLIP_DIR/clip_4k60.mp4" ] && [ "$CLIP_DIR/clip_4k60.mp4" -nt "$CLIP_DIR/clip.mp4" ]; then
+    if [ -f "$CLIP_DIR/clip_4k.mp4" ] && [ "$CLIP_DIR/clip_4k.mp4" -nt "$CLIP_DIR/clip.mp4" ]; then
         UPS_SKIP=$((UPS_SKIP + 1))
         continue
     fi
 
-    log "[$SHOT_ID] Upscaling to 4K 60fps..."
+    log "[$SHOT_ID] 4K master at ${PP_TARGET_FPS} fps..."
     UPS_FORCE=""
-    [ -f "$CLIP_DIR/clip_4k60.mp4" ] && UPS_FORCE="--force"
-    if python3 "$PACK_DIR/pipeline/upscale_clip.py" \
+    [ -f "$CLIP_DIR/clip_4k.mp4" ] && UPS_FORCE="--force"
+    UPS_RC=0
+    python3 "$PACK_DIR/pipeline/upscale_clip.py" \
         --shot-dir "$CLIP_DIR" \
         --comfyui-url "$COMFYUI_URL" \
+        --target-fps "$PP_TARGET_FPS" \
         $UPS_FORCE \
-        2>> "$RUN_DIR/pipeline.log"; then
-        log "[$SHOT_ID] 4K60 ready ($(stat -c%s "$CLIP_DIR/clip_4k60.mp4") bytes)"
-        UPS_DONE=$((UPS_DONE + 1))
-    else
-        log "[$SHOT_ID] WARNING GPU upscale failed — CPU ffmpeg fallback"
-        if ffmpeg -y -v error \
-            -i "$CLIP_DIR/clip.mp4" \
-            -vf "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1:me_mode=bidir:me=epzs,format=yuv420p,scale=3840:2160:flags=lanczos" \
-            -c:v libx264 -preset medium -crf 17 -c:a aac \
-            "$CLIP_DIR/clip_4k60.mp4"; then
-            log "[$SHOT_ID] 4K60 ready (CPU fallback)"
-            UPS_DONE=$((UPS_DONE + 1))
-        else
-            log "[$SHOT_ID] WARNING upscale failed, using original"
-            cp "$CLIP_DIR/clip.mp4" "$CLIP_DIR/clip_4k60.mp4"
-            UPS_FAIL=$((UPS_FAIL + 1))
-        fi
+        2>> "$RUN_DIR/pipeline.log" || UPS_RC=$?
+    if [ "$UPS_RC" -ne 0 ] || [ ! -s "$CLIP_DIR/clip_4k.mp4" ]; then
+        halt_run "$CURRENT_STEP" "4K master for $SHOT_ID failed (upscale_clip.py exit $UPS_RC) — no CPU fallback, no low-res copy; fix ComfyUI/RTX VSR and resume"
     fi
+    log "[$SHOT_ID] 4K master ready ($(stat -c%s "$CLIP_DIR/clip_4k.mp4") bytes)"
+    UPS_DONE=$((UPS_DONE + 1))
 done
-log "Batch upscale complete: $UPS_DONE upscaled, $UPS_SKIP already done, $UPS_FAIL failed"
-notify "Batch upscale done: $UPS_DONE new, $UPS_SKIP skipped, $UPS_FAIL failed" "Upscale"
+log "Batch 4K masters: $UPS_DONE built, $UPS_SKIP already done"
+notify "4K masters done: $UPS_DONE new, $UPS_SKIP skipped" "Upscale"
 
 # ═══════════════════════════════════════════════════════════
-# PHASE 3: POST-PRODUCTION [Qwen 3.8 27B]
+# PHASE 3: POST-PRODUCTION — deterministic
+#   3a narration plan (agent) → 3b edit check → 3c edit decisions (agent)
+#   → 3d timeline → 3e music cues (agent) → 3f ONE GPU excursion (TTS, then
+#   ComfyUI: music + SFX) → 3g assemble.py (picture + one mix) + subtitles.
+# Clip files contribute PICTURE only; every audio element is placed once on
+# the film timeline by pipeline/assemble.py (J/L cuts = audio_lead_s/audio_lag_s).
 # ═══════════════════════════════════════════════════════════
 
 step "PHASE 3: POST-PRODUCTION"
 notify "All clips done. Phase 3: Post-production starting" "Post-Production"
-swap_to_27b
+mkdir -p "$RUN_DIR/final" "$RUN_DIR/music" "$RUN_DIR/audio/narration"
+NARR_DIR="$RUN_DIR/audio/narration"
 
-# 3a. Narration
-if ! skip_if_done "$RUN_DIR/audio/narration/narration_meta.json" "Narration"; then
-    step "3a. Narration (Kokoro — no lip sync)"
-    mkdir -p "$RUN_DIR/audio/narration"
+# 3a. Narration plan — the Audio Producer writes the jobs; the pipeline renders later.
+if ! skip_if_done "$NARR_DIR/tts_jobs.json" "Narration plan"; then
+    step "3a. Narration plan"
     write_prompt "$RUN_DIR/prompt_narration.txt" \
-        "Prepare ALL narration audio jobs — DO NOT call any TTS port (the engines are down while you run; the pipeline renders). Read $RUN_DIR/story.json (narrator lines per scene), $RUN_DIR/shot_list.json (narration spans: span_clips, which clip each block starts on) and the narrator entry of $RUN_DIR/audio/voices/voice_config.json (engine/voice/reference_audio/post_fx — use EXACTLY that cast, never Kokoro unless the cast says so). Write $RUN_DIR/audio/narration/tts_jobs.json: {\"jobs\": [{\"id\": \"N1\", \"engine\": ..., \"voice\"/\"reference_audio\"/\"post_fx\" from the cast, \"text\": <one narration block, sentence-level punctuation kept, ~2.2 words/s pace>, \"out\": \"$RUN_DIR/audio/narration/N1.wav\"}, ...]} and $RUN_DIR/audio/narration/narration_meta.json: {\"blocks\": [{\"id\": \"N1\", \"scene_id\": ..., \"span_clips\": [...], \"starts_on\": <first clip id>, \"text\": ..., \"file\": \"N1.wav\"}]} (durations are filled in by the renderer). Narration is post-only — NO lip sync, never overlaps dialogue clips."
-    run_dsh_agent "audio-producer" "$RUN_DIR/prompt_narration.txt" "$RUN_DIR/audio/narration/narration_meta.json"
-    if python3 "$PACK_DIR/pipeline/tts_render.py" --jobs "$RUN_DIR/audio/narration/tts_jobs.json" --run-dir "$RUN_DIR" >> "$RUN_DIR/pipeline.log" 2>&1; then
-        log "narration rendered"
-    else
-        log "WARNING: some narration jobs failed — see $RUN_DIR/audio/narration/tts_jobs.results.json"
+        "Prepare ALL narration audio jobs — DO NOT call any TTS port (the engines are down while you run; the pipeline renders). Read $RUN_DIR/story.json (scenes[].narration.text), $RUN_DIR/shot_list.json (narration spans: which clips each block covers; a block is carried by the FIRST clip of its span only) and the narrator entry of $RUN_DIR/audio/voices/voice_config.json (engine/voice/reference_audio/post_fx — use EXACTLY that cast). Write $NARR_DIR/tts_jobs.json: {\"jobs\": [{\"id\": \"N1\", \"engine\": ..., \"voice\"/\"reference_audio\"/\"post_fx\" from the cast, \"text\": <one narration passage, sentence-level punctuation kept, ~2.2 words/s pace>, \"out\": \"$NARR_DIR/N1.wav\"}, ...]} and $NARR_DIR/narration_meta.json: {\"blocks\": [{\"id\": \"N1\", \"scene_id\": ..., \"span_clips\": [<clip ids in order>], \"starts_on\": <span_clips[0]>, \"text\": ..., \"file\": \"N1.wav\"}]}. EXACTLY ONE block per narration passage — never repeat a passage on several clips; no span clip may carry dialogue; ids N1, N2, … unique and identical in both files. Narration is post-only: NO lip sync, never overlaps a dialogue clip."
+    run_dsh_agent "audio-producer" "$RUN_DIR/prompt_narration.txt" "$NARR_DIR/narration_meta.json"
+    [ -s "$NARR_DIR/tts_jobs.json" ] || halt_run "$CURRENT_STEP" "audio-producer wrote narration_meta.json but no $NARR_DIR/tts_jobs.json"
+    if ! python3 "$PACK_DIR/pipeline/narration_check.py" --run-dir "$RUN_DIR" --plan >> "$RUN_DIR/pipeline.log" 2>&1; then
+        NC_MSG=$(python3 -c "import json; d=json.load(open('$NARR_DIR/narration_check.json')); print('; '.join(d.get('errors', d.get('blocking', [])))[:1200])" 2>/dev/null || tail -20 "$RUN_DIR/pipeline.log" | tr '\n' ' ')
+        log "narration plan rejected — one fix round: $NC_MSG"
+        write_prompt "$RUN_DIR/prompt_narration_fix.txt" \
+            "Your narration plan was rejected by the pipeline's narration_check: $NC_MSG. Rewrite BOTH $NARR_DIR/tts_jobs.json and $NARR_DIR/narration_meta.json so they pass: exactly one block per passage, starts_on = first clip of span_clips, no clip in two spans, no span clip with dialogue, ids 1:1 between the two files, same cast as $RUN_DIR/audio/voices/voice_config.json. Do NOT call any TTS port."
+        run_dsh_agent "audio-producer" "$RUN_DIR/prompt_narration_fix.txt" "$NARR_DIR/narration_meta.json"
+        python3 "$PACK_DIR/pipeline/narration_check.py" --run-dir "$RUN_DIR" --plan >> "$RUN_DIR/pipeline.log" 2>&1 \
+            || halt_run "$CURRENT_STEP" "narration plan still fails narration_check after the fix round — see $NARR_DIR/narration_check.json"
     fi
-    python3 - "$RUN_DIR/audio/narration" <<'PYEOF'
-import json, os, sys
-d = sys.argv[1]
-try:
-    meta = json.load(open(os.path.join(d, "narration_meta.json")))
-    res = {r["id"]: r for r in json.load(open(os.path.join(d, "tts_jobs.results.json")))["results"]}
-except Exception as e:
-    print(f"narration meta merge skipped: {e}"); sys.exit(0)
-for b in meta.get("blocks", []):
-    r = res.get(b.get("id"))
-    if r:
-        b["duration_s"] = r.get("duration_s"); b["status"] = r.get("status"); b["file"] = os.path.basename(r.get("out") or b.get("file", ""))
-json.dump(meta, open(os.path.join(d, "narration_meta.json"), "w"), indent=2)
-PYEOF
-    notify "Narration audio rendered ($(python3 -c "import json;r=json.load(open('$RUN_DIR/audio/narration/tts_jobs.results.json'));print(r['ok'],'/',r['jobs'])" 2>/dev/null || echo '?'))" "Audio Producer"
+    notify "Narration plan: $(python3 -c "import json; print(len(json.load(open('$NARR_DIR/tts_jobs.json'))['jobs']), 'blocks')" 2>/dev/null) ready" "Audio Producer"
 fi
 
-# 3b. Music
-if ! skip_if_done "$RUN_DIR/music/music_meta.json" "Music"; then
-    step "3b. Music & SFX"
-    write_prompt "$RUN_DIR/prompt_music.txt" \
-        "Create background score and SFX. Read $RUN_DIR/story.json for mood per scene. Generate separate stems. Save to $RUN_DIR/music/"
-    run_dsh_agent "music-composer" "$RUN_DIR/prompt_music.txt" "$RUN_DIR/music/music_meta.json"
-    notify "Music and SFX generated" "Music Composer"
-fi
-
-# 3c. Subtitles
-if ! skip_if_done "$RUN_DIR/final/sub_meta.json" "Subtitles"; then
-    step "3c. Subtitles"
-    write_prompt "$RUN_DIR/prompt_subs.txt" \
-        "Create timed subtitles (SRT + ASS). Read $RUN_DIR/shot_list.json and audio metadata. Dialogue: [CHARACTER]: text. Narration: (Narrator) italic. Save to $RUN_DIR/final/"
-    run_dsh_agent "subtitle-generator" "$RUN_DIR/prompt_subs.txt" "$RUN_DIR/final/sub_meta.json"
-    notify "Subtitles generated" "Subtitle Generator"
-fi
-
-# 3d-pre. Boundary check — does every clip-to-clip cut CUT? (editing-grammar skill)
-step "3d-pre. Edit Check (clip boundaries)"
-mkdir -p "$RUN_DIR/final"
+# 3b. Edit check — scores every clip-to-clip boundary (picture); the editor reads it.
+step "3b. Edit Check (clip boundaries)"
 if python3 "$PACK_DIR/pipeline/edit_check.py" --run-dir "$RUN_DIR" \
         --out "$RUN_DIR/final/edit_report.json" >> "$RUN_DIR/pipeline.log" 2>&1; then
     log "edit check: every boundary >= 0.80"
 else
     EDIT_FAILS=$(python3 -c "import json; r=json.load(open('$RUN_DIR/final/edit_report.json')); print(r.get('failed',0), 'of', r.get('boundaries',0))" 2>/dev/null || echo "?")
-    log "edit check: $EDIT_FAILS boundaries below 0.80 — editor must trim/insert (see final/edit_report.json + edit_boundaries.jpg)"
+    log "edit check: $EDIT_FAILS boundaries below 0.80 — the editor decides trims/inserts (final/edit_report.json + edit_boundaries.jpg)"
     notify "Edit check: $EDIT_FAILS boundaries below 0.80 — see final/edit_boundaries.jpg" "Edit Check" "$RUN_DIR/final/edit_boundaries.jpg"
 fi
 
-# 3d. Assembly (always re-run on resume — it's the final step)
-step "3d. Final Assembly"
-write_prompt "$RUN_DIR/prompt_assembly.txt" \
-    "Assemble the final movie with ffmpeg as the EDITOR (final-assembly + editing-grammar skills):
-- FIRST apply every entry of $RUN_DIR/assembly_fixes.json (blocking checklist)
-- Read $RUN_DIR/final/edit_report.json and look at $RUN_DIR/final/edit_boundaries.jpg: for every boundary choose the cut inside the handles (a_out_s / b_in_s) so it lands on action or on a look; boundaries below 0.80 get a trim, an approved reaction/insert clip between them, or a re-render request — never a dissolve. Record each decision in $RUN_DIR/final/edit_decisions.json
-- Video: trim each $RUN_DIR/clips/<SID>/clip_4k60.mp4 frame-accurately (-frames:v) to the chosen in/out, then concat with the demuxer and -c:v copy in shot order. STRAIGHT CUTS ONLY — no xfade unless transition_to_next.type says dissolve/fade. Write $RUN_DIR/final/concat.txt (it is the cut list for any later full-film pass). Never run RIFE/minterpolate on the assembled film
-- Dialogue: clips/<SID>/clip.mp4 already carries the APPROVED stem clips/<SID>/dialogue.wav muxed at dialogue_meta.json anchor_s (muxed_into_clip true) — keep that track, trimmed with the same in/out as the picture; only if muxed_into_clip is absent strip the native H3 track and mux the stem at anchor_s yourself
-- Overlay: narration from $RUN_DIR/audio/narration/ (no lip sync, sidechain-ducked under any line)
-- Layer: music + SFX from $RUN_DIR/music/ (music and ambience may cross-fade over cuts; picture never does)
-- Subtitles: burn ASS from $RUN_DIR/final/*.ass; loudnorm two-pass
-- Output: $RUN_DIR/final/movie_4k60.mp4 (H.264, AAC 256k)
-- Also: $RUN_DIR/final/movie_4k60_master.mov (ProRes, PCM)
-- Re-run python3 $PACK_DIR/pipeline/edit_check.py --concat-list $RUN_DIR/final/concat.txt and include its result in $RUN_DIR/final/assembly_log.json"
-run_dsh_agent "post-production-editor" "$RUN_DIR/prompt_assembly.txt" "$RUN_DIR/final/assembly_log.json"
+# 3c. Edit decisions — the Post-Production Editor DECIDES (edit_decisions.json v2);
+# assemble.py executes. The editor never runs ffmpeg and never touches clip audio.
+if ! skip_if_done "$RUN_DIR/final/edit_decisions.json" "Edit decisions"; then
+    step "3c. Edit decisions (Post-Production Editor)"
+    write_prompt "$RUN_DIR/prompt_edit_decisions.txt" \
+        "You are the EDITOR. Decide the cut at every clip boundary and write ONLY $RUN_DIR/final/edit_decisions.json (version 2). Do NOT run ffmpeg, do NOT touch any clip or audio file — pipeline/assemble.py executes your decisions.
+Read: $RUN_DIR/final/edit_report.json (score per boundary, flags, suggested fixes) and look at $RUN_DIR/final/edit_boundaries.jpg; $RUN_DIR/shot_list.json (edit.handle_head_s / handle_tail_s / cut_in / cut_out, audio.dialogue, transition_to_next); $RUN_DIR/clips/<SID>/dialogue_meta.json (anchor_s, duration_s of the stem); $RUN_DIR/assembly_fixes.json if it exists (blocking notes from QA: stem offsets, trims).
+Rules (editing-grammar skill): choose a_out_s / b_in_s INSIDE the handles so the cut lands on action or on a look; boundaries below 0.80 get a deeper trim, an approved reaction/insert clip between them ('inserted'), or a request_rerender — never a dissolve. Dialogue clips: never cut inside the stem (anchor_s .. anchor_s+duration_s) unless you set a J/L cut. J-cut = audio_lead_s (0.15-0.30 s): B's line starts BEFORE the picture cut (then b_in_s = anchor_s + audio_lead_s). L-cut = audio_lag_s (0.20-0.40 s): A's line continues over B's first frames (a_out_s = anchor_s + duration_s - audio_lag_s). Voices never overlap. Use J/L cuts on dialogue boundaries where the previous speaker's tail is a hold.
+Schema: {\"version\": 2, \"decisions\": [{\"boundary\": \"S01_003|S01_004\", \"action\": \"trim|insert|hold|request_rerender\", \"a_out_s\": <seconds into clip A>, \"b_in_s\": <seconds into clip B>, \"audio_lead_s\": 0.0, \"audio_lag_s\": 0.0, \"cut_type\": \"on-action|on-look|hold\", \"insert_clip\": null, \"note\": \"...\"}], \"removed_clips\": [], \"inserted\": [{\"after\": \"S01_003\", \"shot_id\": \"S01_007\", \"src_in_s\": 0.5, \"src_out_s\": 2.5}]}. One decision per boundary in shot order. Output the JSON only."
+    run_dsh_agent "post-production-editor" "$RUN_DIR/prompt_edit_decisions.txt" "$RUN_DIR/final/edit_decisions.json"
+    if ! VALID_OUT=$(python3 "$PACK_DIR/pipeline/assemble.py" --run-dir "$RUN_DIR" --validate-decisions 2>&1); then
+        log "edit decisions rejected — one fix round: $(echo "$VALID_OUT" | tail -5 | tr '\n' ' ')"
+        echo "$VALID_OUT" >> "$RUN_DIR/pipeline.log"
+        write_prompt "$RUN_DIR/prompt_edit_decisions_fix.txt" \
+            "Your $RUN_DIR/final/edit_decisions.json was rejected by pipeline/assemble.py --validate-decisions: $(echo "$VALID_OUT" | tail -12). Fix every named boundary (keep the version-2 schema, cuts inside the handles, voices never overlapping, b_in_s = anchor_s + audio_lead_s on a J-cut) and rewrite the file. Do NOT run ffmpeg."
+        run_dsh_agent "post-production-editor" "$RUN_DIR/prompt_edit_decisions_fix.txt" "$RUN_DIR/final/edit_decisions.json"
+        python3 "$PACK_DIR/pipeline/assemble.py" --run-dir "$RUN_DIR" --validate-decisions >> "$RUN_DIR/pipeline.log" 2>&1 \
+            || halt_run "$CURRENT_STEP" "edit_decisions.json still invalid after the editor's fix round — see pipeline.log; fix $RUN_DIR/final/edit_decisions.json by hand and resume"
+    fi
+    log "edit decisions validated"
+fi
+
+# 3d. Timeline — always rebuilt (cheap); the composer reads it for cue lengths.
+step "3d. Timeline"
+python3 "$PACK_DIR/pipeline/assemble.py" --run-dir "$RUN_DIR" --timeline-only >> "$RUN_DIR/pipeline.log" 2>&1 \
+    || halt_run "$CURRENT_STEP" "assemble.py --timeline-only failed — see pipeline.log (a clip without a PASS verdict or a missing 4K master?)"
+python3 "$PACK_DIR/pipeline/assemble.py" --run-dir "$RUN_DIR" --dry-run >> "$RUN_DIR/pipeline.log" 2>&1 || true
+log "timeline: $(python3 -c "import json; t=json.load(open('$RUN_DIR/final/timeline.json')); print(len(t.get('segments',[])), 'segments,', round(t.get('film_duration_s',0),1), 's at', t.get('fps'), 'fps')" 2>/dev/null)"
+
+# 3e. Music cues — the Music Composer PLANS (music_cues.json); music_render.py renders.
+if ! skip_if_done "$RUN_DIR/music/music_cues.json" "Music cues"; then
+    step "3e. Music cues (Music Composer)"
+    write_prompt "$RUN_DIR/prompt_music.txt" \
+        "Plan the score as a film composer and write ONLY $RUN_DIR/music/music_cues.json following the music-cues skill — DO NOT call ComfyUI or any audio port (the pipeline renders with ACE-Step afterwards). Read $RUN_DIR/story.json (scenes[].music_cue {mood,intensity,start,stop}, emotional_beat, audience_feels), $RUN_DIR/shot_list.json (shots[].audio.music_cue action start|continue|swell|stop|silence, audio.sfx, dialogue clips) and $RUN_DIR/final/timeline.json (film time of every clip and scene — cue anchors are clip ids). Cues tile every scene (or an explicit silence entry), 10-180 s each, instrumental only, tempo 50-160, intensity follows the emotional beat, transitions on cuts; motifs per character; ambience beds per scene. Output the JSON only."
+    run_dsh_agent "music-composer" "$RUN_DIR/prompt_music.txt" "$RUN_DIR/music/music_cues.json"
+    if ! MV_OUT=$(python3 "$PACK_DIR/pipeline/music_render.py" --run-dir "$RUN_DIR" --validate 2>&1); then
+        log "music cues rejected — one fix round: $(echo "$MV_OUT" | tail -6 | tr '\n' ' ')"
+        echo "$MV_OUT" >> "$RUN_DIR/pipeline.log"
+        write_prompt "$RUN_DIR/prompt_music_fix.txt" \
+            "Your $RUN_DIR/music/music_cues.json was rejected by the pipeline's validator: $(echo "$MV_OUT" | tail -15). Fix every problem (same schema, music-cues skill) and rewrite the file. Do NOT call any audio port."
+        run_dsh_agent "music-composer" "$RUN_DIR/prompt_music_fix.txt" "$RUN_DIR/music/music_cues.json"
+        python3 "$PACK_DIR/pipeline/music_render.py" --run-dir "$RUN_DIR" --validate >> "$RUN_DIR/pipeline.log" 2>&1 \
+            || halt_run "$CURRENT_STEP" "music_cues.json still invalid after the composer's fix round — see pipeline.log"
+    fi
+    log "music cues validated -> $RUN_DIR/music/music_cues.resolved.json"
+fi
+[ -s "$RUN_DIR/music/music_cues.resolved.json" ] || \
+    python3 "$PACK_DIR/pipeline/music_render.py" --run-dir "$RUN_DIR" --validate >> "$RUN_DIR/pipeline.log" 2>&1 \
+    || halt_run "3e. Music cues" "music_cues.json does not validate (resumed run) — see pipeline.log"
+
+# 3f. Render audio — ONE GPU excursion: TTS cluster (narration), then ComfyUI (music, SFX).
+step "3f. Render narration, music and SFX"
+NARR_OK=$(python3 -c "import json; r=json.load(open('$NARR_DIR/tts_jobs.results.json')); print('yes' if r.get('ok')==r.get('jobs') and r.get('jobs') else 'no')" 2>/dev/null || echo no)
+if [ "$NARR_OK" = "yes" ] && [ "$NARR_DIR/tts_jobs.results.json" -nt "$NARR_DIR/tts_jobs.json" ]; then
+    log "narration already rendered ($NARR_DIR/tts_jobs.results.json)"
+else
+    touch "$OUTPUT_DIR/.audio_phase_active"
+    TTS_RC=0
+    python3 "$PACK_DIR/pipeline/tts_render.py" --jobs "$NARR_DIR/tts_jobs.json" --run-dir "$RUN_DIR" --keep-gpu >> "$RUN_DIR/pipeline.log" 2>&1 || TTS_RC=$?
+    rm -f "$OUTPUT_DIR/.audio_phase_active"
+    [ "$TTS_RC" -eq 0 ] || halt_run "$CURRENT_STEP" "narration render failed (tts_render.py exit $TTS_RC) — see $NARR_DIR/tts_jobs.results.json and pipeline.log"
+    python3 - "$NARR_DIR" <<'PYEOF'
+import json, os, sys
+d = sys.argv[1]
+meta = json.load(open(os.path.join(d, "narration_meta.json")))
+res = {r["id"]: r for r in json.load(open(os.path.join(d, "tts_jobs.results.json")))["results"]}
+for b in meta.get("blocks", []):
+    r = res.get(b.get("id"))
+    if r:
+        b["duration_s"] = r.get("duration_s"); b["status"] = r.get("status"); b["file"] = os.path.basename(r.get("out") or b.get("file", ""))
+tmp = os.path.join(d, "narration_meta.json.tmp")
+json.dump(meta, open(tmp, "w"), indent=2)
+os.replace(tmp, os.path.join(d, "narration_meta.json"))
+PYEOF
+    python3 "$PACK_DIR/pipeline/narration_check.py" --run-dir "$RUN_DIR" --rendered >> "$RUN_DIR/pipeline.log" 2>&1 \
+        || halt_run "$CURRENT_STEP" "rendered narration fails narration_check (missing wav / duration) — see $NARR_DIR/narration_check.json"
+    log "narration rendered: $(python3 -c "import json;r=json.load(open('$NARR_DIR/tts_jobs.results.json'));print(r['ok'],'/',r['jobs'])" 2>/dev/null)"
+fi
+
+touch "$OUTPUT_DIR/.gen_phase_active"
+MUSIC_RC=0
+python3 "$PACK_DIR/pipeline/music_render.py" --run-dir "$RUN_DIR" --keep-gpu >> "$RUN_DIR/pipeline.log" 2>&1 || MUSIC_RC=$?
+[ "$MUSIC_RC" -eq 0 ] || { rm -f "$OUTPUT_DIR/.gen_phase_active"; halt_run "$CURRENT_STEP" "music render failed (music_render.py exit $MUSIC_RC) — see $RUN_DIR/music/render_log.json and pipeline.log"; }
+log "music rendered: $(python3 -c "import json; r=json.load(open('$RUN_DIR/music/render_log.json')); print(r.get('ok'), 'cues/beds ok,', len(r.get('failed',[])), 'failed')" 2>/dev/null)"
+SFX_FLAG=""
+if [ "${SFX_LAYER:-1}" = "1" ]; then
+    SFX_RC=0
+    python3 "$PACK_DIR/pipeline/sfx_render.py" --run-dir "$RUN_DIR" --no-gpu-switch --keep-gpu >> "$RUN_DIR/pipeline.log" 2>&1 || SFX_RC=$?
+    [ "$SFX_RC" -eq 0 ] || { rm -f "$OUTPUT_DIR/.gen_phase_active"; halt_run "$CURRENT_STEP" "SFX render failed (sfx_render.py exit $SFX_RC) — see $RUN_DIR/clips/sfx_render_log.json (set SFX_LAYER=0 to skip the layer)"; }
+    log "sfx rendered"
+else
+    SFX_FLAG="--no-sfx"
+fi
+notify "Narration, music$([ "${SFX_LAYER:-1}" = "1" ] && echo ' and SFX') rendered — assembling" "Post-Production"
+
+# 3g. Assemble — picture from the 4K masters, ONE audio mix on the timeline, subtitles.
+step "3g. Assemble"
+AMB_FLAG=""
+[ "${KEEP_NATIVE_AMBIENCE:-0}" = "1" ] && AMB_FLAG="--keep-native-ambience"
+ASM_RC=0
+python3 "$PACK_DIR/pipeline/assemble.py" --run-dir "$RUN_DIR" --encoder "${ASSEMBLE_ENCODER:-libx264}" $SFX_FLAG $AMB_FLAG \
+    >> "$RUN_DIR/pipeline.log" 2>&1 || ASM_RC=$?
+rm -f "$OUTPUT_DIR/.gen_phase_active"
+[ "$ASM_RC" -eq 0 ] || halt_run "$CURRENT_STEP" "assemble.py exit $ASM_RC — see $RUN_DIR/final/assembly_log.json and pipeline.log"
+python3 "$PACK_DIR/pipeline/subtitles.py" --run-dir "$RUN_DIR" --embed >> "$RUN_DIR/pipeline.log" 2>&1 \
+    || halt_run "$CURRENT_STEP" "subtitles.py failed — see pipeline.log"
+python3 "$PACK_DIR/pipeline/edit_check.py" --concat-list "$RUN_DIR/final/concat.txt" --shots "$RUN_DIR/shot_list.json" \
+    --out "$RUN_DIR/final/edit_report_final.json" >> "$RUN_DIR/pipeline.log" 2>&1 \
+    || log "final edit check: boundaries below 0.80 remain — see final/edit_report_final.json"
 
 # ═══════════════════════════════════════════════════════════
 # DONE
@@ -2235,9 +2134,10 @@ step "PRODUCTION COMPLETE"
 log "Output: $RUN_DIR/final/"
 ls -lh "$RUN_DIR/final/" 2>/dev/null
 log ""
-log "Movie:     $RUN_DIR/final/movie_4k60.mp4"
-log "Subtitles: $RUN_DIR/final/*.srt"
+log "Movie:     $RUN_DIR/final/movie_4k.mp4"
+log "Subtitles: $RUN_DIR/final/movie.srt / movie.ass"
 log "Log:       $RUN_DIR/pipeline.log"
+python3 "$PACK_DIR/pipeline/cloud_ledger.py" summary "$RUN_DIR" 2>/dev/null | while IFS= read -r line; do log "$line"; done
 
-FINAL_SIZE=$(du -sh "$RUN_DIR/final/movie_4k60.mp4" 2>/dev/null | cut -f1 || echo "N/A")
-notify "PRODUCTION COMPLETE\nMovie: $FINAL_SIZE\nClips: $TOTAL\nPath: $RUN_DIR/final/movie_4k60.mp4" "Production Complete"
+FINAL_SIZE=$(du -sh "$RUN_DIR/final/movie_4k.mp4" 2>/dev/null | cut -f1 || echo "N/A")
+notify "PRODUCTION COMPLETE\nMovie: $FINAL_SIZE\nClips: $TOTAL\nPath: $RUN_DIR/final/movie_4k.mp4\n$(python3 "$PACK_DIR/pipeline/cloud_ledger.py" summary "$RUN_DIR" 2>/dev/null | head -3)" "Production Complete"

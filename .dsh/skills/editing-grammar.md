@@ -80,8 +80,10 @@ Rules for choosing them:
   turning, door swinging) and entering shot B with the *same movement finishing*. The brain
   hides the cut inside the motion. Both prompts must describe the same movement phase.
 - **Cut on the look.** For dialogue: cut from the speaker to the listener on the beat the
-  speaker's eyes move, or 2–6 frames before the next line starts (the audio of B may lead
-  the picture — a J-cut; the editor does this with the handles).
+  speaker's eyes move, or let B's line lead the picture by 0.15–0.30 s (a J-cut). The editor
+  writes that as `audio_lead_s` on the boundary in `final/edit_decisions.json`; an L-cut
+  (A's line running under B's picture) is `audio_lag_s` 0.20–0.40 s. `assemble.py` offsets
+  the stem — nobody trims audio by hand, and voices never overlap.
 - **Never cut static-to-static on the same subject.** If both boundary frames are a still
   pose of the same character, it is a jump cut regardless of angle.
 - **Screen direction** is preserved: a character moving left→right keeps moving left→right
@@ -116,13 +118,19 @@ the number of cups on a table, a candle's height, a window's weather — gets an
   Dissolves do not "mask" a bad cut — they advertise it.
 - **Frame interpolation (RIFE / minterpolate) runs per clip only, never across a cut.**
   Interpolating the assembled film blends the last frame of A with the first frame of B and
-  produces a 2–4-frame dissolve at every cut. Upscale and interpolate each `clip.mp4` to its
-  own `clip_4k60.mp4` (`pipeline/upscale_clip.py`) and concatenate those; if the whole film
-  must be processed in one pass, `pipeline/upscale_film.py` MUST be given the cut list
-  (`--concat-list` or `--cuts`) so no interpolation window spans a cut.
-- Trimming happens on the per-clip masters, frame-accurately, BEFORE concat; the clip's own
-  dialogue stem is trimmed with it so lips stay in sync (OpenCineAgent rule).
-- Music and ambience cross-fade over cuts; picture never does.
+  produces a 2–4-frame dissolve at every cut. Upscale each `clip.mp4` to its own
+  `clip_4k.mp4` (`pipeline/upscale_clip.py`, RTX VSR) and concatenate those. The delivery
+  frame rate is `PP_TARGET_FPS` (default 24 = the source rate, no RIFE at all); RIFE runs
+  per clip only when a higher rate is asked for (48/96 = xN, 60 = x5 then every 2nd
+  frame). If the whole film must ever be processed in one pass, `pipeline/upscale_film.py`
+  MUST be given the cut list (`--concat-list` or `--cuts`) so no interpolation window
+  spans a cut.
+- Trimming happens on the per-clip masters, frame-accurately, by `pipeline/assemble.py`
+  from the editor's decisions. The clip's dialogue stem is never trimmed: assembly places
+  `clips/<SID>/dialogue.wav` on the film timeline at `film_start + anchor_s − src_in`, so
+  lips stay in sync whatever the trim.
+- Music and ambience cross-fade over cuts (assembly: equal-power, ≥ 180 ms overlap); picture
+  never does.
 
 ## 6. Adjacent-pair review ("does it cut?")
 
@@ -147,5 +155,17 @@ Fix order for a failed boundary (cheapest first):
 3. **Re-render only B** with a new size/angle (two steps away) keeping the same cut_in.
 4. **Re-stage** both (Director) — last resort.
 
-Record every boundary decision in `final/edit_decisions.json`
-(`{"boundary": "S01_05|S01_06", "action": "trim", "a_out_s": 5.1, "b_in_s": 0.7, "note": "..."}`).
+Record every boundary decision in `final/edit_decisions.json` (version 2 — the only file the
+Post-Production Editor writes; `assemble.py --validate-decisions` checks it):
+
+```json
+{"version": 2,
+ "decisions": [{"boundary": "S01_05|S01_06", "action": "trim", "a_out_s": 5.1, "b_in_s": 0.7,
+                "audio_lead_s": 0.0, "audio_lag_s": 0.0, "cut_type": "cut",
+                "insert_clip": null, "note": "..."}],
+ "removed_clips": [], "inserted": []}
+```
+
+`audio_lead_s` (J-cut, 0.15–0.30 s, `b_in_s = anchor_s + audio_lead_s`) and `audio_lag_s`
+(L-cut, 0.20–0.40 s) are the only way to shape sound across a cut; `assemble.py` places the
+stems accordingly and refuses overlapping voices.

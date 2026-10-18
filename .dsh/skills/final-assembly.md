@@ -1,157 +1,126 @@
 ---
 name: final-assembly
-description: Skill for assembling the final movie from clips, audio, subtitles into one video
-whenToUse: When assembling the final movie from all produced assets
+description: How the final movie is assembled — a deterministic pipeline (timeline → picture → one audio mix → subtitles) driven by the editor's decisions file
+whenToUse: When writing edit decisions, reading assembly output, or reasoning about where any sound lands in the finished film
 ---
 
 # Final Assembly Skill
 
-Used by the Post-Production Editor to assemble all assets into the final movie.
+Since 2026-10-18 assembly is deterministic. The Post-Production Editor writes ONE file,
+`final/edit_decisions.json`; `pipeline/assemble.py` does everything else. No agent runs
+ffmpeg, trims a clip, strips or muxes a track, or mixes audio.
 
-## Assembly Order
+## The timeline model
 
-### Phase 0: Blocking checklist
-Apply every entry of `<run_dir>/assembly_fixes.json` (QA FAILs downgraded to PASS on the
-promise that assembly fixes them: trims, stem offsets, grades). Nothing ships with an
-unapplied entry.
+**Clip files contribute PICTURE ONLY.** Every audio element — dialogue stems, narration
+blocks, music cues, ambience beds, per-clip SFX — is placed exactly once on ONE film
+timeline and mixed once. That removes the three defects of per-clip audio: audio jumps at
+every cut (clips arrived in different audio states), double voice (stems muxed twice,
+narration rendered per clip, H3's native voices under the narration), and the impossibility
+of J/L cuts. The native H3 track is stripped by default (`KEEP_NATIVE_AMBIENCE=1` keeps it as
+a bed only when no speech is detected in it). `mux_stem.py` still gives `clip.mp4` its stem
+for previews and QA — assembly never reads that track.
 
-### Phase 1: Picture edit (editing-grammar skill)
-*The Clockwork Moth* shipped with a jump cut or a blended frame at nearly every boundary.
-The picture edit is therefore a review of BOUNDARIES, not a concatenation:
-1. Collect all QA-passed clips in sequence order — use the per-clip 4K60 masters
-   (`clips/<SID>/clip_4k60.mp4`); RIFE already ran INSIDE each clip.
-2. `python3 pipeline/edit_check.py --run-dir <run_dir>` → `final/edit_report.json` and
-   `final/edit_boundaries.jpg`. Open the sheet and look at every flagged pair.
-3. For every boundary choose the cut inside the handles (`a_out_s`, `b_in_s`): land it on
-   action or on a look; never static → static on the same subject; J-cut dialogue (B's
-   stem leads the picture by 2–6 frames) when A's tail is a hold. Record each decision in
-   `final/edit_decisions.json`.
-4. A boundary still < 0.80: insert an approved reaction/insert clip, or request B at a new
-   size/angle. Do not ship it; do not dissolve over it.
-5. Trim each master frame-accurately and trim its dialogue stem with the same in/out.
-6. Concatenate with the concat demuxer, `-c:v copy`. Straight cuts only; `xfade` only
-   where `transition_to_next.type` is a dissolve/fade. Write `final/concat.txt` — it is
-   the cut list every later full-film pass (`upscale_film.py --concat-list`) must use.
-7. Re-run `edit_check.py --concat-list final/concat.txt` on the trimmed segments.
+Film time is built from frame counts, never float durations:
 
-### Phase 2: Audio Layering
-Layer in this order (highest priority first):
-1. **Dialogue stems** — `clips/{shot_id}/dialogue.wav` (approved TTS stem, trimmed with the
-   picture, placed at the QA-recorded offset). The clip's native H3 track is stripped —
-   it is H3's own take, not the stem.
-2. **Narration track** — from `audio/narration/` (post only, ducked under any line)
-3. **SFX track** — from `output/music/{scene_id}/`
-4. **Music score** — from `output/music/{scene_id}/`
-5. **Ambient track** — from `output/music/{scene_id}/`
-
-Mix rules:
-- Dialogue at 0dB (reference level)
-- Narration at -2dB
-- SFX at -6dB
-- Music at -12dB during dialogue, -6dB during non-dialogue
-- Ambient at -18dB
-
-### Phase 3: Subtitles
-- Burn subtitles into video OR embed as soft subs
-- Use ASS format for styled subtitles (font: "Noto Sans", size: 48, outline: 2px black)
-- Position: bottom center, 10% margin from bottom edge
-- Dialogue subtitles: white text, black outline
-- Narration subtitles: light yellow text, italic, black outline
-
-### Phase 4: Title & Credits
-- Add title card at frame 0 (3-second fade in)
-- Add end credits (scrolling text, 15-30 seconds)
-- Add chapter/act title cards at scene breaks if specified
-
-### Phase 5: Final Encode
-
-#### Preview (for review):
-```bash
-ffmpeg -i assembled.mp4 \
-  -c:v libx264 -preset medium -crf 18 \
-  -c:a aac -b:a 192k \
-  -vf "ass=subtitles.ass" \
-  output/final/{movie_name}_preview.mp4
+```
+fps           probed from the masters clips/<SID>/clip_4k.mp4 (one fps for all; PP_TARGET_FPS)
+src_in_f      = round(cut_in_s  * fps)
+n_frames      = round(cut_out_s * fps) − src_in_f
+film_start_s  = (sum of n_frames of every earlier segment) / fps
 ```
 
-#### Master (archival):
-```bash
-ffmpeg -i assembled.mp4 \
-  -c:v prores_ks -profile:v 3 \
-  -c:a pcm_s24le \
-  output/final/{movie_name}_master.mov
+## Phase 3 in run.sh
+
+| Step | Who | Writes |
+|------|-----|--------|
+| 3a narration plan | audio-producer agent (`narration_check.py --plan` validates) | `audio/narration/tts_jobs.json`, `narration_meta.json` — one block per passage, carried by the first clip of its span |
+| 3b edit check | `edit_check.py --run-dir` | `final/edit_report.json`, `final/edit_boundaries.jpg` |
+| 3c edit decisions | post-production-editor agent (`assemble.py --validate-decisions`) | `final/edit_decisions.json` v2 — ONLY this |
+| 3d timeline | `assemble.py --timeline-only` | `final/timeline.json` (film clock for the composer) |
+| 3e music cues | music-composer agent (`music_render.py --validate`) | `music/music_cues.json` → `music_cues.resolved.json` |
+| 3f render | `tts_render.py --keep-gpu` → `music_render.py` (ACE-Step 1.5) → `sfx_render.py` (MMAudio, `SFX_LAYER=1`) — one GPU excursion | `audio/narration/*.wav`, `music/cues/<id>.wav`, `music/beds/<id>.wav`, `clips/<SID>/sfx.wav` |
+| 3g assemble | `assemble.py` then `subtitles.py --embed` then `edit_check.py --concat-list` | `final/movie_4k.mp4`, `final/audio_placements.json`, `final/assembly_log.json`, `final/concat.txt`, `final/movie.srt`, `final/movie.ass` |
+
+## What assemble.py reads
+
+- `shot_list.json` — play order, `edit.handle_head_s/handle_tail_s`, `transition_to_next`.
+- `clips/<SID>/qa_verdict.json` (PASS or `MANUAL_PASS`), `clip_4k.mp4`, `dialogue.wav` +
+  `dialogue_meta.json` (`anchor_s`), `sfx.wav`.
+- `final/edit_decisions.json` — the editor's per-boundary decisions (below).
+- `audio/narration/narration_meta.json` + the rendered block WAVs.
+- `music/music_cues.resolved.json` + `music/cues/*.wav`, `music/beds/*.wav`.
+- `assembly_fixes.json` — the QA downgrade ledger (the editor turned it into decisions).
+
+## The editor's decisions file — `final/edit_decisions.json` (v2)
+
+```json
+{"version": 2,
+ "decisions": [{"boundary": "S01_005|S01_006", "action": "trim",
+                "a_out_s": 5.10, "b_in_s": 1.65,
+                "audio_lead_s": 0.25, "audio_lag_s": 0.0,
+                "cut_type": "cut", "insert_clip": null,
+                "note": "A leaves as the hand rises; B enters mid-turn; B's line leads by 0.25 s"}],
+ "removed_clips": [], "inserted": []}
 ```
 
-## FFmpeg Commands Reference
+- Default trim when no decision exists for a boundary: `src_in = handle_head_s / 2`,
+  `src_out = master_duration − handle_tail_s / 2`, clamped on dialogue clips so the stem lies
+  inside the picture with 0.2 s on each side.
+- `a_out_s` / `b_in_s` override that per boundary (source seconds inside each master).
+- Straight cuts only (`cut_type: "cut"`); anything else only when the Director scripted it.
+- Fix order for a boundary under 0.80: trim deeper → `insert` an approved reaction/insert
+  clip → `re-render` B at a new size/angle → re-stage. Never a dissolve.
 
-### Frame-exact trim of one clip and its stem (same in/out — lips stay in sync):
-```bash
-# a_in / frames come from final/edit_decisions.json; fps is the master's fps (60)
-ffmpeg -y -ss "$A_IN" -i clips/S01_005/clip_4k60.mp4 -frames:v "$N" -an \
-  -c:v libx264 -crf 16 -preset slow -pix_fmt yuv420p final/segments/S01_005.mp4
-ffmpeg -y -i clips/S01_005/dialogue.wav \
-  -af "atrim=start=$(python3 -c "print(max(0,$A_IN-$STEM_OFFSET))"):duration=$(python3 -c "print($N/60)"),asetpts=N/SR/TB" \
-  final/segments/S01_005_dialogue.wav
-```
+### Where J-cuts and L-cuts live
 
-### Concatenate clips (straight cuts, no re-encode):
-```bash
-# Create concat list in play order — this file is ALSO the cut list for any later
-# full-film interpolation pass (upscale_film.py --concat-list final/concat.txt)
-: > final/concat.txt
-for sid in $(python3 -c "import json;print(' '.join(s['shot_id'] for s in json.load(open('shot_list.json'))['shots']))"); do
-  echo "file 'segments/$sid.mp4'" >> final/concat.txt
-done
-ffmpeg -f concat -safe 0 -i final/concat.txt -c copy assembled_video.mp4
-```
+They are numbers on the boundary, not ffmpeg work:
 
-### NEVER interpolate the assembled film without the cut list:
-```bash
-# wrong — blends the last frame of every shot into the first frame of the next
-python3 pipeline/upscale_film.py --source final/movie.mp4 --out final/movie_4k60.mp4 --no-cuts
-# right — interpolation stops at every cut
-python3 pipeline/upscale_film.py --source final/movie.mp4 --out final/movie_4k60.mp4 \
-  --concat-list final/concat.txt
-```
+- **J-cut** — `audio_lead_s` (0.15–0.30 s) on a boundary INTO a dialogue clip. B's stem is
+  always placed at `B.film_start + (anchor_s − b_in_s)`, so `b_in_s = anchor_s + audio_lead_s`
+  (checked to one frame when both are given; lead ≤ 0.5 s).
+- **L-cut** — `audio_lag_s` (0.20–0.40 s) on a boundary OUT of a dialogue clip. A's stem is not
+  truncated at the cut; it runs past it, capped at 0.6 s with a 40 ms fade.
+- **Voices never overlap:** stem A must end 0.10 s before stem B starts; assembly rejects the
+  decision otherwise.
 
-### Mix audio tracks:
-```bash
-ffmpeg -i assembled_video.mp4 \
-  -i dialogue_mix.wav \
-  -i narration_mix.wav \
-  -i music_mix.wav \
-  -i ambient_mix.wav \
-  -filter_complex "[1:a]volume=1.0[d]; \
-                    [2:a]volume=0.8[n]; \
-                    [3:a]volume=0.25[m]; \
-                    [4:a]volume=0.12[a]; \
-                    [d][n][m][a]amix=inputs=4:duration=longest[out]" \
-  -map 0:v -map "[out]" \
-  -c:v copy -c:a aac -b:a 256k \
-  final_with_audio.mp4
-```
+## The mix (one pass, film timeline)
 
-### Apply dynamic music ducking (lower music during dialogue):
-```bash
-ffmpeg -i music.wav -i dialogue.wav \
-  -filter_complex "[1:a]silencedetect=n=-40dB:d=0.5[silence]; \
-                    [0:a][silence]sidechaincompress=threshold=0.02:ratio=4:attack=200:release=1000[out]" \
-  -map "[out]" music_ducked.wav
-```
+float32 stereo at 48 kHz, five buffers — dialogue, narration, music, bed, sfx — and a voice
+mask built from the stems' own energy (RMS per 10 ms > −45 dBFS), never from clip audio.
 
-### Burn subtitles:
-```bash
-ffmpeg -i final_with_audio.mp4 \
-  -vf "ass=output/final/movie.ass" \
-  -c:v libx264 -crf 18 -c:a copy \
-  output/final/movie_with_subs.mp4
-```
+| Element | Placement | Level |
+|---------|-----------|-------|
+| Dialogue stem | once, at `film_start + anchor_s − src_in` (+ lead / lag) | 0 dB reference |
+| Narration block | once per block, at `film_start(starts_on) + 0.4 s`; never under a line | −1 dB |
+| Music cue | per `music_cues.resolved.json`, normalised to −18 LUFS, fades per `transition_in/out`, equal-power crossfade between consecutive cues | −6 dB, ducked to −12 dB under dialogue AND narration |
+| Bed (ambience) | continuous across cuts, equal-power crossfade with ≥ 180 ms overlap around every boundary | −18 dB, ducked to −24 dB |
+| SFX (`clips/<SID>/sfx.wav`) | per clip, crossing cuts with the same 180 ms overlap | −12 dB, ducked to −20 dB |
 
-### Add title card:
-```bash
-ffmpeg -i title_card.png -i final_movie.mp4 \
-  -filter_complex "[0:v]loop=loop=90:size=1:start=0,setpts=PTS-STARTPTS[title]; \
-                    [title][1:v]concat=n=2:v=1:a=0[out]" \
-  -map "[out]" -map 1:a \
-  movie_with_title.mp4
-```
+Ducking is side-chain at 100 Hz control rate, 60 ms look-ahead attack, 400 ms release.
+Sum → true-peak guard → `final/mix_raw.wav` → two-pass loudnorm (I = −16 LUFS, TP = −1.5,
+LRA = 11) → `final/mix.wav` → muxed onto `final/picture.mp4` → `final/movie_4k.mp4`.
+Nothing falls back silently: every "could not" is an error (exit 1/2/3) or a warning in
+`final/assembly_log.json`.
+
+## Subtitles
+
+`pipeline/subtitles.py --embed` writes `final/movie.srt` and `final/movie.ass` from
+`final/audio_placements.json` — the actual film-time placement of every stem and narration
+block — so cues are timed to the audio in the mix, not to shot-list estimates. The
+subtitle-generator agent is deprecated and not called.
+
+## Interpolation never crosses a cut
+
+Upscaling and any interpolation happen per clip (`pipeline/upscale_clip.py` →
+`clips/<SID>/clip_4k.mp4`; RIFE only when `PP_TARGET_FPS` asks for more than the source
+rate). `assemble.py` trims and concatenates those masters; it never interpolates. If the
+whole film must ever be processed in one pass, `pipeline/upscale_film.py` MUST be given the
+cut list (`--concat-list final/concat.txt`) — it refuses to run without one, because a
+blended frame at every cut is exactly the dissolve *The Clockwork Moth* was reviewed for.
+
+## Final checks
+
+- `edit_check.py --concat-list final/concat.txt` re-scores the trimmed segments; no boundary
+  below 0.80 ships without an entry in `edit_decisions.json`.
+- `final/assembly_log.json` lists every placement, warning and duration check.

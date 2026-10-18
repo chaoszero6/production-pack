@@ -2,7 +2,7 @@
 """generate_frames.py — render a shot's keyframes (Qwen Image 2.1 via ComfyUI)
 from the image-generator agent's frame_spec.json, with the GPU handed to ComfyUI.
 
-Why: ComfyUI and the local LLM are exclusive GPU owners (systemd Conflicts=),
+Why: agents never call ComfyUI during a turn (they plan, the pipeline renders),
 so the agent cannot call ComfyUI during its turn. It PLANS (frame_spec.json);
 this script renders and writes frame_meta.json for generate_video_direct.py.
 
@@ -243,8 +243,8 @@ def main() -> int:
     finally:
         json.dump(meta, open(meta_path, "w", encoding="utf-8"), indent=2)
         if not args.no_gpu_switch and not args.keep_gpu:
-            log("handing the GPU back to the LLM (≈2 min)")
-            gpu("llm")
+            # No local LLM: ComfyUI stays the owner of the GPU (it already is).
+            log("GPU stays with ComfyUI (no local LLM to hand it back to)")
     return rc
 
 

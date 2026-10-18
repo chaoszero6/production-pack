@@ -29,51 +29,13 @@ def log(msg):
 def systemctl(action, service):
     subprocess.run(["systemctl", action, service], capture_output=True)
 
-CLOUD_ROUTING = os.environ.get("CLOUD_ROUTING", "0") == "1"
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import local_llm  # noqa: E402  (Strata Swift unit/port/model — single source of truth)
-
-# While the LLM is parked for a render this marker tells llm_monitor.py not to
-# restart it (its ExecStartPre would kill ComfyUI mid-job).
-PARKED_MARKER = os.path.join(PACK_DIR, "output", ".llm_parked")
-
-
-def stop_llm():
-    if CLOUD_ROUTING:
-        return
-    log(f"Parking the local LLM ({local_llm.UNIT}, ~{local_llm.VRAM_MB} MB) to free VRAM for H3...")
-    os.makedirs(os.path.dirname(PARKED_MARKER), exist_ok=True)
-    with open(PARKED_MARKER, "w") as fh:
-        fh.write(f"{time.time()} generate_clip\n")
-    local_llm.stop()
-    for svc in ("orpheus-tts.service", "orpheus-backend.service"):
+# No local LLM (2026-10-18): the GPU belongs to ComfyUI during the whole clip
+# loop, so there is nothing to park before H3 and nothing to restart after it.
+# Stale TTS engines are stopped so H3 gets the full card.
+def stop_tts_engines():
+    for svc in ("orpheus-tts.service", "orpheus-backend.service", "chatterbox-tts.service",
+                "kokoro-tts.service", "cosyvoice.service", "tts-cluster.service"):
         systemctl("stop", svc)
-    log("LLM services stopped")
-
-
-def start_llm():
-    if CLOUD_ROUTING:
-        return True
-    try:
-        os.remove(PARKED_MARKER)
-    except OSError:
-        pass
-    if local_llm.healthy():
-        log(f"LLM already running: {local_llm.UNIT}")
-        return True
-    # Free ComfyUI's VRAM (H3 models can hold 20-26GB after generation)
-    log("Freeing ComfyUI VRAM before starting LLM...")
-    try:
-        requests.post(f"{COMFYUI}/free", json={"unload_models": True, "free_memory": True}, timeout=10)
-        time.sleep(2)
-    except Exception:
-        pass
-    log(f"Starting local LLM {local_llm.UNIT} (about 2 min)...")
-    if local_llm.start():
-        return True
-    log("WARNING: local LLM did not start in time")
-    return False
 
 
 def ensure_comfyui(comfyui_url):
@@ -117,8 +79,8 @@ def main():
     log(f"=== Generating clip: {shot_id} ===")
     gen_start_time = time.time()
 
-    # Step 1: Stop LLM to give H3 full VRAM
-    stop_llm()
+    # Step 1: make sure no TTS engine holds VRAM (no local LLM exists any more)
+    stop_tts_engines()
 
     # Step 2: Ensure ComfyUI is running
     if not ensure_comfyui(COMFYUI):
@@ -156,13 +118,7 @@ def main():
     with open(os.path.join(shot_dir, "generation_log.json"), "w") as f:
         json.dump(gen_log, f, indent=2)
 
-    # Step 5: Restart LLM for QA
-    if CLOUD_ROUTING:
-        log("Cloud routing: skipping LLM restart (QA is remote)")
-    else:
-        log("Restarting LLM for QA...")
-        start_llm()
-
+    # Step 5: nothing to restart — QA runs in the cloud; ComfyUI keeps the GPU.
     return 0 if os.path.exists(clip_path) else 1
 
 if __name__ == "__main__":

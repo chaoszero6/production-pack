@@ -55,6 +55,27 @@ def validate(shot_list_path, fix=False):
             # Old format: narration as plain string (single clip)
             narration_spans[shot["shot_id"]] = narr
 
+    # --- Check 0b: a narration dict lives on the FIRST clip of its span only ---
+    # The same block repeated on the following clips of the span was rendered and placed once
+    # per clip (double narration). Only the first clip carries the dict; the repeats are nulled.
+    prev_text, prev_span = None, []
+    for shot in shots:
+        sid = shot["shot_id"]
+        audio = shot.get("audio", {})
+        narr = audio.get("narration")
+        if not (narr and isinstance(narr, dict) and (narr.get("text") or "").strip()):
+            continue
+        text = narr.get("text", "")
+        span = narr.get("span_clips") or [sid]
+        if text == prev_text and sid in prev_span and sid != prev_span[0]:
+            issues.append(f"{sid}: narration dict repeated on {sid} — only the first clip of a span carries it")
+            if fix:
+                audio["narration"] = None
+                fixes_applied += 1
+                issues[-1] += " -> FIXED: nulled the repeat"
+            continue
+        prev_text, prev_span = text, list(span)
+
     for shot in shots:
         sid = shot["shot_id"]
         dur = shot.get("duration_seconds", 6)

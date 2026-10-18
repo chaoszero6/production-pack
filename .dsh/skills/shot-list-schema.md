@@ -51,6 +51,9 @@ consumes this schema.
 
       "action_description": "Maya walks through the glowing forest, looking up at the luminous canopy with wide eyes",
 
+      "pov_character": "char_001",
+      "audience_feels": "wonder tinged with dread — she does not yet see what we see",
+
       "keyframe_strategy": {
         "mode": "first_frame_only | first_last_frame | first_from_previous | text_only | reference",
         "first_frame_source": "generate | previous_clip_last_frame",
@@ -81,6 +84,7 @@ consumes this schema.
         },
         "use_native_h3_audio": false,
         "music_mood": "gentle wonder, soft strings",
+        "music_cue": {"action": "start | continue | swell | stop | silence", "mood": "gentle wonder", "intensity": 0.4},
         "sfx": ["footsteps on soft ground", "magical ambient hum"]
       },
 
@@ -146,8 +150,12 @@ Dialogue `estimated_duration` MUST be <= clip `duration_seconds` minus 1s buffer
 If it doesn't fit, either shorten the line or increase clip duration.
 
 ### audio.narration — Spanning Multiple Clips
-Narration is overlaid in post — it CAN span multiple clips via `span_clips`.
-Only set `narration` on the FIRST clip of the span; later clips get `"narration": null`.
+Narration is placed in post by `assemble.py` — it CAN span multiple clips via `span_clips`.
+Set `narration` ONLY on the FIRST clip of the span (`span_clips[0]`); every later clip of the
+span gets `"narration": null`. **Repeating the same narration dict on several clips of a span
+is a validation error** — the audio-producer's plan (`narration_meta.json`, one block per
+passage, `starts_on = span_clips[0]`) and `pipeline/narration_check.py` reject it, because a
+passage planned twice is what produced the double narration.
 `estimated_duration` = `word_count` / 2.5 (narration pace ~150 wpm = 2.5 words/sec).
 
 ### audio.narration — No Overlap with Dialogue
@@ -156,8 +164,25 @@ stop BEFORE that clip. Narration and dialogue must NEVER play simultaneously.
 Pattern: narration over visual-only clips → pause → dialogue clip → pause → narration resumes.
 
 ### audio.use_native_h3_audio
-Almost always `false`. Native H3 audio quality is unreliable.
+Almost always `false`. Native H3 audio quality is unreliable, and assembly strips the clip's
+own track anyway (`KEEP_NATIVE_AMBIENCE=1` keeps it as a bed only when no speech is detected).
 Only set `true` for ambient-only clips with no dialogue.
+
+### pov_character / audience_feels — optional per-shot emotional fields (Director preset)
+`pov_character` is the character whose experience the shot carries (copied from the scene
+unless the shot changes POV — a reverse on the listener makes the listener the POV);
+`audience_feels` is what that face should make us feel. QA compares the POV face against
+`audience_feels`; a shot whose face cannot be read (wide, back view) carries the scene value
+but no reaction claim. The scene's `linger` becomes its own held reaction shot
+(`edit.relation_to_prev: "reaction"`, no dialogue, lips closed).
+
+### audio.music_cue — optional per-shot score instruction (Director preset)
+`{"action": "start" | "continue" | "swell" | "stop" | "silence", "mood": "...", "intensity": 0.0-1.0}`,
+derived from the scene's `music_cue`: the cue's `start` beat lands on the shot that shows it
+(`"start"`), its `stop` beat on the stopping shot (`"stop"`), every shot between is `"continue"`
+(or `"swell"` on the turn), shots outside the span are `"silence"`. The Music Composer reads
+this (plus `final/timeline.json`) to write `music/music_cues.json`; the score is rendered by
+`music_render.py` and laid in by `assemble.py` — never by H3.
 
 ### edit — REQUIRED on every shot (editing-grammar skill)
 - `handle_head_s` / `handle_tail_s` ≥ 1.0. `duration_seconds` INCLUDES them. A dialogue

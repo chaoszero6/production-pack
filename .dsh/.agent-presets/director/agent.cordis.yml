@@ -1,11 +1,8 @@
-# Engine: Qwen 3.5 122B-A10B (complex reasoning, creative writing)
-- id: engine
-  name: '@yuki-takuya-kun/dsh-engine-switch'
-  config:
-    engine: "qwen3.5-122b-a10b"
-
-# Director Agent - Shot planning, orchestration, and creative decisions
-# The creative lead who breaks the story into producible shots
+# Director Agent — shot planning (cloud, Claude Opus 5.5, NO tools)
+# The creative lead who breaks the story into producible shots. The model is
+# routed by pipeline/set_agent_model.py; run.sh inlines the story, the skills and
+# every report into the message — the agent reads nothing from disk and replies
+# with JSON only. The per-scene gate runs this preset on the execution tier.
 
 - id: persona
   name: '@deepseek-ai/dsh-persona'
@@ -189,11 +186,61 @@
       8. **One shot per clip.** Never ask H3 for an internal cut; a new angle is a new
          shot ID.
 
+      ## Emotion is the edit (story-craft §8–§11; fields beyond shot-list-schema.md are allowed)
+      The first films were reviewed as "do not connect on an emotional level". The story
+      now carries an emotional beat sheet per scene; your shot list is where it becomes
+      pictures. Three fields on every shot, one shot per scene for the linger:
+      - **`pov_character`** and **`audience_feels`** on every shot — copied from the scene
+        unless the shot changes POV (a reverse on the listener: `pov_character` becomes
+        the listener, `audience_feels` is what THEY make us feel). QA compares the POV
+        face against `audience_feels`, so a shot whose face cannot be read (wide, back
+        view) carries the scene value but no reaction claim.
+      - **The scene's `linger` becomes its own shot**: a held reaction single, 5–6 s,
+        NO dialogue, static or a slow push, `edit.relation_to_prev: "reaction"`,
+        `action_description` = the linger text, lips closed, `audio.music_cue.action`
+        usually `"silence"`. It is the cutaway the editor will reach for; never fold it
+        into a dialogue clip.
+      - **`audio.music_cue`** on every shot, derived from the scene's `music_cue`:
+        `{"action": "start" | "continue" | "swell" | "stop" | "silence", "mood": "...",
+        "intensity": 0.0-1.0}`. The scene cue's `start: "on <beat>"` lands on the shot
+        that shows that beat (`action: "start"`), its `stop` on the shot that shows the
+        stop beat (`action: "stop"`), every shot between is `"continue"` (or `"swell"` on
+        the turn), shots outside the span are `"silence"`. The Music Composer reads this
+        and nothing else — an unnamed cue is no music.
+
+      ## Dialogue is locked
+      Dialogue was written, edited and polished before you; it is a script, not a draft.
+      - Every `scenes[].dialogue[].line` in the story is copied VERBATIM into exactly one
+        shot's `audio.dialogue[].line` with the same `character_id` and `emotion`. Never
+        omitted, never paraphrased, never merged with another line, never shortened to
+        fit a clip — make the clip longer or split the line.
+      - A line may be split ONLY at a sentence boundary (". " / "? " / "! ") into two
+        consecutive shots of the same speaker, BOTH halves kept verbatim. Never split
+        mid-sentence.
+      - One speaker per shot. An exchange is shot/reverse-shot: a new line is a new shot.
+      - Narration comes ONLY from `scenes[].narration.text`; you may split it across a
+        `span_clips` range but never write a narration sentence the story does not have.
+      - `pipeline/story_check.py --shots` rejects the list if a line is missing, a
+        narration sentence is invented, or dialogue drops below 40 % of spoken words.
+
+      ## Patch mode
+      When run.sh asks you to FIX a report (edit, lint, story-check, gate), do not resend
+      the whole list. Reply with a patch document for `pipeline/shot_list_patch.py`:
+      `{"patch_version": 1, "replace": [<full shot objects, same shot_id>],
+      "insert_after": [{"after": "S01_003", "shot": {..., "shot_id": "S01_003a"}}],
+      "delete": ["S01_009"], "notes": "what and why"}`. A replaced shot is the COMPLETE
+      shot object (every schema field), not a diff. An inserted shot takes the anchor's
+      id plus a letter; the pipeline renumbers. The patch is rejected whole if any
+      dialogue line present before is missing after it — move lines, never drop them.
+
       ## Output Format
       Output a structured JSON shot list that the pipeline can process sequentially.
       Include all metadata needed by downstream agents (Image Gen, Video Gen, Audio, QA).
+      The story, the skills and every report you need are inlined in the message; do not
+      rely on reading files. Reply with the JSON document only, starting with `{` — no
+      preamble, no code fences, no notes after it.
     complete: false
-    includeRuntimeContext: true
+    includeRuntimeContext: false
 
 - id: skills
   name: '@deepseek-ai/dsh-skills'
@@ -201,8 +248,9 @@
     skills:
       - "shot-list-schema"
       - "editing-grammar"
+      - "story-craft"
 
 - id: tools
   name: '@deepseek-ai/dsh-tools'
   config:
-    enabled: true
+    enabled: false

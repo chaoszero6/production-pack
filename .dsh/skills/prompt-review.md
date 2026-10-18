@@ -86,7 +86,7 @@ overall_soundscape:
 {Ambient/physical sounds. NOT narration — narration is post-only.}
 
 non_diegetic_music:
-{Score description — instrumentation, tempo, dynamics.}
+none — the score is added in post (assemble.py)
 ```
 
 **For i2va / fl2va**, use timecoded segments:

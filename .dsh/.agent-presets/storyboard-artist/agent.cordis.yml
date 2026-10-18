@@ -1,9 +1,3 @@
-# Engine: Qwen 3.8 27B (fast execution, tool use, multimodal)
-- id: engine
-  name: '@yuki-takuya-kun/dsh-engine-switch'
-  config:
-    engine: "qwen3.8-27b"
-
 # Storyboard Artist Agent - Visual pre-production storyboards
 # Creates quick storyboard panels to validate shot flow before expensive generation
 

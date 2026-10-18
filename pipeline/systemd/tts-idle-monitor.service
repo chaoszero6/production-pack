@@ -1,7 +1,7 @@
 # /etc/systemd/system/tts-idle-monitor.service
 # Installed by pipeline/systemd/install_units.sh (production pack).
 [Unit]
-Description=Production Pack monitor — LLM crash/hang recovery + VRAM reclaim from idle generation services
+Description=Production Pack monitor — VRAM reclaim from idle generation services (no local LLM)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,13 +9,9 @@ Wants=network-online.target
 Type=simple
 Environment=PACK_DIR=/root/production_pack
 # One pass every 30 s:
-#   llm_monitor.py   — the local LLM (strata-swift-iq3-xxs, :8321) must be serving
-#                      whenever no generation phase holds the GPU: restarts it after a
-#                      crash, restarts it when hung, never while ComfyUI/TTS own the GPU
 #   idle_monitor.py  — a TTS engine / ComfyUI that is active-but-dead during its phase
-#                      is stopped and the GPU handed back to the LLM
+#                      is stopped so the GPU is free for the next phase
 ExecStart=/bin/bash -c 'while true; do \
-  python3 /root/production_pack/pipeline/llm_monitor.py >> /root/production_pack/output/llm_monitor.log 2>&1; \
   python3 /root/production_pack/pipeline/idle_monitor.py --service cosyvoice     --port 50000 --health-path / --idle-seconds 120 --phase audio >> /root/production_pack/output/idle_monitor.log 2>&1; \
   python3 /root/production_pack/pipeline/idle_monitor.py --service chatterbox-tts --port 9882 --health-path /health --idle-seconds 120 --phase audio >> /root/production_pack/output/idle_monitor.log 2>&1; \
   python3 /root/production_pack/pipeline/idle_monitor.py --service kokoro-tts    --port 9881 --health-path /health --idle-seconds 120 --phase audio >> /root/production_pack/output/idle_monitor.log 2>&1; \

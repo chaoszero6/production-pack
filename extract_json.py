@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract a JSON object from messy agent output — nested, fenced, or prose-wrapped.
+r"""Extract a JSON object from messy agent output — nested, fenced, or prose-wrapped.
 
 WHY THIS EXISTS
 run.sh's historical extractor was the regex `\{(?:[^{}]|\{[^{}]*\})*\}`, which only matches

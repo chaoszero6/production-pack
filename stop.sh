@@ -3,8 +3,8 @@
 # pack's monitors. Nothing is deleted; `./launch_resume.sh <run_dir>` picks up where it left off.
 #
 #   ./stop.sh                 stop everything (run + monitors), cancel the ComfyUI queue
-#   ./stop.sh --keep-monitor  leave tts-idle-monitor.service (LLM crash/hang recovery) running
-#   ./stop.sh --gpu llm|none  after stopping, hand the GPU to the LLM / park every owner
+#   ./stop.sh --keep-monitor  leave tts-idle-monitor.service (idle VRAM reclaim) running
+#   ./stop.sh --gpu comfyui|none  after stopping, hand the GPU to ComfyUI / park every owner
 #                             (default: leave the current owner as it is)
 set -uo pipefail
 PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,12 +59,12 @@ term_then_kill "render helpers" \
 term_then_kill "pack watchers" \
     $(pgrep -f "$PACK_DIR/(monitor_resume|watch_run|watchdog)[.]sh" || true) \
     $(pgrep -f "$PACK_DIR/pipeline/(vram_supervisor|vram_monitor)[.]sh" || true) \
-    $(pgrep -f "$PACK_DIR/pipeline/(idle_monitor|llm_monitor|vram_watchdog)[.]py" || true)
+    $(pgrep -f "$PACK_DIR/pipeline/(idle_monitor)[.]py" || true)
 rm -f "$OUT/run_monitor.pid"
 
 if [ "$KEEP_MONITOR" = "false" ]; then
     if systemctl is-active --quiet tts-idle-monitor.service 2>/dev/null; then
-        log "stopping tts-idle-monitor.service (LLM crash/hang monitor) — restart with: systemctl start tts-idle-monitor"
+        log "stopping tts-idle-monitor.service (idle VRAM reclaim) — restart with: systemctl start tts-idle-monitor"
         systemctl stop tts-idle-monitor.service 2>/dev/null || true
     fi
 fi
@@ -91,7 +91,7 @@ STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 
 echo
 log "stopped. Still running:"
-pgrep -af 'bash run[.]sh|bin[.]ts --profile headless|pipeline/.*[.]py' | grep -v -E 'pgrep|llm_ready_notify' | cut -c1-120 || true
+pgrep -af 'bash run[.]sh|bin[.]ts --profile headless|pipeline/.*[.]py' | grep -v pgrep | cut -c1-120 || true
 log "GPU: $(bash "$PACK_DIR/pipeline/gpu_owner.sh" status 2>/dev/null | head -1 || echo unknown)"
 [ -n "$RUN_DIR" ] && log "resume with: ./launch_resume.sh $RUN_DIR"
 exit 0

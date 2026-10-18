@@ -1,97 +1,78 @@
-# Model Configuration — LOCAL Strata LLM for reasoning + execution, cloud for vision
+# Model Configuration — cloud only, three tiers, no local LLM (decision 2026-10-18)
 #
-# Since 2026-10-11 every text agent runs on the local Qwen 3.8 Flash Next 125B
-# served by Strata Swift (unit strata-swift-iq3-xxs, OpenAI API on :8321,
-# dsh provider "strata-swift", model swift-1.5-iq3_xxs, 262k context,
-# maxTokens 131072, effort xhigh). It is TEXT ONLY, so qa-inspector (the one
-# vision agent) stays on OpenRouter gemini-3-flash-preview.
+# THIS FILE IS DOCUMENTATION. The routing that actually runs lives ONLY in
+# pipeline/set_agent_model.py (tier table, KNOWN_MODELS, env overrides). run.sh
+# calls it before EVERY dsh launch and it rewrites the agent-default-model
+# section of /root/.dsh/settings.yaml, so a route can never be inherited from
+# the previous call. A routing error (exit 2) or a provider error (exit 3 —
+# missing key, failed /models probe) HALTS the run (HALT_FOR_REVIEW.json +
+# Discord); nothing reroutes, nothing retries.
 #
-# The GPU has exactly ONE owner at a time — Strata LLM | ComfyUI | TTS cluster —
-# enforced by systemd Conflicts= (pipeline/systemd/). The LLM holds ~31.8 GB of
-# the 32.6 GB card and takes ~2 min to start; pipeline/gpu_owner.sh switches
-# owner and waits, pipeline/llm_monitor.py restarts the LLM after a crash/hang
-# whenever no other owner holds the GPU.
+# There is no local LLM any more: the GPU alternates between ComfyUI and the
+# TTS cluster only (pipeline/gpu_owner.sh comfyui|tts|none|status).
 #
-# dsh-engine-switch plugin is NOT installed (404s on npm), so per-preset
-# engine declarations in agent.cordis.yml are inert. run.sh rewrites the
-# agent-default-model section of ~/.dsh/settings.yaml before each agent call
-# via pipeline/set_agent_model.py (single source of truth, reads pipeline/local_llm.py).
+# API keys: /root/.hermes/.env (ANTHROPIC_API_KEY, OPENCODE_GO_API_KEY) or the
+# environment. Providers must also be registered for dsh in
+# /root/.dsh/profiles/headless/cordis.patch.yml under `llm-pi-ai -> providers`:
+# `anthropic` is a built-in pi-ai provider (api anthropic-messages); the
+# OpenCode Go entries are custom openai-completions providers with base URL
+# https://opencode.ai/zen/go/v1.
+#
+# Spend: pipeline/cloud_ledger.py writes <run_dir>/cloud_usage.json; caps
+# CLOUD_MAX_CALLS_ANTHROPIC (12), CLOUD_MAX_USD_EST_ANTHROPIC (9),
+# CLOUD_MAX_CALLS_OPENCODE (1500) — reaching a cap halts; Discord note at 50 % / 80 %.
 
-routing:
-  reasoning_agents:
-    - story-creator
-    - director
-    - screenplay-reviewer
-    - character-designer
-    - location-designer
-  reasoning_provider: "strata-swift"
-  reasoning_model: "swift-1.5-iq3_xxs"
-  reasoning_effort: "xhigh"
+tiers:
+  creative:
+    agents: [story-creator, story-editor, director]
+    provider: "anthropic"
+    model: "claude-opus-5-5"
+    effort: "high"              # Opus 5.5: thinking always on; effort is the only depth control
+    override_env: [DSH_CREATIVE_PROVIDER, DSH_CREATIVE_MODEL, DSH_CREATIVE_EFFORT]
 
-  execution_agents:
-    - storyboard-artist
-    - image-generator
-    - audio-producer
-    - music-composer
-    - video-generator
-    - pipeline-orchestrator
-    - subtitle-generator
-    - post-production-editor
-  execution_provider: "strata-swift"
-  execution_model: "swift-1.5-iq3_xxs"
-  execution_effort: "xhigh"
+  vision:
+    agents: [qa-inspector]      # the ONLY agent that reads images
+    provider: "opencode-go-deepseek"
+    model: "gemini-3.8-flash"
+    effort: "high"
+    override_env: [DSH_VISION_PROVIDER, DSH_VISION_MODEL, DSH_VISION_EFFORT]
 
-  vision_agents:
-    - qa-inspector
-  vision_provider: "openrouter"
-  vision_model: "google/gemini-3-flash-preview"
-  vision_effort: "high"
+  execution:
+    agents: [screenplay-reviewer, character-designer, location-designer, storyboard-artist,
+             image-generator, video-generator, audio-producer, music-composer,
+             pipeline-orchestrator, post-production-editor, dialogue-polish]
+    provider: "opencode-go-deepseek"
+    model: "deepseek-v4.1-flash"
+    effort: "high"
+    override_env: [DSH_EXECUTION_PROVIDER, DSH_EXECUTION_MODEL, DSH_EXECUTION_EFFORT]
+    model_overrides:
+      dialogue-polish: "gemini-3.8-flash"   # same provider, different model
+
+# DSH_FORCE_TIER=execution routes ONE call onto the execution tier regardless of
+# preset — run.sh uses it for the Director's mechanical per-scene gate so a lint
+# fix never spends Opus. A provider override must name the model explicitly
+# (DSH_<TIER>_PROVIDER without DSH_<TIER>_MODEL is a routing error).
 
 providers:
-  strata-swift:
-    base_url: "http://127.0.0.1:8321/v1"
-    model: "swift-1.5-iq3_xxs"
-    service: "strata-swift-iq3-xxs.service"
-    health: "http://127.0.0.1:8321/v1/models"
+  anthropic:
+    base_url: "https://api.anthropic.com"
+    models_url: "https://api.anthropic.com/v1/models"
+    key_env: "ANTHROPIC_API_KEY"
+    api: "anthropic-messages"   # built-in pi-ai provider
+    known_models: [claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5]
     input: [text]
-    context_window: 262144
-    max_tokens: 131072
-    vram_gb: 31.8
-    ram_gb: 40
-    start_seconds: 120            # unit TimeoutStartSec=300
-    thinking_format: "qwen"
-    exclusive_with: [comfyui.service, tts-cluster.service]
+    role: "creative tier"
 
-  openrouter:
-    base_url: "https://openrouter.ai/api/v1"
-    key_env: "OPENROUTER_API_KEY"
-    model: "google/gemini-3-flash-preview"
-    input: [text, image]
-    role: "QA vision only"
-
-  # Retired local providers — units are MASKED on 207, kept for reference only
-  ninfer:
-    base_url: "http://127.0.0.1:8080/v1"
-    model: "qwen3.8-27b"
-    service: "ninfer.service"
-    retired: true
-  ninfer-us:
-    base_url: "http://127.0.0.1:8081/v1"
-    model: "qwen38-huihui-abliterated-ninfer-nvfp4"
-    service: "ninfer-us.service"
-    retired: true
-
-  opencode-go-deepseek-pro:
-    base_url: "https://opencode.ai/zen/go/v1"
-    key_env: "OPENCODE_GO_API_KEY"
-    model: "deepseek-v4-pro"
-    input: [text, image]
-    context_window: 1000000
-    role: "cloud fallback (reasoning)"
   opencode-go-deepseek:
     base_url: "https://opencode.ai/zen/go/v1"
+    models_url: "https://opencode.ai/zen/go/v1/models"
     key_env: "OPENCODE_GO_API_KEY"
-    model: "deepseek-v4.1-flash"
-    input: [text, image]
+    api: "openai-completions"   # custom provider in cordis.patch.yml
+    known_models: [deepseek-v4.1-flash, gemini-3.8-flash, deepseek-v4-flash-vision-exp]
+    input: [text, image]        # gemini-3.8-flash carries the vision tier
     context_window: 1000000
-    role: "cloud fallback (execution)"
+    role: "execution + vision tiers (prepaid pool: call-capped, costed at 0)"
+
+# Tools: `set_agent_model.py --list` (tiers after env overrides),
+# `--dry-run-all` (every preset's route), `--probe-all` (GET /models on every
+# provider in use — run.sh step 0 halts on a failure), `<preset> --show`.

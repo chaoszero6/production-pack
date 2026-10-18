@@ -40,11 +40,10 @@ fi
 if [ -x "$PACK_DIR/stop.sh" ]; then
     "$PACK_DIR/stop.sh" --gpu none
 fi
-for u in strata-swift-iq3-xxs.service comfyui.service tts-cluster.service tts-idle-monitor.service; do
+for u in comfyui.service tts-cluster.service tts-idle-monitor.service strata-swift-iq3-xxs.service strata-orca-iq3-xxs.service; do
     systemctl stop "$u" 2>/dev/null || true
 done
 systemctl reset-failed tts-cluster.service 2>/dev/null || true
-touch "$PACK_DIR/output/.llm_parked" 2>/dev/null || true
 log "GPU: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || echo '?') used"
 
 # 3. flush and power off

@@ -104,6 +104,50 @@ hf_get() {
     N_OK=$((N_OK+1)); BYTES=$((BYTES+want))
 }
 
+# --- hf_get_any <dest-subdir> <repo> <subpath> [dest-filename] ---------------
+# Same as hf_get for files whose reference byte count was not recorded (the
+# MMAudio weights were present on the render server before this manifest was
+# written). Downloads when absent, verifies presence + non-empty only, and
+# prints the size it got so the exact count can be pinned into hf_get later.
+hf_get_any() {
+    local sub="$1" repo="$2" path="$3" name="${4:-$(basename "$3")}"
+    local dir="$MODEL_DIR/$sub"
+    local target="$dir/$name"
+    mkdir -p "$dir" 2>/dev/null
+
+    local have; have="$(fsize "$target")"
+    if [ "$have" -gt 0 ]; then
+        skip "$name  ($(human "$have"), size not pinned)"; N_SKIP=$((N_SKIP+1)); N_OK=$((N_OK+1)); BYTES=$((BYTES+have)); return 0
+    fi
+
+    local url="https://huggingface.co/$repo/resolve/main/$path"
+    if [ "$DRY" = "1" ]; then
+        echo "  would get $repo/$path -> $sub/$name  (size not pinned)"
+        N_MISS=$((N_MISS+1)); return 0
+    fi
+
+    echo "  fetching  $name  (size not pinned)"
+    local tmp="$target.part"
+    rm -f "$tmp"
+    local auth=(); [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL --retry 3 --retry-delay 3 --connect-timeout 30 \
+             -A "$UA" "${auth[@]}" ${CURL_OPTS:-} -o "$tmp" "$url" >/dev/null 2>&1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --tries=3 -O "$tmp" "$url" 2>/dev/null
+    else
+        fail "$name — neither curl nor wget found"; N_MISS=$((N_MISS+1)); REQ_MISS=$((REQ_MISS+1)); return 1
+    fi
+
+    local got; got="$(fsize "$tmp")"
+    if [ "$got" -le 0 ]; then
+        fail "$name  (download empty)"; rm -f "$tmp"; N_MISS=$((N_MISS+1)); REQ_MISS=$((REQ_MISS+1)); return 1
+    fi
+    mv -f "$tmp" "$target" && ok "$name  ($(human "$got"), $got bytes — pin this in hf_get)" \
+        || { fail "$name — move failed"; N_MISS=$((N_MISS+1)); REQ_MISS=$((REQ_MISS+1)); return 1; }
+    N_OK=$((N_OK+1)); BYTES=$((BYTES+got))
+}
+
 # --- rife: the frame-interpolation node auto-downloads, but pre-seed it ------
 rife_get() {
     local url="https://github.com/Fannovel16/ComfyUI-Frame-Interpolation/releases/download/models/rife47.pth"
@@ -165,6 +209,19 @@ models() {
     hf_get   675509688 vae             Comfy-Org/Qwen-Image-2.1 \
            vae/qwen_image_2.1_vae_bf16.safetensors
 
+    echo "  ${c_b}-- ACE-Step 1.5 (music) --${c_0}"
+    # music_render.py: CKPT (core ComfyUI >= 0.39 nodes, turbo all-in-one checkpoint)
+    hf_get 10025478736 checkpoints Comfy-Org/ace_step_1.5_ComfyUI_files \
+           checkpoints/ace_step_1.5_turbo_aio.safetensors
+
+    echo "  ${c_b}-- MMAudio (sfx) --${c_0}"
+    # sfx_render.py: MMA_MODEL / MMA_VAE / MMA_SYNC / MMA_CLIP (custom node comfyui-mmaudio,
+    # --optional). Present on the reference machine before this manifest; sizes not pinned.
+    hf_get_any mmaudio Kijai/MMAudio_safetensors mmaudio_large_44k_v2_fp16.safetensors
+    hf_get_any mmaudio Kijai/MMAudio_safetensors mmaudio_vae_44k_fp16.safetensors
+    hf_get_any mmaudio Kijai/MMAudio_safetensors mmaudio_synchformer_fp16.safetensors
+    hf_get_any mmaudio Kijai/MMAudio_safetensors apple_DFN5B-CLIP-ViT-H-14-384_fp16.safetensors
+
     echo "  ${c_b}-- 4K60 upscale --${c_0}"
     rife_get
 }
@@ -177,7 +234,9 @@ models() {
 # KSamplerSelect, LoadAudio, LoadImage, SaveVideo, CreateVideo, ResolutionSelector,
 # VAEDecode, VAEDecodeAudio, ImageFromBatch, MiniMaxH3ReferenceToVideo,
 # MiniMaxH3ImageToVideo, QwenImage21Cache, TextEncodeQwenImage21, KSampler,
-# EmptyLatentImage, SaveImage.  These three are NOT core:
+# EmptyLatentImage, SaveImage, and (ComfyUI >= 0.39) the ACE-Step 1.5 music nodes
+# CheckpointLoaderSimple, TextEncodeAceStepAudio1.5, ConditioningZeroOut,
+# ModelSamplingAuraFlow, EmptyAceStep1.5LatentAudio, SaveAudio.  These three are NOT core:
 nodes() {
     echo; echo "${c_b}ComfyUI custom nodes${c_0}  ->  $NODES_DIR"
     # Cloned into the directory name the reference machine uses (ComfyUI loads
@@ -197,6 +256,8 @@ nodes_optional() {
     git_get https://github.com/M1kep/ComfyLiterals                        ComfyLiterals
     git_get https://github.com/princepainter/Comfyui-PainterVRAM          Comfyui-PainterVRAM
     git_get https://github.com/LAOGOU-666/Comfyui-Memory_Cleanup          comfyui_memory_cleanup
+    # sfx_render.py (MMAudio v2v foley) — the only optional node a runtime builder calls
+    git_get https://github.com/kijai/ComfyUI-MMAudio                      comfyui-mmaudio
 }
 
 # =============================================================================
@@ -233,6 +294,7 @@ check() {
       "14230280616|diffusion_models|qwen_image_2.1_bf16.safetensors"
       "17534334616|text_encoders|qwen3vl_8b_bf16.safetensors"
       "675509688|vae|qwen_image_2.1_vae_bf16.safetensors"
+      "10025478736|checkpoints|ace_step_1.5_turbo_aio.safetensors"
     )
     local total=0
     for e in "${spec[@]}"; do
@@ -248,9 +310,17 @@ check() {
     done
     local rf="$NODES_DIR/comfyui-frame-interpolation/ckpts/rife/rife47.pth"
     if [ "$(fsize "$rf")" = 21344827 ]; then ok "rife47.pth"; else miss "rife47.pth"; missing=$((missing+1)); fi
+    # MMAudio (sfx_render.py): presence only, sizes not pinned
+    for n in mmaudio_large_44k_v2_fp16.safetensors mmaudio_vae_44k_fp16.safetensors \
+             mmaudio_synchformer_fp16.safetensors apple_DFN5B-CLIP-ViT-H-14-384_fp16.safetensors; do
+        local mp="$MODEL_DIR/mmaudio/$n"
+        local mh; mh="$(fsize "$mp")"
+        if [ "$mh" -gt 0 ]; then ok "mmaudio/$n  ($(human "$mh"))"; total=$((total+mh));
+        else miss "mmaudio/$n"; missing=$((missing+1)); fi
+    done
 
     echo; echo "${c_b}Custom nodes${c_0}"
-    for n in comfyui-videohelpersuite comfyui_nvidia_rtx_nodes ComfyUI-Frame-Interpolation; do
+    for n in comfyui-videohelpersuite comfyui_nvidia_rtx_nodes ComfyUI-Frame-Interpolation comfyui-mmaudio; do
         if [ -d "$NODES_DIR/$n" ]; then ok "$n"; else miss "$n"; missing=$((missing+1)); fi
     done
 
@@ -301,13 +371,15 @@ cat <<'TXT'
     CosyVoice 3  port 9880   HF FunAudioLLM/CosyVoice2-0.5B (~4.5 GB)
     Kokoro       port 9881   HF hexgrad/Kokoro-82M        (~340 MB)
     Orpheus 3B   port 9883   GGUF Q8_0, load on demand    (~3.5 GB)
-  config/pipeline.yml documents the endpoints; services are started by
-  pipeline/services.sh (see pipeline/phase_config.yaml).
+  config/pipeline.yml documents the endpoints; the GPU is handed between
+  ComfyUI and the TTS cluster by pipeline/gpu_owner.sh (systemd units and
+  Conflicts= drop-ins from pipeline/systemd/install_units.sh).
 
   workflows/*.json are example/preview templates. The pipeline builds its
   graphs in code (pipeline/generate_video_direct.py, generate_character_sheets.py,
-  generate_location_refs.py, upscale_clip.py), so the optional nodes above
-  are not required to run a production.
+  generate_location_refs.py, upscale_clip.py, music_render.py, sfx_render.py),
+  so the optional nodes above are not required to run a production — except
+  comfyui-mmaudio, which sfx_render.py (per-clip foley) needs: ./setup.sh --optional
 
   API keys are read from the environment at runtime (OPENROUTER_API_KEY,
   OPENCODE_GO_API_KEY) — see key_env in config/models.yml. Nothing is stored

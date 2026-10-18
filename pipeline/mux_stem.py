@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """mux_stem.py <clip_dir> — give clip.mp4 its dialogue stem as the audio track.
 
+PREVIEW / QA ONLY — assembly never reads this track. pipeline/assemble.py takes picture
+only from the clips and places clips/<SID>/dialogue.wav on the film timeline itself.
+
 The i2va graph writes video only (the native H3 track is never used), so a clip previewed
 straight from clips/<SID>/clip.mp4 was silent even though the stem drove the mouth. This muxes
 dialogue.wav at dialogue_meta.json's anchor_s (padded with silence before and after to the
-clip length) so previews, QA and assembly all carry the same approved audio at the same
-offset. The video stream is copied untouched; the video-only original is kept as
-clip_video_only.mp4. Idempotent: a clip that already carries the stem is left alone.
+clip length) so previews and QA hear the same approved audio at the same offset. The video
+stream is copied untouched; the video-only original is kept as clip_video_only.mp4.
+Idempotent: a clip that already carries the stem is left alone.
 Exit 0 = muxed or nothing to do, 1 = ffmpeg failed.
 """
 import json

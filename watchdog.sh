@@ -7,7 +7,7 @@
 #   2. If pipeline down but an orphan agent has a ComfyUI job → wait
 #      (max 15 min) so the render isn't wasted
 #   3. If pipeline down and nothing in flight → kill leftovers, resume
-#   4. Exits when final/movie_4k60.mp4 exists
+#   4. Exits when final/movie_4k.mp4 exists
 #
 # Usage:
 #   ./watchdog.sh <story.md>         (new production)
@@ -39,7 +39,7 @@ find_run_dir() {
 is_movie_done() {
     local run_dir
     run_dir=$(find_run_dir)
-    [ -n "$run_dir" ] && [ -f "$run_dir/final/movie_4k60.mp4" ]
+    [ -n "$run_dir" ] && [ -f "$run_dir/final/movie_4k.mp4" ]
 }
 
 # ── Check if run.sh is alive ─────────────────────────────────

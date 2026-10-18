@@ -15,24 +15,34 @@ services:
     health_check_interval: 5  # seconds
     restart_timeout: 60       # seconds
 
-  # LLM agents run on cloud (OpenCode Go) — no local LLM during production
-  # RTX 5090 is 100% dedicated to ComfyUI. See config/models.yml for routing.
-  # Local LLMs (llama-qwen35-122b, qwen3.8-27b-q6k-cuda) are STOPPED during runs.
-  cloud_reasoning:
-    provider: "opencode-go-deepseek-pro"
-    model: "deepseek-v4-pro"
+  # Every agent runs in the cloud (decision 2026-10-18) — there is NO local LLM.
+  # The GPU alternates between ComfyUI and the TTS cluster only. The routing that
+  # runs is pipeline/set_agent_model.py; config/models.yml documents it. These
+  # three entries are documentation of the tier defaults.
+  cloud_creative:
+    agents: [story-creator, story-editor, director]
+    provider: "anthropic"
+    model: "claude-opus-5-5"
+    effort: "high"
+    base_url: "https://api.anthropic.com"
+    key_env: "ANTHROPIC_API_KEY"
+
+  cloud_vision:
+    agents: [qa-inspector]
+    provider: "opencode-go-deepseek"
+    model: "gemini-3.8-flash"
+    effort: "high"
     base_url: "https://opencode.ai/zen/go/v1"
-    input: [text]           # NO image support
-    context_window: 1000000
-    role: "reasoning agents (story, director, reviewer, character/location design)"
+    key_env: "OPENCODE_GO_API_KEY"
+    input: [text, image]    # the only tier that reads images
 
   cloud_execution:
+    agents: "everything else (dialogue-polish overrides the model to gemini-3.8-flash)"
     provider: "opencode-go-deepseek"
     model: "deepseek-v4.1-flash"
+    effort: "high"
     base_url: "https://opencode.ai/zen/go/v1"
-    input: [text, image]    # Accepts images — QA vision
-    context_window: 1000000
-    role: "execution agents + QA vision"
+    key_env: "OPENCODE_GO_API_KEY"
 
   chatterbox:
     host: "127.0.0.1"
@@ -106,7 +116,7 @@ video_generation:
 # QA settings
 qa:
   max_retries: 3
-  vision_model: "deepseek-v4-flash-vision-exp"  # ONLY vision model on OpenCode Go
+  vision_model: "gemini-3.8-flash"  # vision tier (opencode-go-deepseek) — see pipeline/set_agent_model.py
   checks:
     - hand_anomalies
     - face_distortion
@@ -141,8 +151,8 @@ audio:
 
 # Pipeline orchestration
 orchestration:
-  cloud_llm: true                  # All agents on cloud — no local LLM needed
-  stop_local_llms: true            # Stop local LLMs to free full VRAM for ComfyUI
+  cloud_llm: true                  # All agents on cloud — there is no local LLM
+  stop_local_llms: true            # gpu_owner.sh stops any retired LLM unit before a hand-over
   auto_restart_comfyui: true
   monitoring_interval: 2           # seconds
   clip_generation_timeout: 600     # seconds (10 min per clip incl. upscale)

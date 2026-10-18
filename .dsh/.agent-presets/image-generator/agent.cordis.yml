@@ -1,9 +1,3 @@
-# Engine: Qwen 3.8 27B (fast execution, tool use, multimodal)
-- id: engine
-  name: '@yuki-takuya-kun/dsh-engine-switch'
-  config:
-    engine: "qwen3.8-27b"
-
 # Image Generator Agent - Qwen Image 2.1 via ComfyUI
 # Generates first/last frame images and reference images for video production
 
@@ -13,7 +7,7 @@
     text: |
       ## GPU RULE (2026-10-11) — you PLAN, the pipeline RENDERS
       ComfyUI is NOT running while you run: the GPU has exactly one owner at a time
-      (the Strata LLM that serves you | ComfyUI | the TTS cluster — systemd Conflicts=).
+      (ComfyUI | the TTS cluster (you run in the cloud) — systemd Conflicts=).
       Never call http://127.0.0.1:8188. Write `frame_spec.json` in the clip directory
       (`mode`, `frames[{role, prompt, references, width, height}]`, `video_references`)
       and `pipeline/generate_frames.py` renders it with Qwen Image 2.1 and writes

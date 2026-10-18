@@ -36,7 +36,7 @@ duplicated frame is dropped inside the graph (ImageFromBatch), matching
 upscale_clip.py exactly so the two stay consistent.
 
 Usage:
-  python3 upscale_film.py --source final/movie.mp4 --out final/movie_4k60.mp4 \
+  python3 upscale_film.py --source final/movie.mp4 --out final/movie_4k.mp4 \
                           --concat-list final/concat.txt
   python3 upscale_film.py ... --cuts final/cuts.json        # [0, 192, 311, ...]
   python3 upscale_film.py ... --max-chunks 2                # smoke test

@@ -4,243 +4,262 @@
 
 ## Architecture Overview
 
-This production pack orchestrates 14 specialized agents to produce a complete animated movie
-with consistent characters, continuity, dialogues, narration, BGM, and subtitles.
+This production pack orchestrates 16 specialized agent presets to produce a complete animated movie
+with consistent characters, continuity, dialogues, narration, BGM, SFX and subtitles.
 Each agent is a dsh preset in `.dsh/.agent-presets/` with skills in `.dsh/skills/`.
+Every agent runs in the cloud (three tiers — see "Model Routing"); the GPU on 207 is used only
+by ComfyUI and the TTS cluster. Agents reason and write files; the pipeline renders.
 
 ## Pipeline Flow
 
 ```
 ═══════════════════════════════════════════════════════════════
- PHASE A — REASONING  [cloud: deepseek-v4-pro, effort=high]
+ PHASE 1 — PRE-PRODUCTION  [cloud]
 ═══════════════════════════════════════════════════════════════
 
-  Story Creator → Director → Character Designer + Location Designer
-                                ↓
-                        Storyboard Artist
+  0   Cloud preflight (set_agent_model.py --probe-all; a failed probe halts)
+  1a  Story Creator      [creative: anthropic/claude-opus-5-5]  REWRITES the draft
+  1a-edit   Story Editor [creative]  one call: critique scores + revised story
+  1a-dialogue Dialogue Polish [execution: gemini-3.8-flash] lines only → LOCKED
+  1b  Director           [creative]  shot list; locked dialogue copied verbatim
+  1b-validate / 1b-edit / 1b-lint   fix rounds ≤ 2 each, PATCH mode
+  1b-dialogue  story_check.py --story --shots (every locked line present, share ≥ 55 %)
+  1c/1d Character Designer + Location Designer [execution] → sheets rendered on ComfyUI
+  1e  Audio Producer [execution] casts → tts_render.py + voice_lineup.py (TTS owns GPU)
+  (Storyboard Artist is available; run.sh does not call it)
 
 ═══════════════════════════════════════════════════════════════
- PER-CLIP LOOP
+ PHASE 2 — PER-CLIP LOOP
 ═══════════════════════════════════════════════════════════════
 
-  ┌─ PHASE A: REASONING [deepseek-v4-pro] ────────────────────┐
+  ┌─ A: REASONING [execution tier, cloud] ─────────────────────┐
   │  Screenplay Reviewer (builds H3-format prompt)             │
   │       ↓                                                    │
-  │  Has Dialogue? ──YES──→ Audio Producer generates voice     │
-  │       │                  (Chatterbox/CosyVoice/Orpheus)    │
-  │       │                  → becomes <Audio N> ref + <d> tags│
-  │       NO → skip (narration added in post, no lip sync)     │
+  │  Has Dialogue? ──YES──→ dialogue_stem.py renders the stem  │
+  │       │                  (TTS owns GPU) → <Audio 1> guide  │
+  │       NO → skip (narration is placed in post, no lip sync) │
   ├────────────────────────────────────────────────────────────┤
-  │ PHASE B: GENERATION [ComfyUI on the local RTX 5090]        │
-  │  Image Generator → scene compositing / frames              │
+  │ B: GENERATION [ComfyUI on the local RTX 5090]              │
+  │  generate_frames.py → keyframes (Qwen Image 2.1 / Ideogram)│
   │       ↓                                                    │
-  │  Video Generator → clip (MiniMax H3)                       │
-  │       • Dialogue: <Audio> ref + <d> tags = lip sync        │
+  │  generate_clip.py → clip (MiniMax H3)                      │
+  │       • Dialogue: stem as lip-sync guide + <d> tags        │
   │       • Narration: NO <Audio>, NO <d> = no lip movement    │
+  │       • the clip's own audio track never reaches the film  │
   ├────────────────────────────────────────────────────────────┤
-  │ PHASE C: QA [deepseek-v4-flash-vision-exp — the one        │
-  │  │           routed model that actually accepts images]     │
-  │  QA Inspector → analyzes frames                             │
+  │ C: QA [vision tier: opencode-go-deepseek/gemini-3.8-flash] │
+  │  QA Inspector → analyzes frames → normalise_qa_verdict.py  │
   │       → PASS → next clip                                   │
-  │       → FAIL → back to Phase A (rewrite the prompt)        │
+  │       → FAIL → back to A (reviewer rewrites; MAX_RETRY=3)  │
   └────────────────────────────────────────────────────────────┘
+  2g  4K masters: upscale_clip.py → clips/<SID>/clip_4k.mp4 (RTX VSR, PP_TARGET_FPS)
 
 ═══════════════════════════════════════════════════════════════
- POST-PRODUCTION  [cloud, no local model needed]
+ PHASE 3 — POST-PRODUCTION  (deterministic; agents only PLAN)
 ═══════════════════════════════════════════════════════════════
 
-  Audio Producer → narration audio (Kokoro, no lip sync)
-       ↓
-  Music Composer → score, ambient, SFX
-       ↓
-  Subtitle Generator → dialogue + narration subs (.srt/.ass)
-       ↓
-  Post-Production Editor
-     • APPLY $RUN_DIR/assembly_fixes.json FIRST (blocking checklist)
-     • Dialogue: strip the rejected native H3 track, mux the APPROVED
-       stem (clips/<SID>/dialogue.wav) at the recorded offset
-     • Overlay narration (no lip sync — post only)
-     • Layer music, SFX, ambient
-     • Burn subtitles
-       ↓
-  Final Movie (.mp4 + .srt + .ass)
+  3a  Audio Producer → narration plan (tts_jobs.json + narration_meta.json,
+      one block per passage) · narration_check.py --plan
+  3b  edit_check.py --run-dir → final/edit_report.json
+  3c  Post-Production Editor → final/edit_decisions.json v2 ONLY
+      (trims, inserts, J/L cuts as audio_lead_s / audio_lag_s) · assemble.py --validate-decisions
+  3d  assemble.py --timeline-only → final/timeline.json
+  3e  Music Composer → music/music_cues.json · music_render.py --validate
+  3f  ONE GPU excursion: tts_render.py (narration) → music_render.py (ACE-Step 1.5)
+      → sfx_render.py (MMAudio per clip, SFX_LAYER=1)
+  3g  assemble.py: picture from the masters trimmed per decisions + ONE audio mix on the
+      film timeline → final/movie_4k.mp4 · subtitles.py --embed → movie.srt / movie.ass
+      · edit_check.py --concat-list
 ```
 
-### Model Switching (per-agent routing, NOT a plugin)
+### Model Routing (three cloud tiers, no local LLM)
 
-There is **no `dsh-engine-switch` plugin** (it 404s on npm) and the `engine:` field in a preset is
-a no-op. The model is resolved from the **`agent-default-model` section of `/root/.dsh/settings.yaml`
-at dsh launch**, so the route is rewritten before every agent call.
+Decision of 2026-10-18: **there is no local LLM.** Every agent runs in the cloud. The route is
+resolved from the `agent-default-model` section of `/root/.dsh/settings.yaml` at dsh launch, and
+**`pipeline/set_agent_model.py`** (the ONLY routing table) rewrites it before every agent call, so
+a subprocess can never inherit the previous call's route. `config/models.yml` documents the same
+table; the `engine:` plugin block in presets never worked and has been removed everywhere.
 
-**Since 2026-10-11 every text agent runs on the LOCAL Qwen 3.8 Flash Next 125B** served by Strata
-Swift on 207 (`strata-swift-iq3-xxs.service`, OpenAI API `http://127.0.0.1:8321/v1`, dsh provider
-`strata-swift`, model `swift-1.5-iq3_xxs`, 262k context, maxTokens 131072, effort **xhigh** for both
-reasoning and execution). Its `strata-vision` sidecar reads images, so the QA inspector runs locally too (verified 2026-10-16; OpenRouter is only a fallback). The unit, port
-and model are defined once in `pipeline/local_llm.sh` / `pipeline/local_llm.py`; everything else
-imports them. `CLOUD_ROUTING=0` in `run.sh` is the active mode.
+| Tier | Presets | Provider / model | Effort |
+|------|---------|------------------|--------|
+| `creative` | story-creator, story-editor, director | `anthropic` / `claude-opus-5-5` | high |
+| `vision` | qa-inspector (the ONLY agent that reads images) | `opencode-go-deepseek` / `gemini-3.8-flash` | high |
+| `execution` | everything else | `opencode-go-deepseek` / `deepseek-v4.1-flash` (dialogue-polish overrides the model to `gemini-3.8-flash`) | high |
 
-The per-agent table lives in **`pipeline/set_agent_model.py`** (single source of truth; `run.sh`'s
-`set_agent_model` and `pipeline/generate_clip.py` both call it, so a subprocess can never inherit
-the previous agent call's route). If the Strata unit is not serving when a route is written,
-`set_agent_model.py` starts it and waits (≈2 min, cap 300 s) before the agent launches.
+- **Env overrides** (the only way to change a route): `DSH_CREATIVE_PROVIDER/MODEL/EFFORT`,
+  `DSH_VISION_PROVIDER/MODEL/EFFORT`, `DSH_EXECUTION_PROVIDER/MODEL/EFFORT`; a provider override
+  must name the model. `DSH_FORCE_TIER=execution` routes ONE call onto the execution tier — run.sh
+  uses it for the Director's mechanical per-scene gate so a lint fix never spends Opus.
+  `DSH_SETTINGS` / `DSH_ENV_FILE` relocate the settings and key files.
+- **Keys** live in `/root/.hermes/.env` (`ANTHROPIC_API_KEY`, `OPENCODE_GO_API_KEY`) or the
+  environment. **Providers are registered for dsh** in `/root/.dsh/profiles/headless/cordis.patch.yml`
+  under `llm-pi-ai → providers`: `anthropic` is a built-in pi-ai provider (api anthropic-messages);
+  the OpenCode Go entries are custom openai-completions providers with base URL
+  `https://opencode.ai/zen/go/v1`. A model must be in `KNOWN_MODELS` AND in cordis.patch.yml.
+- **No fallbacks, no retries.** `set_agent_model.py` exits 2 on a routing error (unknown tier /
+  provider / model, bad env) and 3 on a provider error (missing key, failed `/models` probe);
+  run.sh turns both into `halt_run`. Step 0 runs `--probe-all` before anything else. Tools:
+  `--list`, `--dry-run-all`, `<preset> --show`.
+- **Cloud spend ledger:** `pipeline/cloud_ledger.py` brackets every agent launch and writes
+  `$RUN_DIR/cloud_usage.json`. Caps `CLOUD_MAX_CALLS_ANTHROPIC` (12), `CLOUD_MAX_USD_EST_ANTHROPIC`
+  (9), `CLOUD_MAX_CALLS_OPENCODE` (1500); reaching a cap halts the run; Discord note at 50 % / 80 %.
+- Opus 5.5: thinking is always on; effort is the only depth control. Check the run log for
+  `ROUTE preset=<p> provider=<prov> model=<m> effort=<e> tier=<t>`.
 
-| Agent | Provider / model | Effort |
-|-------|------------------|--------|
-| Story Creator, Director, Screenplay Reviewer, Character Designer, Location Designer | `strata-swift` / `swift-1.5-iq3_xxs` (local :8321) | xhigh |
-| QA Inspector — the ONLY vision agent | `strata-swift` / `swift-1.5-iq3_xxs` (local :8321, strata-vision encoder — verified 2026-10-16) | xhigh |
-| All other agents | `strata-swift` / `swift-1.5-iq3_xxs` (local :8321) | xhigh |
+### Halt on error — `HALT_FOR_REVIEW.json`
 
-### The GPU has exactly ONE owner: Strata LLM | ComfyUI | TTS cluster
+Any machinery error — an agent call that fails or returns nothing, a QA inspector that returns no
+verdict, a key/probe failure, a render script crash, a spend cap — calls `halt_run` in run.sh:
+it writes `$RUN_DIR/HALT_FOR_REVIEW.json` (`{kind: "error", step, reason, preset, stderr_tail,
+resume}`), posts to Discord and exits 3. Nothing reroutes, nothing retries silently.
+`./launch_resume.sh <run_dir>` clears an error halt and re-runs the halted step.
 
-The LLM holds ~31.8 GB of the 32.6 GB card and pins ~40 GB of RAM, so nothing can share the GPU
-with it. The exclusion is enforced in **systemd**, not in scripts: `pipeline/systemd/` installs
-`tts-cluster.service` (starts Orpheus backend+API, Chatterbox, CosyVoice and Kokoro as one set) and
-`Conflicts=` drop-ins on `comfyui.service`, `strata-swift-iq3-xxs.service` and every TTS unit, so
-`systemctl start <owner>` stops the other two automatically (`pipeline/systemd/install_units.sh`).
+Quality loops are not errors and still run: QA FAIL → reviewer rewrites → re-render (`MAX_RETRY=3`,
+`best_take.py`, then the MANUAL_PASS / RETRY_AGAIN escalation halt); Director edit/lint fix rounds
+(≤ 2 each, PATCH mode via `pipeline/shot_list_patch.py`); audio-producer recast rounds (≤ 2); one fix
+round each for story-editor, dialogue-polish, the narration plan, the edit decisions and the music cues.
 
-- `pipeline/gpu_owner.sh llm|comfyui|tts|none|status` switches owner and **waits for the new owner's
-  API** (Strata ≈ 2 min; ComfyUI ≤ 180 s; TTS ≤ 240 s) and maintains `output/.llm_parked`, the marker
-  that tells the monitor the LLM is down on purpose.
-- **An agent turn never calls ComfyUI or a TTS port** — those are down while its LLM runs. Agents write
-  job files (`frame_spec.json`, `tts_jobs.json`, `reviewed_prompt.json`) and the pipeline renders them
-  with the GPU handed over: `generate_frames.py`, `tts_render.py` + `voice_lineup.py`,
-  `generate_dialogue_audio.py`, `generate_clip.py`, `upscale_clip.sh`. Each hands the GPU back to the
-  LLM when done (`--keep-gpu` chains render steps without the 2-minute reload).
-- **Crash / hang recovery:** `tts-idle-monitor.service` runs `pipeline/llm_monitor.py` every 30 s. If the
-  Strata unit is failed/inactive while nothing else owns the GPU, it restarts it (≤ 4 restarts per hour,
-  then a handoff note); if the unit is active but `/v1/models` or a real chat round-trip fails for
-  ≥ 120 s, it restarts it; it never touches a unit younger than 330 s (still loading) or while
-  ComfyUI/TTS are active. The Strata unit's own `ExecStartPost` (`llm_ready_notify.sh`) writes
-  `output/.llm_ready` and posts "LLM back" so a failed agent turn re-issues itself.
-- A stale Qwen/ninfer unit can never hold VRAM: `local_llm.sh` stops the retired units
-  (`ninfer`, `ninfer-us`, `ninfer-qwen36-35b`, `qwen3.8-27b-q6k-cuda`, `qfn-iq3m-cuda`) before every
-  start. They are masked on 207.
+### The GPU has TWO owners: ComfyUI | TTS cluster
 
-**Only `qa-inspector` needs vision** (it extracts frames at 2 FPS and scores hands/face/identity
-per frame). Capability labels lie — probe before trusting a declared `input:` list.
-`deepseek/deepseek-v4-pro` **hard-rejects images** (HTTP 404 "No endpoints found that support image
-input"), so it must never be given a vision job. Verified 2026-09-23: `gemini-3-flash-preview` and
-`qwen/qwen3-vl-32b-instruct` both read images correctly; a real 1280×704 frame costs ~1100 prompt
-tokens on gemini and ~910 on qwen-vl. Budget tier = `qwen/qwen3-vl-32b-instruct`.
+With no local LLM, the RTX 5090 alternates between **ComfyUI** (the resting owner — Qwen Image,
+MiniMax H3, RTX VSR, ACE-Step, MMAudio) and the **TTS cluster** (`tts-cluster.service`: Orpheus
+backend+API, Chatterbox, CosyVoice, Kokoro). The exclusion is enforced in **systemd**
+(`pipeline/systemd/install_units.sh` installs the units and `Conflicts=` drop-ins), so starting one
+owner stops the other.
 
-Routing is re-resolved on every agent call, so a route change takes effect without restarting the run.
-The pipeline phases naturally — reasoning and generation never run simultaneously.
+- `pipeline/gpu_owner.sh comfyui|tts|none|status` switches owner and **waits for the new owner's
+  API** (ComfyUI ≤ 180 s; TTS ≤ 240 s). The `llm` verb is gone; retired LLM units (Strata,
+  OrcaRouter, ninfer, …) are stopped before every hand-over so a stale one can never hold VRAM.
+- **An agent turn never calls ComfyUI or a TTS port.** Agents write job files (`frame_spec.json`,
+  `tts_jobs.json`, `reviewed_prompt.json`, `narration_meta.json`, `edit_decisions.json`,
+  `music_cues.json`) and the pipeline renders them: `generate_frames.py`, `tts_render.py` +
+  `voice_lineup.py`, `dialogue_stem.py`, `generate_clip.py`, `upscale_clip.py`, `music_render.py`,
+  `sfx_render.py`, `assemble.py`. `--keep-gpu` chains render steps without a hand-over.
+- `tts-idle-monitor.service` runs only `pipeline/idle_monitor.py` (stops a TTS engine or ComfyUI that
+  is active-but-dead during its phase). There is no LLM monitor and no LLM restart.
+
+Vision: only `qa-inspector` reads images (frames at 2 FPS, scored per frame). Capability labels
+lie — probe before trusting a declared `input:` list; `deepseek-v4-pro` hard-rejects images
+(HTTP 404), so it must never be given a vision job.
 
 ## Agents
 
 ### 1. Story Creator
-**Preset:** `.dsh/.agent-presets/story-creator/`
-- Writes complete story with scenes, dialogue, emotional arcs
-- Outputs structured JSON with scenes, characters, locations, mood
+**Preset:** `.dsh/.agent-presets/story-creator/`  (creative tier, Opus, no tools)
+- **Rewrites the user's draft** into a complete story — scenes, dialogue, emotional arcs
+- story-schema and story-craft skills are inlined by run.sh; outputs structured JSON
 - Specializes in Pixar-style storytelling (heart, humor, stakes)
 
-### 2. Director
-**Preset:** `.dsh/.agent-presets/director/`
-- Breaks story into numbered shots with camera angles
-- Decides which characters and locations need visual generation
-- Specifies keyframe requirements (first-frame from previous clip output)
-- Defines audio requirements per character and narrator
-- Controls pacing, transitions, and emotional timing
+### 2. Story Editor
+**Preset:** `.dsh/.agent-presets/story-editor/`  (creative tier, Opus, no tools)
+- Step 1a-edit, ONE call: scored critique against story-craft (emotional_connect, scene_turns,
+  dialogue_subtext, stakes, setups/payoffs, theme, show-don't-tell, dialogue_share) **plus** the
+  fully revised story with every rewrite applied
+- Writes `story_review.json`; the revised story becomes `story.json` (previous kept as `story_v1.json`)
+- One fix round if `story_check.py` still fails
 
-### 3. Character Designer
+### 3. Dialogue Polish
+**Preset:** `.dsh/.agent-presets/dialogue-polish/`  (execution tier, model `gemini-3.8-flash`, no tools)
+- Step 1a-dialogue: rewrites ONLY the spoken lines (subtext, no plot explanation, verbal
+  signatures, ≤ 130 characters / 30 words, one speaker per beat)
+- `pipeline/dialogue_patch.py` applies the patch and writes `story_dialogue_diff.txt`;
+  **dialogue is LOCKED afterwards** — the Director copies it verbatim
+
+### 4. Director
+**Preset:** `.dsh/.agent-presets/director/`  (creative tier, Opus)
+- Breaks story into numbered shots with camera angles; story + skills inlined
+- Locked dialogue copied verbatim; per shot `pov_character`, `audience_feels`,
+  `audio.music_cue {action, mood, intensity}`; the scene's `linger` becomes a held reaction shot
+- Keyframe requirements, handles, cut points, readable props, audio requirements
+- Fix rounds (1b-validate / 1b-edit / 1b-lint, ≤ 2 each) are PATCH mode via
+  `pipeline/shot_list_patch.py`; `story_check.py --story --shots` then verifies every locked line
+  is present and dialogue share ≥ 55 % (missing lines halt; `MIN_DIALOGUE_SHARE_BLOCK=1` halts on
+  share). The per-scene gate runs this preset on the execution tier (`DSH_FORCE_TIER=execution`)
+
+### 5. Character Designer
 **Preset:** `.dsh/.agent-presets/character-designer/`
-- Generates multi-angle character reference sheets via Qwen Image 2.1
-- Creates front/side/back/3-quarter views for each character
-- Maintains consistent style across all characters
+- Plans multi-angle character reference sheets (front/side/back/3-quarter); rendered via
+  Qwen Image 2.1 on ComfyUI by the pipeline
 - Outputs reference images for identity-locking in video generation
 
-### 4. Location Designer
+### 6. Location Designer
 **Preset:** `.dsh/.agent-presets/location-designer/`
-- Generates environment/location reference images
-- Creates day/night/weather variants as needed
-- Ensures locations match story mood and Pixar aesthetic
-- Provides wide establishing shots and detail textures
+- Plans environment/location reference images, day/night/weather variants
+- Wide establishing shots and detail textures in the Pixar aesthetic
 
-### 5. Storyboard Artist
+### 7. Storyboard Artist
 **Preset:** `.dsh/.agent-presets/storyboard-artist/`
-- Creates visual storyboard panels from director's shot list
-- Quick sketch-style frames showing composition and action
-- Validates visual flow before committing to expensive generation
-- Annotates with camera moves, timing, and transitions
+- Visual storyboard panels from the shot list (composition, action, camera moves, timing)
+- Available as a preset; not called by run.sh
 
-### 6. Screenplay Reviewer
+### 8. Screenplay Reviewer
 **Preset:** `.dsh/.agent-presets/screenplay-reviewer/`
-- Reviews all prompts before they reach MiniMax H3
-- Applies knowledge base of known H3 artifacts and bugs
-- Prevents: character duplication, hand anomalies, face distortion in wide shots,
-  POV hand issues, text rendering problems, audio crosstalk
-- Structures prompts with temporal decomposition [START-END] format
-- Adds negative constraints to prevent common failures
+- Reviews all prompts before they reach MiniMax H3; applies the known-artifact knowledge base
+- Structures prompts with temporal decomposition, handles and boundary states; ≤ 900 words
+- On a QA FAIL rewrites from the shot list; `non_diegetic_music` is always "none — the score is
+  added in post"
 
-### 7. Image Generator
+### 9. Image Generator
 **Preset:** `.dsh/.agent-presets/image-generator/`
-- Manages Qwen Image 2.1 workflows in ComfyUI
-- Generates first-frame and last-frame images for each clip
-- Uses character/location references for consistency (up to 10 refs)
-- Handles text-to-image and reference-to-image generation
+- Writes `frame_spec.json` (first/last frames, compositing, references); `generate_frames.py`
+  renders it on ComfyUI (Qwen Image 2.1, or Ideogram 4 + Qwen identity pass with `FRAME_ENGINE=ideogram4`)
 
-### 8. Audio Producer
+### 10. Audio Producer
 **Preset:** `.dsh/.agent-presets/audio-producer/`
-- 4 TTS engines, chosen per task:
-  - **Chatterbox** — primary dialogue (best naturalness, zero-shot cloning, MIT)
-  - **CosyVoice 3** — multilingual/cross-lingual dialogue, instruction-based emotion
-  - **Orpheus 3B** — intense emotional scenes (crying, shouting, whispering — load on demand)
-  - **Kokoro** — narration only (lightweight, 54 built-in voices)
-- Dialogue generated BEFORE video (for H3 lip sync via `<Audio>` ref)
-- Narration generated AFTER all clips (overlaid in post, NO lip sync)
+- Casts by voice class (voice-casting skill) → `audio/voices/voice_config.json`; measured line-up,
+  `CAST_FAIL` blocks Phase 2; ≤ 2 recast rounds
+- 4 TTS engines: Chatterbox (primary dialogue), CosyVoice 3 (multilingual / instruction emotion),
+  Orpheus 3B (intense emotion), Kokoro (narration only)
+- Per-clip dialogue stems are rendered by `pipeline/dialogue_stem.py` BEFORE video (lip-sync guide)
+- Step 3a: the **narration plan** — `audio/narration/narration_meta.json` (canonical: one block per
+  passage, `span_clips`, `starts_on = span_clips[0]`, never per shot) + `tts_jobs.json`;
+  `narration_check.py --plan` validates; `tts_render.py` renders; `assemble.py` places each block once
 
-### 9. Music Composer
+### 11. Music Composer
 **Preset:** `.dsh/.agent-presets/music-composer/`
-- Generates background score matching scene mood
-- Creates ambient soundscapes and sound effects
-- Handles musical transitions between scenes
-- Produces final audio mix layers
+- PLAN ONLY: writes `music/music_cues.json` (music-cues skill) — cues anchored to shot IDs on
+  `final/timeline.json`, motifs, intensity, transitions, ambience beds, deliberate silence
+- `music_render.py --validate` → `music_cues.resolved.json` (one fix round); `music_render.py`
+  renders every cue and bed with **ACE-Step 1.5** on ComfyUI → `music/cues/<id>.wav`, `music/beds/`
+- SFX are not the composer's: `sfx_render.py` renders **MMAudio** foley per clip from the shot's
+  `audio.sfx` → `clips/<SID>/sfx.wav`
 
-### 10. Video Generator
+### 12. Video Generator
 **Preset:** `.dsh/.agent-presets/video-generator/`
-- Manages MiniMax H3 workflows in ComfyUI
-- Supports T2V, I2V, and First-Last-Frame-to-Video modes
-- Handles 2K output, up to 15-second clips with stereo audio
-- ⚠ `ref2va` ALWAYS emits its own native H3 audio branch on stream 1, **even when
-  `use_native_h3_audio=false`** in `shot_list.json`. That track is H3's own generated
-  take, not the approved TTS stem — it may match the stem closely or be a completely
-  different take (measured r≈0.07 on S01_004). Never treat it as the dialogue master;
-  see "QA Gate & Retry Policy".
-- Applies director's shot specifications and camera directions
+- MiniMax H3 via ComfyUI — ref2va / i2va / fl2va; mode comes from the shot list
+- Dialogue: the approved stem is the lip-sync guide (`MiniMaxH3AddGuide` / `<Audio 1>` + `<d>`);
+  narration: no `<Audio>`, no `<d>`, no lip movement
+- ⚠ The clip's own audio track (H3's native take — measured r≈0.07 against the stem on S01_004 —
+  or the stem muxed back for previews) is **never used in the film**: `assemble.py` places
+  `clips/<SID>/dialogue.wav` at `anchor_s` on the film timeline
 
-### 11. QA Inspector
-**Preset:** `.dsh/.agent-presets/qa-inspector/`
-- Reviews each generated clip using Qwen2.5-VL vision model
-- Checks for: hand anomalies, face distortion, character duplication,
-  motion artifacts, texture instability, identity drift, audio quality
-- Issues PASS/FAIL verdict with detailed feedback
-- Verdict carries `re_render_recommended` (bool) and `recommended_action`
-  (`"ASSEMBLY_FIX_ONLY"` when the render itself is fine) — these now gate retries,
-  see "QA Gate & Retry Policy"
-- On FAIL: provides specific prompt corrections for regeneration
-- Tracks retry count and escalates after max retries
+### 13. QA Inspector
+**Preset:** `.dsh/.agent-presets/qa-inspector/`  (vision tier)
+- Reviews each generated clip frame by frame: hands, face, duplication, motion, texture,
+  identity drift, continuity, edit pair, audience_feels on the POV face
+- Issues PASS/FAIL with `re_render_recommended` / `recommended_action` — normalised by
+  `normalise_qa_verdict.py`, see "QA Gate & Retry Policy"
+- No verdict at all is a machinery error → halt
 
-### 12. Pipeline Orchestrator
+### 14. Pipeline Orchestrator
 **Preset:** `.dsh/.agent-presets/pipeline-orchestrator/`
-- Manages service lifecycle (ComfyUI, Qwen model loading/unloading)
-- Coordinates: stop Qwen → generate image/video → restart Qwen → QA
-- Monitors ComfyUI health and restarts if needed
-- Manages VRAM allocation between models
-- Queues and sequences clip generation
+- Service lifecycle reference (ComfyUI, TTS cluster, VRAM); the running pipeline uses
+  `gpu_owner.sh` and systemd directly
 
-### 13. Subtitle Generator
+### 15. Subtitle Generator — DEPRECATED (2026-10-18)
 **Preset:** `.dsh/.agent-presets/subtitle-generator/`
-- Creates timed subtitles for all dialogue and narration
-- Outputs SRT and ASS formats with character attribution
-- Handles timing sync with audio tracks
-- Supports styled subtitles (italic narration, character-colored dialogue)
+- Not called by run.sh. Subtitles are generated by `pipeline/subtitles.py --embed` from
+  `final/audio_placements.json` (actual placement times) after assembly → `movie.srt` / `movie.ass`
 
-### 14. Post-Production Editor
+### 16. Post-Production Editor
 **Preset:** `.dsh/.agent-presets/post-production-editor/`
-- Assembles all approved clips into scene sequences
-- Layers audio: dialogue, narration, music, SFX
-- Handles transitions between clips
-- Produces final movie file with proper encoding
+- **Decides only; `assemble.py` executes.** Reads `assembly_fixes.json` (blocking checklist) and
+  `final/edit_report.json`, writes ONLY `final/edit_decisions.json` v2:
+  `{"version":2,"decisions":[{boundary,action,a_out_s,b_in_s,audio_lead_s,audio_lag_s,cut_type,insert_clip,note}],"removed_clips":[],"inserted":[]}`
+- J-cut = `audio_lead_s` 0.15–0.30 s into a dialogue clip (`b_in_s = anchor_s + audio_lead_s`);
+  L-cut = `audio_lag_s` 0.20–0.40 s; voices never overlap; straight cuts only
+- Fix order: trim deeper → insert reaction/insert clip → request re-render; never ffmpeg, never
+  touches clip or audio files; `assemble.py --validate-decisions` (one fix round)
 
 ## QA Gate & Retry Policy
 
@@ -259,7 +278,9 @@ It resolves the verdict from the richest source available, applies the **calibra
 ### Assembly-fixable FAIL → PASS (do NOT re-render)
 A FAIL whose defect lives in the audio stem or the edit — not in the pixels — is downgraded to `PASS`
 with `assembly_fix_required: true`, and its fixes are appended to `<run_dir>/assembly_fixes.json`.
-Phase 3 assembly consumes that file as a BLOCKING checklist.
+Phase 3 consumes that file as a BLOCKING checklist (the editor turns every entry into a decision).
+The `audio_fix_target` is the stem itself — `clips/<sid>/dialogue.wav` + `dialogue_meta.json`
+(`stem_offset_s`); assembly never uses clip audio, so nothing is ever re-muxed.
 
 Downgrade applies only when ALL of these hold:
 - the inspector signalled "no re-render" — in ANY of the three forms it uses, and
@@ -290,16 +311,14 @@ overall 0.901 and was assembly-fixable, while take 2 regressed to hands 0.74 / l
 Diff the new take's category scores against the previous one before letting it replace the accepted clip;
 if the retry regressed, restore the earlier take and archive the new report under `_take_archive/`.
 
-### A pass-through clip still needs its 4K60 master
-The upscale step (2g) lives *inside* the QA loop, so a clip that exits via the assembly-fix PASS never
-gets one — and resume re-renders any clip lacking `clip_4k60.mp4` (the skip test needs PASS **and** the
-master). Use `./upscale_clip.sh <run_dir> <SHOT_ID>` to run just that step.
-
-⚠ `upscale_clip.sh` must export `DSH_PERMISSION_MODE=danger-full-access` exactly as `run.sh:36` does.
-dsh confines writes to the harness workspace and headless has no approval channel, so without that export
-the agent builds a correct 4K master and then cannot copy it into the run dir — it reports the blocker and
-the script's fallback silently ships a LOW-RES master. The script now also salvages the master from
-`$DSH_DIR/.work/<SHOT_ID>/` if that happens.
+### Every approved clip needs its 4K master
+Phase 2g builds `clips/<SID>/clip_4k.mp4` for every approved clip with `pipeline/upscale_clip.py`
+(RTX VSR on ComfyUI). The delivery frame rate is `PP_TARGET_FPS` (default 24 = the source rate,
+**no RIFE**); 48/96 = RIFE xN, 60 = RIFE x5 then every 2nd frame. There is no CPU fallback and no
+low-res copy — a failed master halts the run. `./upscale_clip.sh <run_dir> <SHOT_ID>` re-runs one
+master (it must export `DSH_PERMISSION_MODE=danger-full-access` exactly as run.sh does — dsh confines
+writes to the harness workspace and headless has no approval channel). `assemble.py` refuses a clip
+without a PASS verdict or without its master.
 
 ## Editorial Rules — *The Clockwork Moth* postmortem (2026-10-07)
 
@@ -312,15 +331,17 @@ and two tools; the rules that must never regress:
 
 | Complaint | Root cause | Rule / tool |
 |-----------|-----------|-------------|
-| Dissolve on every cut | `upscale_film.py` ran RIFE over the ASSEMBLED film, blending shot A's last frame into shot B's first | Interpolate per clip only. `upscale_film.py` now **refuses to run without a cut list** (`--concat-list final/concat.txt`); it holds each shot's last frame and decimates with a global parity so there is no drift |
+| Dissolve on every cut | `upscale_film.py` ran RIFE over the ASSEMBLED film, blending shot A's last frame into shot B's first | Interpolate per clip only (and only when `PP_TARGET_FPS` asks for more than the source rate). `upscale_film.py` **refuses to run without a cut list** (`--concat-list final/concat.txt`); it holds each shot's last frame and decimates with a global parity so there is no drift |
 | Jump cuts | Shot list had 9 consecutive pairs with same character + same size + same angle; dialogue clips were sized to the stem (0.4 s / 0.6 s) so there were no handles to cut into | Director: consecutive shots differ by subject, ≥ 2 shot sizes or ≥ 30°; every clip carries ≥ 1 s handles with `edit.cut_in` / `edit.cut_out`; reaction + insert per dialogue scene. `pipeline/edit_check.py` scores every boundary (threshold 0.80) before assembly and inside QA (`edit_pair`) |
 | Clock time changes across the cut | No ledger for readable props | `readable_props` per scene in the story/shot list, phrase copied verbatim into every prompt, QA continuity category 9j fails on contradiction |
 | Same voice for everyone | Narrator, boy, grandmother and moth were all Orpheus adult-female voices (`tara/jess/leah/zoe`) within ~3 semitones | Cast by **voice class**; narrator in a class no character uses; measured line-up with ≥ 4 semitone separation (`audio/voices/lineup/separation.json`, `CAST_FAIL` blocks Phase 2); child/elderly via Chatterbox clone or CosyVoice 3 instruction, never adult + affectation |
+| Audio jumps at cuts / double voice-over / no J-L cuts | Clips arrived in different audio states (native H3 take, stem muxed twice, narration rendered per clip) and were concatenated with their audio | Clip audio never reaches the film; `assemble.py` places every stem once on the timeline (`film_start + anchor_s − src_in`), narration once per block, beds and SFX crossfade across cuts, J/L cuts via `audio_lead_s` / `audio_lag_s` in `edit_decisions.json`, voices never overlap |
 
 Pipeline hooks: `run.sh` 1b validates the shot list for jump cuts and handles
-(`edit_check.py --shot-list`), 1e builds the voice line-up, 3d runs `edit_check.py --run-dir` and
+(`edit_check.py --shot-list`), 1e builds the voice line-up, 3b runs `edit_check.py --run-dir` and
 hands `final/edit_report.json` to the Post-Production Editor, who records every boundary decision in
-`final/edit_decisions.json` and cuts straight (no `xfade` unless the Director scripted it).
+`final/edit_decisions.json` (v2) and cuts straight (no dissolve unless the Director scripted it);
+3g re-scores the trimmed segments with `edit_check.py --concat-list`.
 
 ## H3 Envelope & QA Calibration — *Cinderquay* postmortem (2026-10-16)
 
@@ -346,51 +367,64 @@ Keyframe engines: `FRAME_ENGINE=qwen` (default, Qwen Image 2.1 + sheets) or `FRA
 text-only, so it places figures exactly but cannot lock identity; native ComfyUI graph with the
 nvfp4 cond + unconditional UNETs on `/mnt/ChaosWares1/comfyui/models`; see rules §0.3).
 
-Verified 2026-10-16: the local Strata model DOES read images (its `strata-vision` encoder
-described a frame's whale, bell, lantern and counted the figures), so qa-inspector runs
-locally; the OpenRouter route is no longer needed for vision.
-
 ## Service Dependencies
 
-> **Model routing is per-call and LOCAL-first** (`run.sh`'s `set_agent_model` →
-> `pipeline/set_agent_model.py` rewrites the `agent-default-model` section of `/root/.dsh/settings.yaml`
-> before each agent call — see "Model Switching"). Check the run log for
-> `Model route: <agent> -> strata-swift/swift-1.5-iq3_xxs` (text agents) and
-> `qa-inspector -> openrouter/google/gemini-3-flash-preview` (vision).
+> **Model routing is per-call and cloud-only** (`run.sh` → `pipeline/set_agent_model.py` rewrites the
+> `agent-default-model` section of `/root/.dsh/settings.yaml` before each agent call — see "Model
+> Routing"). Check the run log for `ROUTE preset=… provider=… model=… tier=…`.
 >
-> ⚠ Only one of {Strata LLM, ComfyUI, TTS cluster} can hold the GPU. `pipeline/gpu_owner.sh status`
-> shows who does. `ninfer`/`ninfer-us` are masked; `qfn-iq3m-cuda` (docker llama.cpp) conflicts with
-> Strata and is stopped by `local_llm.sh` before every LLM start.
+> ⚠ Only one of {ComfyUI, TTS cluster} can hold the GPU. `pipeline/gpu_owner.sh status` shows who
+> does. Retired LLM units (Strata, OrcaRouter, ninfer, ninfer-us, qfn-iq3m-cuda) are stopped before
+> every hand-over and never started by the pack.
 
 | Service          | Used By                        | Port  | VRAM     | Notes                              |
 |-----------------|--------------------------------|-------|----------|------------------------------------|
-| **Strata Swift (Qwen 3.8 Flash Next 125B)** | ALL text agents (`strata-swift`) | 8321 | ~31.8 GB | `strata-swift-iq3-xxs.service`; ~2 min start; exclusive GPU owner |
-| tts-cluster     | Audio Producer renders         | —     | ~8 GB    | starts all 4 TTS engines; exclusive GPU owner |
-| ~~Qwen 3.5 122B~~ | ~~Story, Director, Reviewer~~ | 11434 | ~75 GB Q4| RETIRED 2026-09-21                 |
-| ~~Qwen 3.8 27B~~  | ~~All execution + QA agents~~ | 11435 | ~16 GB Q4| RETIRED 2026-09-21                 |
-| ~~ninfer~~      | ~~dsh local route~~            | 8080  | ~28 GB   | RETIRED 2026-10-11 — unit masked   |
-| ~~ninfer-us~~   | ~~dsh local route~~            | 8081  | ~31 GB   | RETIRED 2026-10-11 — unit masked   |
-| ComfyUI         | Image Gen, Video Gen           | 8188  | varies   | Workflow execution engine; exclusive GPU owner |
-| Qwen Image 2.1  | Image Generator                | -     | ~8-10 GB | Via ComfyUI node                    |
-| MiniMax H3      | Video Generator                | -     | ~8-12 GB | Via ComfyUI node                    |
-| Chatterbox      | Audio Producer                 | 9882  | ~4-6 GB  | Primary dialogue (best naturalness) |
-| CosyVoice 3     | Audio Producer                 | 9880  | ~4-6 GB  | Multilingual / cross-lingual voice  |
-| Orpheus 3B      | Audio Producer                 | 9883  | ~8-12 GB | Emotional dialogue (load on demand) |
-| Kokoro          | Audio Producer                 | 9881  | ~2-3 GB  | Narration only (lightweight)        |
-
-⚠ `ninfer` and `ninfer-us` have mutual systemd `Conflicts=` — only one can hold the RTX 5090 at a time.
-Both are registered as dsh providers; switch with `systemctl start ninfer` / `ninfer-us`.
+| Anthropic API (`claude-opus-5-5`) | Story Creator, Story Editor, Director | — | — | creative tier; `ANTHROPIC_API_KEY`; call/USD caps in `cloud_usage.json` |
+| OpenCode Go (`deepseek-v4.1-flash`, `gemini-3.8-flash`) | all other agents; QA vision | — | — | execution + vision tiers; `OPENCODE_GO_API_KEY`; base `https://opencode.ai/zen/go/v1` |
+| ComfyUI         | frames, clips, masters, music, SFX | 8188 | varies | Workflow execution engine; resting GPU owner |
+| Qwen Image 2.1  | generate_frames.py, sheets     | -     | ~8-10 GB | Via ComfyUI node                    |
+| MiniMax H3      | generate_clip.py               | -     | ~8-12 GB | Via ComfyUI node                    |
+| RTX VSR (+ RIFE) | upscale_clip.py               | -     | ~8-14 GB | Via ComfyUI; `clip_4k.mp4` at `PP_TARGET_FPS` |
+| ACE-Step 1.5    | music_render.py                | -     | via ComfyUI | score cues + ambience beds (`ace_step_1.5_turbo_aio`) |
+| MMAudio         | sfx_render.py                  | -     | via ComfyUI | per-clip foley from the picture (`SFX_LAYER=1`) |
+| tts-cluster     | tts_render.py, dialogue_stem.py | —    | ~8 GB    | starts all 4 TTS engines; exclusive GPU owner |
+| Chatterbox      | Audio Producer (cast)          | 9882  | ~4-6 GB  | Primary dialogue (best naturalness) |
+| CosyVoice 3     | Audio Producer (cast)          | 9880  | ~4-6 GB  | Multilingual / cross-lingual voice  |
+| Orpheus 3B      | Audio Producer (cast)          | 9883  | ~3.5 GB  | Emotional dialogue                  |
+| Kokoro          | Audio Producer (cast)          | 9881  | ~2-3 GB  | Narration only (lightweight)        |
 
 ## Output Structure
 
 ```
-output/
-├── characters/    # Character reference sheets
-├── locations/     # Location reference images
-├── storyboards/   # Storyboard panels
-├── frames/        # First/last frame images per clip
-├── clips/         # Generated video clips
-├── audio/         # Voice and narration tracks
-├── music/         # Background score and SFX
-└── final/         # Assembled movie
+output/<run>/
+├── story.json, story_v1.json, story_review.json, story_dialogue_diff.txt
+├── shot_list.json, story_check.json, story_check_shots.json
+├── cloud_usage.json          # cloud spend ledger (cloud_ledger.py)
+├── HALT_FOR_REVIEW.json      # present only while halted (error or escalation)
+├── assembly_fixes.json       # QA downgrades the editor must address
+├── characters/, locations/   # reference sheets / environments
+├── frames/                   # first/last frames per clip
+├── clips/<SID>/
+│   ├── clip.mp4              # picture (stem muxed in for preview/QA only)
+│   ├── clip_4k.mp4           # 4K master at PP_TARGET_FPS
+│   ├── dialogue.wav + dialogue_meta.json   # approved stem + anchor_s
+│   ├── sfx.wav               # MMAudio foley
+│   ├── qa_report.json, qa_verdict.json, reviewed_prompt.json, takes/
+├── audio/
+│   ├── voices/               # cast, line-up, separation.json
+│   └── narration/            # narration_meta.json, tts_jobs.json, <block>.wav
+├── music/
+│   ├── music_cues.json, music_cues.resolved.json
+│   ├── cues/<id>.wav (+ .json sidecar)
+│   └── beds/<id>.wav
+└── final/
+    ├── edit_report.json, edit_boundaries.jpg
+    ├── edit_decisions.json   # the editor's only output (v2)
+    ├── timeline.json         # film clock (assemble.py --timeline-only)
+    ├── segments/, concat.txt, picture.mp4
+    ├── mix_raw.wav, mix.wav
+    ├── movie_4k.mp4          # the film
+    ├── audio_placements.json # every voice's film-time placement (subtitles.py)
+    ├── assembly_log.json
+    └── movie.srt, movie.ass
 ```

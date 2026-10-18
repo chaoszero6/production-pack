@@ -579,11 +579,11 @@ def main():
         entry = {
             "qa_verdict": "FAIL",
             "assembly_fix_required": True,
-            # Phase 3 concatenates clip_4k60.mp4, NOT clip.mp4 — name it explicitly so the
-            # editor agent cannot strip the rejected track from the wrong file.
+            # Assembly never uses clip audio: assemble.py places the approved stem on the
+            # film timeline, so an audio fix lives in the stem and its metadata only.
             "audio_fix_target": (
-                f"clips/{shot_id}/clip_4k60.mp4 (the file Phase 3 concatenates); "
-                f"clips/{shot_id}/clip.mp4 carries the same rejected native track"
+                f"clips/{shot_id}/dialogue.wav + clips/{shot_id}/dialogue_meta.json "
+                f"(stem_offset_s); assembly never uses the clip's own audio track"
             ),
             "weighted_overall": _overall(rich),
             "threshold": (rich or {}).get("threshold"),
