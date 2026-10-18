@@ -51,9 +51,9 @@ source "$PACK_DIR/pipeline/gpu_owner.sh"
 
 # LLM routing (pipeline/set_agent_model.py — the single source of truth):
 #   creative   story-creator, story-editor, director   → anthropic / claude-opus-5-5 (effort high)
-#   vision     qa-inspector                            → opencode-go-deepseek / gemini-3.8-flash
+#   vision     qa-inspector                            → opencode-go-deepseek / qwen3.8-flash
 #   execution  everything else                         → opencode-go-deepseek / deepseek-v4.1-flash
-#                                                        (dialogue-polish: gemini-3.8-flash)
+#   (dialogue-polish runs on the creative tier too — OpenCode Go offers no Gemini)
 # Override per tier with DSH_CREATIVE_* / DSH_VISION_* / DSH_EXECUTION_* (PROVIDER/MODEL/EFFORT).
 # NO FALLBACKS: a routing or provider error halts the run (halt_run), never reroutes.
 DSH_SETTINGS="/root/.dsh/settings.yaml"
@@ -71,7 +71,7 @@ fi
 # (default); 48/96 = RIFE xN; 60 = RIFE x5 then every 2nd frame.
 export PP_TARGET_FPS="${PP_TARGET_FPS:-24}"
 # Cloud spend caps (pipeline/cloud_ledger.py) — reaching one halts the run.
-export CLOUD_MAX_CALLS_ANTHROPIC="${CLOUD_MAX_CALLS_ANTHROPIC:-12}"
+export CLOUD_MAX_CALLS_ANTHROPIC="${CLOUD_MAX_CALLS_ANTHROPIC:-16}"
 export CLOUD_MAX_USD_EST_ANTHROPIC="${CLOUD_MAX_USD_EST_ANTHROPIC:-9}"
 export CLOUD_MAX_CALLS_OPENCODE="${CLOUD_MAX_CALLS_OPENCODE:-1500}"
 
@@ -873,11 +873,11 @@ $(cat "$RUN_DIR/story.json")"
     notify "Story editor pass done — $SPLIT_MSG" "Story Editor"
 fi
 
-# 1a-dialogue. Dialogue Polish — Gemini (OpenCode Go) rewrites ONLY the dialogue
+# 1a-dialogue. Dialogue Polish — a second Opus call rewrites ONLY the dialogue
 # lines for subtext, within the H3 limits. dialogue_patch.py validates and applies;
 # after this step the dialogue is LOCKED (the Director copies lines verbatim).
 if ! skip_if_done "$RUN_DIR/story_dialogue_patch.json" "Dialogue Polish"; then
-    step "1a-dialogue. Dialogue Polish (Gemini)"
+    step "1a-dialogue. Dialogue Polish"
     DIALOGUE_INPUT=$(python3 - "$RUN_DIR/story.json" <<'PYEOF'
 import json, sys
 d = json.load(open(sys.argv[1], encoding="utf-8"))

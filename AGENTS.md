@@ -20,7 +20,7 @@ by ComfyUI and the TTS cluster. Agents reason and write files; the pipeline rend
   0   Cloud preflight (set_agent_model.py --probe-all; a failed probe halts)
   1a  Story Creator      [creative: anthropic/claude-opus-5-5]  REWRITES the draft
   1a-edit   Story Editor [creative]  one call: critique scores + revised story
-  1a-dialogue Dialogue Polish [execution: gemini-3.8-flash] lines only → LOCKED
+  1a-dialogue Dialogue Polish [execution: qwen3.8-flash] lines only → LOCKED
   1b  Director           [creative]  shot list; locked dialogue copied verbatim
   1b-validate / 1b-edit / 1b-lint   fix rounds ≤ 2 each, PATCH mode
   1b-dialogue  story_check.py --story --shots (every locked line present, share ≥ 55 %)
@@ -47,7 +47,7 @@ by ComfyUI and the TTS cluster. Agents reason and write files; the pipeline rend
   │       • Narration: NO <Audio>, NO <d> = no lip movement    │
   │       • the clip's own audio track never reaches the film  │
   ├────────────────────────────────────────────────────────────┤
-  │ C: QA [vision tier: opencode-go-deepseek/gemini-3.8-flash] │
+  │ C: QA [vision tier: opencode-go-deepseek/qwen3.8-flash] │
   │  QA Inspector → analyzes frames → normalise_qa_verdict.py  │
   │       → PASS → next clip                                   │
   │       → FAIL → back to A (reviewer rewrites; MAX_RETRY=3)  │
@@ -83,8 +83,8 @@ table; the `engine:` plugin block in presets never worked and has been removed e
 | Tier | Presets | Provider / model | Effort |
 |------|---------|------------------|--------|
 | `creative` | story-creator, story-editor, director | `anthropic` / `claude-opus-5-5` | high |
-| `vision` | qa-inspector (the ONLY agent that reads images) | `opencode-go-deepseek` / `gemini-3.8-flash` | high |
-| `execution` | everything else | `opencode-go-deepseek` / `deepseek-v4.1-flash` (dialogue-polish overrides the model to `gemini-3.8-flash`) | high |
+| `vision` | qa-inspector (the ONLY agent that reads images) | `opencode-go-deepseek` / `qwen3.8-flash` | high |
+| `execution` | everything else | `opencode-go-deepseek` / `deepseek-v4.1-flash` (dialogue-polish overrides the model to `qwen3.8-flash`) | high |
 
 - **Env overrides** (the only way to change a route): `DSH_CREATIVE_PROVIDER/MODEL/EFFORT`,
   `DSH_VISION_PROVIDER/MODEL/EFFORT`, `DSH_EXECUTION_PROVIDER/MODEL/EFFORT`; a provider override
@@ -159,7 +159,7 @@ lie — probe before trusting a declared `input:` list; `deepseek-v4-pro` hard-r
 - One fix round if `story_check.py` still fails
 
 ### 3. Dialogue Polish
-**Preset:** `.dsh/.agent-presets/dialogue-polish/`  (execution tier, model `gemini-3.8-flash`, no tools)
+**Preset:** `.dsh/.agent-presets/dialogue-polish/`  (execution tier, model `qwen3.8-flash`, no tools)
 - Step 1a-dialogue: rewrites ONLY the spoken lines (subtext, no plot explanation, verbal
   signatures, ≤ 130 characters / 30 words, one speaker per beat)
 - `pipeline/dialogue_patch.py` applies the patch and writes `story_dialogue_diff.txt`;
@@ -380,7 +380,7 @@ nvfp4 cond + unconditional UNETs on `/mnt/ChaosWares1/comfyui/models`; see rules
 | Service          | Used By                        | Port  | VRAM     | Notes                              |
 |-----------------|--------------------------------|-------|----------|------------------------------------|
 | Anthropic API (`claude-opus-5-5`) | Story Creator, Story Editor, Director | — | — | creative tier; `ANTHROPIC_API_KEY`; call/USD caps in `cloud_usage.json` |
-| OpenCode Go (`deepseek-v4.1-flash`, `gemini-3.8-flash`) | all other agents; QA vision | — | — | execution + vision tiers; `OPENCODE_GO_API_KEY`; base `https://opencode.ai/zen/go/v1` |
+| OpenCode Go (`deepseek-v4.1-flash`, `qwen3.8-flash`) | all other agents; QA vision | — | — | execution + vision tiers; `OPENCODE_GO_API_KEY`; base `https://opencode.ai/zen/go/v1` |
 | ComfyUI         | frames, clips, masters, music, SFX | 8188 | varies | Workflow execution engine; resting GPU owner |
 | Qwen Image 2.1  | generate_frames.py, sheets     | -     | ~8-10 GB | Via ComfyUI node                    |
 | MiniMax H3      | generate_clip.py               | -     | ~8-12 GB | Via ComfyUI node                    |

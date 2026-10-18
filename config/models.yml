@@ -33,7 +33,7 @@ tiers:
   vision:
     agents: [qa-inspector]      # the ONLY agent that reads images
     provider: "opencode-go-deepseek"
-    model: "gemini-3.8-flash"
+    model: "qwen3.8-flash"
     effort: "high"
     override_env: [DSH_VISION_PROVIDER, DSH_VISION_MODEL, DSH_VISION_EFFORT]
 
@@ -46,7 +46,7 @@ tiers:
     effort: "high"
     override_env: [DSH_EXECUTION_PROVIDER, DSH_EXECUTION_MODEL, DSH_EXECUTION_EFFORT]
     model_overrides:
-      dialogue-polish: "gemini-3.8-flash"   # same provider, different model
+      dialogue-polish: "qwen3.8-flash"   # same provider, different model
 
 # DSH_FORCE_TIER=execution routes ONE call onto the execution tier regardless of
 # preset — run.sh uses it for the Director's mechanical per-scene gate so a lint
@@ -68,8 +68,8 @@ providers:
     models_url: "https://opencode.ai/zen/go/v1/models"
     key_env: "OPENCODE_GO_API_KEY"
     api: "openai-completions"   # custom provider in cordis.patch.yml
-    known_models: [deepseek-v4.1-flash, gemini-3.8-flash, deepseek-v4-flash-vision-exp]
-    input: [text, image]        # gemini-3.8-flash carries the vision tier
+    known_models: [deepseek-v4.1-flash, qwen3.8-flash, deepseek-v4-flash-vision-exp]
+    input: [text, image]        # qwen3.8-flash carries the vision tier
     context_window: 1000000
     role: "execution + vision tiers (prepaid pool: call-capped, costed at 0)"
 

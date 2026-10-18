@@ -1,4 +1,4 @@
-# Dialogue Polish Agent — dialogue specialist (cloud, Gemini, NO tools)
+# Dialogue Polish Agent — dialogue specialist (cloud, Claude Opus 5.5, NO tools)
 # Step 1a-dialogue: rewrites ONLY the spoken lines of an edited story. Its output
 # is applied by pipeline/dialogue_patch.py, after which dialogue is LOCKED for the
 # Director. run.sh builds the compact input described below; no engine block —

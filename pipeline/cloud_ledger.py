@@ -23,7 +23,7 @@ found). Prices are USD per million tokens (input, output); OpenCode Go is a
 prepaid pool and is costed at 0 but still call-capped.
 
 Caps come from the environment at `check` time:
-    CLOUD_MAX_CALLS_ANTHROPIC   (default 12)    CLOUD_MAX_USD_EST_ANTHROPIC (default 9)
+    CLOUD_MAX_CALLS_ANTHROPIC   (default 16)    CLOUD_MAX_USD_EST_ANTHROPIC (default 9)
     CLOUD_MAX_CALLS_OPENCODE    (default 1500)
 Notifications at 50 % / 80 % are the caller's job (summary prints the ratios).
 """
@@ -60,7 +60,7 @@ def _caps_from_env():
             return cast(v) if v not in (None, "") else default
         except ValueError:
             return default
-    anth = {"calls": num("CLOUD_MAX_CALLS_ANTHROPIC", 12),
+    anth = {"calls": num("CLOUD_MAX_CALLS_ANTHROPIC", 16),
             "usd_est": num("CLOUD_MAX_USD_EST_ANTHROPIC", 9.0, float)}
     oc = {"calls": num("CLOUD_MAX_CALLS_OPENCODE", 1500)}
     return {"anthropic": anth,

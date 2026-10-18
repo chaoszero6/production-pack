@@ -83,7 +83,7 @@ each for the story editor, dialogue polish, narration plan, edit decisions and m
     ▼
  Story Editor (Opus, one call: critique + revised story)
     ▼
- Dialogue Polish (Gemini, lines only) ─► dialogue LOCKED
+ Dialogue Polish (Opus, lines only) ─► dialogue LOCKED
     ▼
  Director (Opus) ─► validate / edit-check / lint / locked-dialogue check (patch rounds)
     ▼
@@ -143,8 +143,8 @@ both call it, so a subprocess can never inherit the previous call's route.
 | Tier | Presets | Default | Override |
 |------|---------|---------|----------|
 | Creative | story-creator, story-editor, director | `anthropic` / `claude-opus-5-5`, effort high | `DSH_CREATIVE_PROVIDER` / `DSH_CREATIVE_MODEL` / `DSH_CREATIVE_EFFORT` |
-| Vision (QA) | qa-inspector | `opencode-go-deepseek` / `gemini-3.8-flash` | `DSH_VISION_PROVIDER` / `DSH_VISION_MODEL` / `DSH_VISION_EFFORT` |
-| Execution | everything else (dialogue-polish overrides the model to `gemini-3.8-flash`) | `opencode-go-deepseek` / `deepseek-v4.1-flash` | `DSH_EXECUTION_PROVIDER` / `DSH_EXECUTION_MODEL` / `DSH_EXECUTION_EFFORT` |
+| Vision (QA) | qa-inspector | `opencode-go-deepseek` / `qwen3.8-flash` | `DSH_VISION_PROVIDER` / `DSH_VISION_MODEL` / `DSH_VISION_EFFORT` |
+| Execution | everything else (dialogue-polish overrides the model to `qwen3.8-flash`) | `opencode-go-deepseek` / `deepseek-v4.1-flash` | `DSH_EXECUTION_PROVIDER` / `DSH_EXECUTION_MODEL` / `DSH_EXECUTION_EFFORT` |
 
 A provider override must name the model. `DSH_FORCE_TIER=execution` routes one
 call onto the execution tier (the Director's mechanical per-scene gate uses it).
@@ -179,13 +179,14 @@ and the pipeline renders them (`generate_frames.py`, `dialogue_stem.py`,
 |-----------|------|---------|
 | Agent framework | dsh presets (`.dsh/.agent-presets/`) | 16 specialised agent presets, all cloud-routed |
 | Creative writing | Claude Opus 5.5 (Anthropic) | Story, story editor, director |
-| Execution / dialogue | DeepSeek v4.1 Flash, Gemini 3.8 Flash via OpenCode Go | Prompts, plans, decisions, dialogue polish |
+| Execution | DeepSeek v4.1 Flash via OpenCode Go | Prompts, plans, decisions |
+| QA vision | Qwen 3.8 Flash via OpenCode Go (verified to read frames) | Per-frame scoring |
 | Image generation | Qwen Image 2.1 via ComfyUI | Character/location refs, frames, compositing |
 | Video generation | MiniMax H3 via ComfyUI | `ref2va` / `i2va` / `fl2va` clips (3–15 s) |
 | Dialogue TTS | Chatterbox, CosyVoice 3 | Zero-shot voice cloning, primary dialogue |
 | Emotional TTS | Orpheus 3B | Crying, whispering, shouting |
 | Narration TTS | Kokoro | Narrator voice, placed by assembly (no lip sync) |
-| QA vision | gemini-3.8-flash via OpenCode Go | Per-frame scoring of hands, face, identity |
+| QA vision | qwen3.8-flash via OpenCode Go | Per-frame scoring of hands, face, identity |
 | Music | ACE-Step 1.5 via ComfyUI (`music_render.py`) | Score cues and ambience beds from the composer's cue sheet |
 | SFX | MMAudio via ComfyUI (`sfx_render.py`) | Per-clip foley synced to the picture |
 | Spatial upscale | NVIDIA RTX Video Super Resolution | 4K ULTRA per chunk → `clip_4k.mp4` |

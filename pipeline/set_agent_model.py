@@ -20,10 +20,9 @@ Exit codes (run.sh turns 2 and 3 into a halt, never a reroute):
 
 Tiers (decision of 2026-10-18 — no local LLM, every agent in the cloud):
 
-    creative   story-creator, story-editor, director       anthropic / claude-opus-5-5   effort high
-    vision     qa-inspector                                opencode-go-deepseek / gemini-3.8-flash
+    creative   story-creator, story-editor, dialogue-polish, director   anthropic / claude-opus-5-5  effort high
+    vision     qa-inspector                                opencode-go-deepseek / qwen3.8-flash (verified 2026-10-18: reads frames)
     execution  everything else                             opencode-go-deepseek / deepseek-v4.1-flash
-               (dialogue-polish overrides the model to gemini-3.8-flash)
 
 Env overrides (read once per call, the ONLY way to change a route):
     DSH_CREATIVE_PROVIDER / DSH_CREATIVE_MODEL / DSH_CREATIVE_EFFORT
@@ -72,17 +71,16 @@ class ProviderError(Exception):
 
 
 # ── Tier table ───────────────────────────────────────────────────────────────
-CREATIVE_PRESETS = {"story-creator", "story-editor", "director"}
+CREATIVE_PRESETS = {"story-creator", "story-editor", "dialogue-polish", "director"}
 VISION_PRESETS = {"qa-inspector"}
-# Per-preset model override inside its tier (provider stays the tier's).
-PRESET_MODEL_OVERRIDE = {
-    "dialogue-polish": "gemini-3.8-flash",
-}
+# Per-preset model override inside its tier (provider stays the tier's). Empty today:
+# OpenCode Go offers no Gemini, so dialogue-polish runs on the creative tier (Opus).
+PRESET_MODEL_OVERRIDE = {}
 
 TIER_DEFAULTS = {
     # tier:       (provider,               model,                 effort)
     "creative":  ("anthropic",            "claude-opus-5-5",     "high"),
-    "vision":    ("opencode-go-deepseek", "gemini-3.8-flash",    "high"),
+    "vision":    ("opencode-go-deepseek", "qwen3.8-flash",       "high"),
     "execution": ("opencode-go-deepseek", "deepseek-v4.1-flash", "high"),
 }
 
@@ -122,9 +120,9 @@ PROVIDERS = {
 # routing error — add it here AND to cordis.patch.yml after verifying it).
 KNOWN_MODELS = {
     "anthropic": {"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"},
-    "opencode-go-deepseek": {"deepseek-v4.1-flash", "gemini-3.8-flash", "deepseek-v4-flash-vision-exp"},
+    "opencode-go-deepseek": {"deepseek-v4.1-flash", "qwen3.8-flash", "deepseek-v4-flash-vision-exp"},
     "opencode-go-deepseek-pro": {"deepseek-v4-pro"},
-    "opencode-go": {"deepseek-v4.1-flash", "gemini-3.8-flash", "deepseek-v4-pro"},
+    "opencode-go": {"deepseek-v4.1-flash", "qwen3.8-flash", "deepseek-v4-pro"},
     "openrouter": None,  # open catalogue — not validated here
 }
 
@@ -231,7 +229,11 @@ def probe_provider(provider, timeout=8):
     if not key:
         raise ProviderError(
             f"{provider}: {spec['key_env']} is not set (env or {ENV_FILE})")
-    req = urllib.request.Request(spec["models_url"], headers=spec["headers"](key))
+    # Cloudflare in front of OpenCode Go rejects Python's default User-Agent (error 1010).
+    headers = {"User-Agent": "production-pack/1.0 (+https://github.com/chaoszero6/production-pack)",
+               "Accept": "application/json"}
+    headers.update(spec["headers"](key))
+    req = urllib.request.Request(spec["models_url"], headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status != 200:
