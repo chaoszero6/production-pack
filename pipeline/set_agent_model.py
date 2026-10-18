@@ -313,13 +313,11 @@ def write_route(provider, model, effort):
         raise
 
 
-_PROFILE_BLOCK_RE = re.compile(
-    r"(- id: agent-default-model
-  name: \"@deepseek-ai/dsh-agent-default-model\"
-  config:
-)"
-    r"(?:    [a-zA-Z]+: .*
-)*")
+NL = "\n"
+_PROFILE_HEAD = ('- id: agent-default-model' + NL +
+                 '  name: "@deepseek-ai/dsh-agent-default-model"' + NL +
+                 '  config:' + NL)
+_PROFILE_BLOCK_RE = re.compile(re.escape(_PROFILE_HEAD) + r"(?:    [a-zA-Z]+: [^\n]*\n)*")
 
 
 def write_profile_route(provider, model, effort):
@@ -329,21 +327,13 @@ def write_profile_route(provider, model, effort):
         return False
     with open(path, encoding="utf-8") as fh:
         text = fh.read()
-    block = ('- id: agent-default-model
-  name: "@deepseek-ai/dsh-agent-default-model"
-  config:
-'
-             f"    provider: {provider}
-    model: {model}
-    reasoningEffort: {effort}
-")
+    block = (_PROFILE_HEAD + f"    provider: {provider}" + NL + f"    model: {model}" + NL
+             + f"    reasoningEffort: {effort}" + NL)
     m = _PROFILE_BLOCK_RE.search(text)
     if m:
         new_text = text[:m.start()] + block + text[m.end():]
     else:
-        new_text = text.rstrip("
-") + "
-" + block
+        new_text = text.rstrip(NL) + NL + block
     if new_text == text:
         return True
     dir_path = os.path.dirname(path) or "."
