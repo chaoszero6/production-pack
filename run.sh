@@ -51,7 +51,7 @@ source "$PACK_DIR/pipeline/gpu_owner.sh"
 
 # LLM routing (pipeline/set_agent_model.py — the single source of truth):
 #   creative   story-creator, story-editor, director   → anthropic / claude-opus-5-5 (effort high)
-#   vision     qa-inspector                            → opencode-go-deepseek / qwen3.8-flash
+#   vision     qa-inspector                            → anthropic / claude-haiku-5-5
 #   execution  everything else                         → opencode-go-deepseek / deepseek-v4.1-flash
 #   (dialogue-polish runs on the creative tier too — OpenCode Go offers no Gemini)
 # Override per tier with DSH_CREATIVE_* / DSH_VISION_* / DSH_EXECUTION_* (PROVIDER/MODEL/EFFORT).
@@ -70,10 +70,15 @@ fi
 # Delivery frame rate of the per-clip 4K masters: 24 = source rate, no RIFE
 # (default); 48/96 = RIFE xN; 60 = RIFE x5 then every 2nd frame.
 export PP_TARGET_FPS="${PP_TARGET_FPS:-24}"
-# Cloud spend caps (pipeline/cloud_ledger.py) — reaching one halts the run.
-export CLOUD_MAX_CALLS_ANTHROPIC="${CLOUD_MAX_CALLS_ANTHROPIC:-16}"
-export CLOUD_MAX_USD_EST_ANTHROPIC="${CLOUD_MAX_USD_EST_ANTHROPIC:-9}"
-export CLOUD_MAX_CALLS_OPENCODE="${CLOUD_MAX_CALLS_OPENCODE:-1500}"
+# Cloud spend caps per tier (pipeline/cloud_ledger.py) — reaching one halts the run.
+#   creative  = the Opus writing calls (story, editor, dialogue polish, director + patch rounds)
+#   vision    = one Haiku call per QA pass (hundreds per film, ~$0.005 each)
+#   execution = the per-clip OpenCode Go calls (prepaid pool, counted not costed)
+export CLOUD_MAX_CALLS_CREATIVE="${CLOUD_MAX_CALLS_CREATIVE:-16}"
+export CLOUD_MAX_USD_EST_CREATIVE="${CLOUD_MAX_USD_EST_CREATIVE:-9}"
+export CLOUD_MAX_CALLS_VISION="${CLOUD_MAX_CALLS_VISION:-600}"
+export CLOUD_MAX_USD_EST_VISION="${CLOUD_MAX_USD_EST_VISION:-4}"
+export CLOUD_MAX_CALLS_EXECUTION="${CLOUD_MAX_CALLS_EXECUTION:-1500}"
 
 DISCORD_CHANNEL="discord:#film-maker"
 NOTIFY="$PACK_DIR/pipeline/notify.sh"
@@ -187,15 +192,15 @@ set_agent_model() {
     log "Model route: $preset -> $ROUTE_PROVIDER/$ROUTE_MODEL (effort=$ROUTE_EFFORT, tier=$ROUTE_TIER)"
 }
 
-# Discord note once at 50 % and 80 % of a provider's spend cap.
+# Discord note once at 50 % and 80 % of a tier's spend cap.
 _ledger_progress() {
-    local provider="$1" pct marker
-    pct=$(python3 - "$RUN_DIR/cloud_usage.json" "$provider" <<'PYEOF' 2>/dev/null || echo 0
+    local tier="$1" pct marker
+    pct=$(python3 - "$RUN_DIR/cloud_usage.json" "$tier" <<'PYEOF' 2>/dev/null || echo 0
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
     cap = d.get("caps", {}).get(sys.argv[2], {})
-    used = d.get("totals", {}).get("by_provider", {}).get(sys.argv[2], {})
+    used = d.get("totals", {}).get("by_tier", {}).get(sys.argv[2], {})
     r = 0.0
     for k in ("calls", "usd_est"):
         if cap.get(k):
@@ -206,10 +211,10 @@ except Exception:
 PYEOF
 )
     for t in 80 50; do
-        marker="$RUN_DIR/.ledger_notified_${provider}_${t}"
+        marker="$RUN_DIR/.ledger_notified_${tier}_${t}"
         if [ "${pct:-0}" -ge "$t" ] && [ ! -f "$marker" ]; then
             touch "$marker"
-            notify "Cloud spend on $provider is at ${pct}% of its cap ($(python3 "$PACK_DIR/pipeline/cloud_ledger.py" summary "$RUN_DIR" 2>/dev/null | grep "$provider" | head -1))" "Cloud Spend"
+            notify "Cloud spend on the $tier tier is at ${pct}% of its cap ($(python3 "$PACK_DIR/pipeline/cloud_ledger.py" summary "$RUN_DIR" 2>/dev/null | grep "^  $tier" | head -1))" "Cloud Spend"
             break
         fi
     done
@@ -257,8 +262,8 @@ _run_dsh_agent_internal() {
 
     set_agent_model "$preset"
     # Spend ledger: cap check before, record after (pipeline/cloud_ledger.py).
-    if ! python3 "$PACK_DIR/pipeline/cloud_ledger.py" check "$RUN_DIR" --provider "$ROUTE_PROVIDER" >> "$RUN_DIR/pipeline.log" 2>&1; then
-        halt_run "${CURRENT_STEP:-agent}" "cloud spend cap reached for $ROUTE_PROVIDER before $preset — see $RUN_DIR/cloud_usage.json (raise CLOUD_MAX_* to continue)"
+    if ! python3 "$PACK_DIR/pipeline/cloud_ledger.py" check "$RUN_DIR" --provider "$ROUTE_PROVIDER" --tier "$ROUTE_TIER" >> "$RUN_DIR/pipeline.log" 2>&1; then
+        halt_run "${CURRENT_STEP:-agent}" "cloud spend cap reached for tier $ROUTE_TIER ($ROUTE_PROVIDER) before $preset — see $RUN_DIR/cloud_usage.json (raise CLOUD_MAX_*_$(echo "$ROUTE_TIER" | tr a-z A-Z) to continue)"
     fi
     local agent_exit=0 t0 t1
     t0=$(date +%s)
@@ -276,10 +281,10 @@ _run_dsh_agent_internal() {
         cat "$err_output" >> "$RUN_DIR/pipeline.log"
     fi
     python3 "$PACK_DIR/pipeline/cloud_ledger.py" record "$RUN_DIR" --preset "$preset" --provider "$ROUTE_PROVIDER" \
-        --model "$ROUTE_MODEL" --effort "$ROUTE_EFFORT" --step "${CURRENT_STEP:-}" --prompt-file "$prompt_file" \
+        --model "$ROUTE_MODEL" --effort "$ROUTE_EFFORT" --tier "$ROUTE_TIER" --step "${CURRENT_STEP:-}" --prompt-file "$prompt_file" \
         --raw-file "$raw_output" --stderr-file "$err_output" --exit "$agent_exit" --seconds "$((t1 - t0))" \
         >> "$RUN_DIR/pipeline.log" 2>&1 || true
-    _ledger_progress "$ROUTE_PROVIDER"
+    _ledger_progress "$ROUTE_TIER"
 
     # Any failure of the call halts — no retry, no second provider (decision 2026-10-18).
     if [[ $agent_exit -ne 0 ]] || grep -qE 'PI_AI_ERROR|TRANSPORT: Connection error|expired while waiting for admission' "$err_output" 2>/dev/null; then
@@ -772,7 +777,7 @@ PROBE_OUT=$(python3 "$PACK_DIR/pipeline/set_agent_model.py" --probe-all 2>&1) ||
     halt_run "0. Cloud preflight" "provider probe failed: $(echo "$PROBE_OUT" | grep -E 'FAIL|ERROR' | head -3 | tr '\n' ' ')"
 log "$PROBE_OUT"
 python3 "$PACK_DIR/pipeline/set_agent_model.py" --dry-run-all >> "$RUN_DIR/pipeline.log" 2>&1 || true
-log "4K master frame rate: ${PP_TARGET_FPS} fps; cloud caps: anthropic ${CLOUD_MAX_CALLS_ANTHROPIC} calls / \$${CLOUD_MAX_USD_EST_ANTHROPIC}, opencode ${CLOUD_MAX_CALLS_OPENCODE} calls"
+log "4K master frame rate: ${PP_TARGET_FPS} fps; cloud caps: creative ${CLOUD_MAX_CALLS_CREATIVE} calls / \$${CLOUD_MAX_USD_EST_CREATIVE}, vision ${CLOUD_MAX_CALLS_VISION} calls / \$${CLOUD_MAX_USD_EST_VISION}, execution ${CLOUD_MAX_CALLS_EXECUTION} calls"
 
 # 1a. Story Creator — Claude Opus 5.5 REWRITES the draft into a screenplay-grade
 # story. The agent has no tools: the schema and the craft skill are inlined. One

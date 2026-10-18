@@ -143,8 +143,8 @@ both call it, so a subprocess can never inherit the previous call's route.
 | Tier | Presets | Default | Override |
 |------|---------|---------|----------|
 | Creative | story-creator, story-editor, director | `anthropic` / `claude-opus-5-5`, effort high | `DSH_CREATIVE_PROVIDER` / `DSH_CREATIVE_MODEL` / `DSH_CREATIVE_EFFORT` |
-| Vision (QA) | qa-inspector | `opencode-go-deepseek` / `qwen3.8-flash` | `DSH_VISION_PROVIDER` / `DSH_VISION_MODEL` / `DSH_VISION_EFFORT` |
-| Execution | everything else (dialogue-polish overrides the model to `qwen3.8-flash`) | `opencode-go-deepseek` / `deepseek-v4.1-flash` | `DSH_EXECUTION_PROVIDER` / `DSH_EXECUTION_MODEL` / `DSH_EXECUTION_EFFORT` |
+| Vision (QA) | qa-inspector | `anthropic` / `claude-haiku-5-5` | `DSH_VISION_PROVIDER` / `DSH_VISION_MODEL` / `DSH_VISION_EFFORT` |
+| Execution | everything else | `opencode-go-deepseek` / `deepseek-v4.1-flash` | `DSH_EXECUTION_PROVIDER` / `DSH_EXECUTION_MODEL` / `DSH_EXECUTION_EFFORT` |
 
 A provider override must name the model. `DSH_FORCE_TIER=execution` routes one
 call onto the execution tier (the Director's mechanical per-scene gate uses it).
@@ -155,8 +155,8 @@ registered for dsh in `/root/.dsh/profiles/headless/cordis.patch.yml`
 (`anthropic` is built in; the OpenCode Go entries are openai-completions
 providers on `https://opencode.ai/zen/go/v1`). `pipeline/cloud_ledger.py` keeps
 `output/<run>/cloud_usage.json` and halts at the caps
-`CLOUD_MAX_CALLS_ANTHROPIC` (12), `CLOUD_MAX_USD_EST_ANTHROPIC` (9),
-`CLOUD_MAX_CALLS_OPENCODE` (1500), with a Discord note at 50 % and 80 %.
+`CLOUD_MAX_CALLS_CREATIVE` (16), `CLOUD_MAX_USD_EST_CREATIVE` (9),
+`CLOUD_MAX_CALLS_VISION` (600), `CLOUD_MAX_USD_EST_VISION` (4), `CLOUD_MAX_CALLS_EXECUTION` (1500), with a Discord note at 50 % and 80 %.
 
 The GPU has two owners — **ComfyUI** (resting owner) and the four-engine **TTS
 cluster** — enforced by systemd `Conflicts=` installed from `pipeline/systemd/`.
@@ -180,13 +180,13 @@ and the pipeline renders them (`generate_frames.py`, `dialogue_stem.py`,
 | Agent framework | dsh presets (`.dsh/.agent-presets/`) | 16 specialised agent presets, all cloud-routed |
 | Creative writing | Claude Opus 5.5 (Anthropic) | Story, story editor, director |
 | Execution | DeepSeek v4.1 Flash via OpenCode Go | Prompts, plans, decisions |
-| QA vision | Qwen 3.8 Flash via OpenCode Go (verified to read frames) | Per-frame scoring |
+| QA vision | Claude Haiku 5.5 (Anthropic) | Per-frame scoring; ~$0.005 per pass |
 | Image generation | Qwen Image 2.1 via ComfyUI | Character/location refs, frames, compositing |
 | Video generation | MiniMax H3 via ComfyUI | `ref2va` / `i2va` / `fl2va` clips (3–15 s) |
 | Dialogue TTS | Chatterbox, CosyVoice 3 | Zero-shot voice cloning, primary dialogue |
 | Emotional TTS | Orpheus 3B | Crying, whispering, shouting |
 | Narration TTS | Kokoro | Narrator voice, placed by assembly (no lip sync) |
-| QA vision | qwen3.8-flash via OpenCode Go | Per-frame scoring of hands, face, identity |
+| QA vision | Claude Haiku 5.5 (Anthropic, ~$0.005 per pass) | Per-frame scoring of hands, face, identity |
 | Music | ACE-Step 1.5 via ComfyUI (`music_render.py`) | Score cues and ambience beds from the composer's cue sheet |
 | SFX | MMAudio via ComfyUI (`sfx_render.py`) | Per-clip foley synced to the picture |
 | Spatial upscale | NVIDIA RTX Video Super Resolution | 4K ULTRA per chunk → `clip_4k.mp4` |

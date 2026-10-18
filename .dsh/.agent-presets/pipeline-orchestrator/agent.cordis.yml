@@ -13,8 +13,7 @@
       ## How the system works (2026-10-18 design)
       - Every agent (story, director, reviewer, QA, you) runs in the CLOUD. There is
         no local LLM. Routing: pipeline/set_agent_model.py (creative → Claude Opus
-        5.5; vision → qwen3.8-flash; execution → deepseek-v4.1-flash, both via
-        OpenCode Go). API keys: /root/.hermes/.env.
+        5.5; vision → Claude Haiku 5.5; execution → deepseek-v4.1-flash via OpenCode Go). API keys: /root/.hermes/.env.
       - The RTX 5090 has exactly TWO owners: ComfyUI (renders, 4K masters, ACE-Step
         music) and the TTS cluster (dialogue stems, narration, voice line-up).
         `pipeline/gpu_owner.sh comfyui|tts|none|status` switches and waits.

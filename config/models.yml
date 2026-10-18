@@ -19,12 +19,12 @@
 # https://opencode.ai/zen/go/v1.
 #
 # Spend: pipeline/cloud_ledger.py writes <run_dir>/cloud_usage.json; caps
-# CLOUD_MAX_CALLS_ANTHROPIC (12), CLOUD_MAX_USD_EST_ANTHROPIC (9),
-# CLOUD_MAX_CALLS_OPENCODE (1500) — reaching a cap halts; Discord note at 50 % / 80 %.
+# CLOUD_MAX_CALLS_CREATIVE (16), CLOUD_MAX_USD_EST_CREATIVE (9), CLOUD_MAX_CALLS_VISION (600), CLOUD_MAX_USD_EST_VISION (4),
+# CLOUD_MAX_CALLS_EXECUTION (1500) — reaching a cap halts; Discord note at 50 % / 80 %.
 
 tiers:
   creative:
-    agents: [story-creator, story-editor, director]
+    agents: [story-creator, story-editor, dialogue-polish, director]
     provider: "anthropic"
     model: "claude-opus-5-5"
     effort: "high"              # Opus 5.5: thinking always on; effort is the only depth control
@@ -32,21 +32,19 @@ tiers:
 
   vision:
     agents: [qa-inspector]      # the ONLY agent that reads images
-    provider: "opencode-go-deepseek"
-    model: "qwen3.8-flash"
+    provider: "anthropic"
+    model: "claude-haiku-5-5"
     effort: "high"
     override_env: [DSH_VISION_PROVIDER, DSH_VISION_MODEL, DSH_VISION_EFFORT]
 
   execution:
     agents: [screenplay-reviewer, character-designer, location-designer, storyboard-artist,
              image-generator, video-generator, audio-producer, music-composer,
-             pipeline-orchestrator, post-production-editor, dialogue-polish]
+             pipeline-orchestrator, post-production-editor]
     provider: "opencode-go-deepseek"
     model: "deepseek-v4.1-flash"
     effort: "high"
     override_env: [DSH_EXECUTION_PROVIDER, DSH_EXECUTION_MODEL, DSH_EXECUTION_EFFORT]
-    model_overrides:
-      dialogue-polish: "qwen3.8-flash"   # same provider, different model
 
 # DSH_FORCE_TIER=execution routes ONE call onto the execution tier regardless of
 # preset — run.sh uses it for the Director's mechanical per-scene gate so a lint
@@ -68,10 +66,10 @@ providers:
     models_url: "https://opencode.ai/zen/go/v1/models"
     key_env: "OPENCODE_GO_API_KEY"
     api: "openai-completions"   # custom provider in cordis.patch.yml
-    known_models: [deepseek-v4.1-flash, qwen3.8-flash, deepseek-v4-flash-vision-exp]
-    input: [text, image]        # qwen3.8-flash carries the vision tier
+    known_models: [deepseek-v4.1-flash, qwen3.8-flash (reads frames, alternative vision), deepseek-v4-flash-vision-exp]
+    input: [text, image]        # qwen3.8-flash reads frames (verified) — alternative vision model
     context_window: 1000000
-    role: "execution + vision tiers (prepaid pool: call-capped, costed at 0)"
+    role: "execution tier (prepaid pool: call-capped, costed at 0)"
 
 # Tools: `set_agent_model.py --list` (tiers after env overrides),
 # `--dry-run-all` (every preset's route), `--probe-all` (GET /models on every

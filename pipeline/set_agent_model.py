@@ -21,7 +21,8 @@ Exit codes (run.sh turns 2 and 3 into a halt, never a reroute):
 Tiers (decision of 2026-10-18 — no local LLM, every agent in the cloud):
 
     creative   story-creator, story-editor, dialogue-polish, director   anthropic / claude-opus-5-5  effort high
-    vision     qa-inspector                                opencode-go-deepseek / qwen3.8-flash (verified 2026-10-18: reads frames)
+    vision     qa-inspector                                anthropic / claude-haiku-5-5 (decision 2026-10-18;
+               alternative verified to read frames: opencode-go-deepseek / qwen3.8-flash)
     execution  everything else                             opencode-go-deepseek / deepseek-v4.1-flash
 
 Env overrides (read once per call, the ONLY way to change a route):
@@ -87,7 +88,7 @@ PRESET_MODEL_OVERRIDE = {}
 TIER_DEFAULTS = {
     # tier:       (provider,               model,                 effort)
     "creative":  ("anthropic",            "claude-opus-5-5",     "high"),
-    "vision":    ("opencode-go-deepseek", "qwen3.8-flash",       "high"),
+    "vision":    ("anthropic",            "claude-haiku-5-5",    "high"),
     "execution": ("opencode-go-deepseek", "deepseek-v4.1-flash", "high"),
 }
 

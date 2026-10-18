@@ -30,14 +30,14 @@ services:
   cloud_vision:
     agents: [qa-inspector]
     provider: "opencode-go-deepseek"
-    model: "qwen3.8-flash"
+    model: "claude-haiku-5-5"
     effort: "high"
     base_url: "https://opencode.ai/zen/go/v1"
     key_env: "OPENCODE_GO_API_KEY"
     input: [text, image]    # the only tier that reads images
 
   cloud_execution:
-    agents: "everything else (dialogue-polish overrides the model to qwen3.8-flash)"
+    agents: "everything else (dialogue-polish overrides the model to claude-haiku-5-5)"
     provider: "opencode-go-deepseek"
     model: "deepseek-v4.1-flash"
     effort: "high"
@@ -116,7 +116,7 @@ video_generation:
 # QA settings
 qa:
   max_retries: 3
-  vision_model: "qwen3.8-flash"  # vision tier (opencode-go-deepseek) — see pipeline/set_agent_model.py
+  vision_model: "claude-haiku-5-5"  # vision tier (opencode-go-deepseek) — see pipeline/set_agent_model.py
   checks:
     - hand_anomalies
     - face_distortion
