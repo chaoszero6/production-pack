@@ -41,6 +41,7 @@ Opus 5.5 notes: thinking is always on (never send budget_tokens / disabled);
 effort is the only depth control and must be explicit — default here is high.
 """
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -57,6 +58,12 @@ except ImportError:  # pragma: no cover
 
 SETTINGS = os.environ.get("DSH_SETTINGS", "/root/.dsh/settings.yaml")
 ENV_FILE = os.environ.get("DSH_ENV_FILE", "/root/.hermes/.env")
+# dsh imports settings.yaml into its profile patch AT LAUNCH, but the launch that
+# does the import still runs with the previously imported value (observed
+# 2026-10-18: UNKNOWN_MODEL for the route of the call before). Writing the
+# profile's own agent-default-model block too makes the route take effect on the
+# very next launch.
+PROFILE_PATCH = os.environ.get("DSH_PROFILE_PATCH", "/root/.dsh/profiles/headless/cordis.patch.yml")
 
 EXIT_ROUTING = 2
 EXIT_PROVIDER = 3
@@ -306,6 +313,54 @@ def write_route(provider, model, effort):
         raise
 
 
+_PROFILE_BLOCK_RE = re.compile(
+    r"(- id: agent-default-model
+  name: \"@deepseek-ai/dsh-agent-default-model\"
+  config:
+)"
+    r"(?:    [a-zA-Z]+: .*
+)*")
+
+
+def write_profile_route(provider, model, effort):
+    """Atomically set the agent-default-model block of the headless profile patch."""
+    path = PROFILE_PATCH
+    if not os.path.exists(path):
+        return False
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    block = ('- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+'
+             f"    provider: {provider}
+    model: {model}
+    reasoningEffort: {effort}
+")
+    m = _PROFILE_BLOCK_RE.search(text)
+    if m:
+        new_text = text[:m.start()] + block + text[m.end():]
+    else:
+        new_text = text.rstrip("
+") + "
+" + block
+    if new_text == text:
+        return True
+    dir_path = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_fh:
+            tmp_fh.write(new_text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return True
+
+
 def route_line(preset, provider, model, effort, tier):
     return f"ROUTE preset={preset} provider={provider} model={model} effort={effort} tier={tier}"
 
@@ -359,6 +414,7 @@ def main(argv):
         if probe:
             probe_provider(provider)
         write_route(provider, model, effort)
+        write_profile_route(provider, model, effort)
         print(f"Routed: {preset} -> {provider}/{model} (effort={effort}, tier={tier})")
         print(route_line(preset, provider, model, effort, tier))
         return 0
