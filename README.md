@@ -399,6 +399,13 @@ environment or `/root/.hermes/.env` (`ANTHROPIC_API_KEY`, `OPENCODE_GO_API_KEY`)
 
 ---
 
+## Demo & Results
+
+Check out the visual outputs and animations generated using the `production-pack` source code on our YouTube channel: 
+👉 **[Haha Kids Entertainment YouTube Channel](https://www.youtube.com/@HahaKidsEntertainment)**
+
+---
+
 ## License
 
 Copyright (c) 2026 **Vinoth Kannah MP**. Released under the
